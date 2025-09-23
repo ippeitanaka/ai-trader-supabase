@@ -6,7 +6,7 @@
 // - 認証：Bearer (任意)
 // Deno runtime
 
-import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { serve } from "std/http/server.ts";
 
 // ====== 環境変数（必要に応じてダッシュボードで設定） =========================
 // 認証（空なら無効）
