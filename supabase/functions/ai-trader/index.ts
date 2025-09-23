@@ -1,54 +1,89 @@
-import { serve } from "https://deno.land/std/http/server.ts"
+// supabase/functions/ai-trader/index.ts
+// Gemini APIを使ったトレードシグナル生成
 
-function toNum(v: unknown, d = 0): number {
-  const n = Number(v)
-  return Number.isFinite(n) ? n : d
+import "jsr:@supabase/functions-js/edge-runtime/v2";
+
+type Signal = { action: "BUY" | "SELL" | "HOLD"; sl?: number; tp?: number; reason?: string };
+
+const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") ?? "";
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+
+function json(res: unknown, status = 200) {
+  return new Response(JSON.stringify(res), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
-serve(async (req) => {
-  if (req.method === "POST") {
-    try {
-      const body = await req.json()
+// 最低限のサーバーサイド安全弁
+function preFilter(body: any): string | null {
+  const bid = Number(body?.bid ?? 0);
+  const ask = Number(body?.ask ?? 0);
+  const atr = Number(body?.atr ?? 0);
+  if (!isFinite(bid) || !isFinite(ask) || bid <= 0 || ask <= 0) return "bad_price";
+  if (!isFinite(atr) || atr <= 0) return "atr_invalid";
+  const spread = Math.abs(ask - bid);
+  if (spread <= 0) return "bad_spread";
+  return null;
+}
 
-      const price     = toNum(body.price)
-      const bid       = toNum(body.bid)
-      const ask       = toNum(body.ask)
-      const sma_fast  = toNum(body.sma_fast, price)
-      const sma_slow  = toNum(body.sma_slow, price)
-      const rsi       = toNum(body.rsi, 50)
-      const atr_in    = toNum(body.atr, Math.abs(ask - bid) || (price * 0.001))
-      const ob        = toNum(body.ob_imbalance, 0)
+Deno.serve(async (req) => {
+  let body: any = {};
+  try { body = await req.json(); } catch { return json({ action: "HOLD", reason: "invalid_json" }); }
 
-      if (!price || !bid || !ask) {
-        return new Response(JSON.stringify({ action: "HOLD", confidence: 0, reason: "invalid price/bid/ask" }), {
-          headers: { "Content-Type": "application/json" }
-        })
-      }
+  // 0) 早期フィルタ
+  const ng = preFilter(body);
+  if (ng) return json({ action: "HOLD", reason: ng });
 
-      let st = (sma_fast > sma_slow ? 1 : -1)
-      st += (rsi < 30 ? 0.5 : (rsi > 70 ? -0.5 : 0.0))
-      const so = ob
-      const score = 0.6 * st + 0.3 * so
-      const conf = Math.min(1, Math.max(0, 0.25 * Math.abs(score)))
-
-      let action: "BUY" | "SELL" | "HOLD" = "HOLD"
-      let sl: number | null = null
-      let tp: number | null = null
-
-      if (score > 0.4) {
-        action = "BUY";  sl = price - 1.5 * atr_in; tp = price + 2.0 * atr_in
-      } else if (score < -0.4) {
-        action = "SELL"; sl = price + 1.5 * atr_in; tp = price - 2.0 * atr_in
-      }
-
-      return new Response(JSON.stringify({ action, sl, tp, confidence: conf, reason: `score=${score.toFixed(2)}` }), {
-        headers: { "Content-Type": "application/json" }
-      })
-    } catch (e) {
-      return new Response(JSON.stringify({ action: "HOLD", reason: "error " + (e?.message ?? e) }), {
-        headers: { "Content-Type": "application/json" }, status: 400
-      })
-    }
+  if (!GEMINI_API_KEY) {
+    return json({ action: "HOLD", reason: "no_gemini_key" });
   }
-  return new Response("AI Trader API (Supabase) running")
-})
+
+  // 1) Geminiに渡すプロンプト
+  const prompt = `
+あなたはトレードシグナル生成AIです。必ず以下のJSONだけを返してください。
+{ "action": "BUY" | "SELL" | "HOLD", "sl": number, "tp": number, "reason": string }
+
+ルール:
+- RSI, SMA fast/slow, ATR を用いて判断。
+- ATRやスプレッドが小さい時はHOLD。
+- 不確実な時はHOLD。
+- BUYなら sl < bid, tp > ask。
+- SELLなら sl > ask, tp < bid。
+- 数値は必ず数値型で返す。
+入力データ:
+${JSON.stringify(body)}
+`;
+
+  try {
+    const resp = await fetch(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.2 },
+      }),
+    });
+
+    if (!resp.ok) {
+      const txt = await resp.text();
+      console.log("gemini_error", resp.status, txt);
+      return json({ action: "HOLD", reason: `gemini_${resp.status}` });
+    }
+
+    const data = await resp.json();
+    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    let parsed: Signal | null = null;
+    try { parsed = JSON.parse(raw); } catch { parsed = null; }
+
+    if (!parsed || !["BUY","SELL","HOLD"].includes(parsed.action)) {
+      return json({ action: "HOLD", reason: "parse_error", raw });
+    }
+
+    return json(parsed);
+
+  } catch (e) {
+    console.log("gemini_exception", String(e));
+    return json({ action: "HOLD", reason: "exception" });
+  }
+});
