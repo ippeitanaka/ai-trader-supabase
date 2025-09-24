@@ -1,7 +1,7 @@
 name: healthcheck
 
 on:
-  workflow_dispatch:   # ←手動実行だけにする
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,25 +11,33 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve HEALTH_URL
+        id: resolve
+        run: |
+          if [ -n "${{ secrets.HEALTH_URL }}" ]; then
+            echo "HEALTH_URL=${{ secrets.HEALTH_URL }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ vars.HEALTH_URL }}" ]; then
+            echo "HEALTH_URL=${{ vars.HEALTH_URL }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ vars.PROJECT_REF }}" ]; then
+            echo "HEALTH_URL=https://${{ vars.PROJECT_REF }}.functions.supabase.co/ai-trader/health" >> "$GITHUB_OUTPUT"
+          else
+            echo "HEALTH_URL=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Ping health endpoint
         env:
-          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+          HEALTH_URL: ${{ steps.resolve.outputs.HEALTH_URL }}
         run: |
           if [ -z "$HEALTH_URL" ]; then
             echo "HEALTH_URL not set"; exit 1
           fi
-
           HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL") || true
-          echo "HTTP_CODE=$HTTP_CODE"
-          cat resp.json || true
-
-          OK=$(python3 -c "import sys,json;print(str(json.load(open('resp.json')).get('ok')).lower())" 2>/dev/null || echo "")
+          echo "HTTP_CODE=$HTTP_CODE"; cat resp.json || true
+          OK=$(jq -r '.ok // "false"' resp.json 2>/dev/null || echo "false")
           if [ "$HTTP_CODE" = "200" ] && [ "$OK" = "true" ]; then
-            echo "Health check OK."
-            exit 0
+            echo "Health check OK."; exit 0
           else
-            echo "Health check failed"
-            exit 1
+            echo "Health check failed"; exit 1
           fi
 
       - name: Create issue on failure
@@ -45,14 +53,6 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: `Healthcheck failed: ${new Date().toISOString()}`,
-              body: [
-                `**Health URL**: ${process.env.HEALTH_URL || '(secret not set)'}`,
-                `**Run**: ${runUrl}`,
-                '',
-                '### Health API Response',
-                '```json',
-                bodyText,
-                '```',
-              ].join('\n'),
+              body: [`**HEALTH_URL**: ${process.env.HEALTH_URL||'(set via resolve step)'}`, `**Run**: ${runUrl}`, '', '```json', bodyText, '```'].join('\n'),
               labels: ['bug','healthcheck']
             });
