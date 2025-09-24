@@ -1,50 +1,41 @@
-// AI Trader Edge Function (All-in-one Pack)
-// - 汎用：どの通貨ペアでも同じURLでOK（シンボル別しきい値の上書きも可）
-// - フィルタ：時間帯 / スプレッド / 低ボラ / レート制限
-// - 合議制スコア：SMA, RSI, MACD, ADX(DI), Stochastic, Bollinger
-// - ログ：理由テキストを返却＆console出力
-// - 認証：Bearer (任意)
+// AI Trader Edge Function (Strict Consensus + Safe AI Annotation)
+// - 失敗時：必ず合議制スコアで返す（AIなしでも止まらない）
+// - 成功時：AIは action を一切変えず、reason に補足のみ（厳格運用）
 // Deno runtime
 
 import { serve } from "std/http/server.ts";
+import OpenAI from "npm:openai";
 
-// ====== 環境変数（必要に応じてダッシュボードで設定） =========================
-// 認証（空なら無効）
+// ====== ENV ======
 const API_KEY = Deno.env.get("AI_TRADER_API_KEY") ?? "";
-
-// ログ
 const LOG_REASON = (Deno.env.get("AI_TRADER_LOG_REASON") ?? "true") === "true";
 
-// 時間帯フィルタ（JSTで扱う）
+// オプショナルAI（注釈のみ・アクション不変）
+const ENABLE_LLM = (Deno.env.get("ENABLE_LLM") ?? "false") === "true";
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
+const LLM_TIMEOUT_MS = Number(Deno.env.get("LLM_TIMEOUT_MS") ?? 1200);
+
+// 時間帯フィルタ（JST）
 const ENABLE_TIME_FILTER = (Deno.env.get("ENABLE_TIME_FILTER") ?? "false") === "true";
 const TRADE_START_HOUR_JST = Number(Deno.env.get("TRADE_START_HOUR_JST") ?? 8);
 const TRADE_END_HOUR_JST   = Number(Deno.env.get("TRADE_END_HOUR_JST") ?? 23);
 
 // フィルタ閾値（汎用デフォルト）
-const SPREAD_MAX_DEFAULT = Number(Deno.env.get("SPREAD_MAX") ?? 0); // 価格差。0で無効
-const ATR_MIN_DEFAULT    = Number(Deno.env.get("ATR_MIN") ?? 0);    // 低ボラ回避。0で無効
+const SPREAD_MAX_DEFAULT = Number(Deno.env.get("SPREAD_MAX") ?? 0);
+const ATR_MIN_DEFAULT    = Number(Deno.env.get("ATR_MIN") ?? 0);
 
-// 合議制スコアの基本しきい値
+// 合議制スコアの基本しきい値（いっぺいの“厳しめ”を維持）
 const RSI_BUY_MIN_DEFAULT  = Number(Deno.env.get("RSI_BUY_MIN") ?? 55);
 const RSI_SELL_MAX_DEFAULT = Number(Deno.env.get("RSI_SELL_MAX") ?? 45);
 const ADX_MIN_DEFAULT      = Number(Deno.env.get("ADX_MIN") ?? 22);
-
-// スコアの採択条件
 const SCORE_FIRE_MIN       = Number(Deno.env.get("SCORE_FIRE_MIN") ?? 4);
 const SCORE_MARGIN_MIN     = Number(Deno.env.get("SCORE_MARGIN_MIN") ?? 2);
 
-// TTL（EA側で有効視する秒数）
+// TTL・レート制限
 const TTL_SEC_DEFAULT      = Number(Deno.env.get("TTL_SEC_DEFAULT") ?? 30);
-
-// ソフトRateLimit（インスタンス内メモリ）
 const RL_MAX_HITS_PER_MIN  = Number(Deno.env.get("RL_MAX_HITS_PER_MIN") ?? 120);
 
-// ---- 銘柄別の上書き（JSON文字列、例は下） -------------------------------
-// 例:
-// AI_TRADER_SYMBOL_OVERRIDES='{
-//   "USDJPY":{"SPREAD_MAX":0.03,"ATR_MIN":0.02,"RSI_BUY_MIN":54,"RSI_SELL_MAX":46,"ADX_MIN":20},
-//   "XAUUSD":{"SPREAD_MAX":0.6,"ATR_MIN":0.8,"RSI_BUY_MIN":56,"RSI_SELL_MAX":44,"ADX_MIN":18}
-// }'
+// 銘柄別上書き
 type SymCfg = Partial<{
   SPREAD_MAX:number; ATR_MIN:number;
   RSI_BUY_MIN:number; RSI_SELL_MAX:number; ADX_MIN:number;
@@ -57,95 +48,49 @@ const OVERRIDES: Record<string, SymCfg> = (() => {
   } catch { return {}; }
 })();
 
-// ===========================================================================
-
+// ====== 型 ======
 type InPayload = {
-  symbol: string;
-  timeframe: string;
-  time: number;
-  price: number;
-  bid: number;
-  ask: number;
-  sma_fast: number;
-  sma_slow: number;
-  rsi: number;
-  atr: number;
-
-  // 任意（送ってこれたら使う）
-  macd?: number;
-  macd_signal?: number;
-  macd_hist?: number;
-
-  adx?: number;        // ADX本体
-  plus_di?: number;    // +DI
-  minus_di?: number;   // -DI
-
-  stoch_k?: number;
-  stoch_d?: number;
-
-  bb_upper?: number;
-  bb_basis?: number;
-  bb_lower?: number;
+  symbol: string; timeframe: string; time: number;
+  price: number; bid: number; ask: number;
+  sma_fast: number; sma_slow: number; rsi: number; atr: number;
+  macd?: number; macd_signal?: number; macd_hist?: number;
+  adx?: number; plus_di?: number; minus_di?: number;
+  stoch_k?: number; stoch_d?: number;
+  bb_upper?: number; bb_basis?: number; bb_lower?: number;
 };
+type OutPayload = { action: "BUY"|"SELL"|"HOLD"; reason?: string; ttl_sec?: number; version?: string; };
 
-type OutPayload = {
-  action: "BUY" | "SELL" | "HOLD";
-  reason?: string;
-  ttl_sec?: number;
-  version?: string;
-};
+function ver(){ return "ai-trader:2.2.0-strict-hybrid"; }
+function okJSON(data: unknown, status=200){ return new Response(JSON.stringify(data), {status, headers:{"content-type":"application/json; charset=utf-8"}}); }
+function badRequest(msg:string){ return okJSON({error:msg}, 400); }
+function unauthorized(){ return okJSON({error:"unauthorized"}, 401); }
 
-function ver() { return "ai-trader:2.0.0-allin"; }
-
-function okJSON(data: unknown, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status, headers: { "content-type": "application/json; charset=utf-8" }
-  });
-}
-function badRequest(msg: string) { return okJSON({ error: msg }, 400); }
-function unauthorized() { return okJSON({ error: "unauthorized" }, 401); }
-
-// JST時間帯フィルタ
+// ====== Utility ======
 function inTradeSessionJST(): boolean {
   if (!ENABLE_TIME_FILTER) return true;
-  const now = new Date();
-  const hUTC = now.getUTCHours();
-  const hJST = (hUTC + 9) % 24;
+  const hJST = (new Date().getUTCHours() + 9) % 24;
   if (TRADE_START_HOUR_JST <= TRADE_END_HOUR_JST)
     return hJST >= TRADE_START_HOUR_JST && hJST < TRADE_END_HOUR_JST;
-  return hJST >= TRADE_START_HOUR_JST || hJST < TRADE_END_HOUR_JST; // 日跨ぎ
+  return hJST >= TRADE_START_HOUR_JST || hJST < TRADE_END_HOUR_JST;
 }
 
-// ソフトRateLimit
-const rlMap = new Map<string, { count:number; slot:number }>();
-function softRateLimit(key: string): boolean {
-  const now = Date.now();
-  const slot = Math.floor(now / 60_000);
+const rlMap = new Map<string,{count:number;slot:number}>();
+function softRateLimit(key:string): boolean {
+  const slot = Math.floor(Date.now()/60_000);
   const v = rlMap.get(key);
-  if (!v || v.slot !== slot) { rlMap.set(key, { count:1, slot }); return true; }
-  v.count++;
-  return v.count <= RL_MAX_HITS_PER_MIN;
+  if (!v || v.slot!==slot){ rlMap.set(key,{count:1,slot}); return true; }
+  v.count++; return v.count <= RL_MAX_HITS_PER_MIN;
 }
 
-// 必須フィールド検証
-function validate(p: any): {ok:true; data:InPayload}|{ok:false; msg:string} {
+function validate(p:any): {ok:true; data:InPayload}|{ok:false; msg:string} {
   const req = ["symbol","timeframe","time","price","bid","ask","sma_fast","sma_slow","rsi","atr"];
-  if (!p || typeof p!=="object") return {ok:false, msg:"invalid json"};
-  for (const k of req) if (!(k in p)) return {ok:false, msg:`missing field: ${k}`};
-  const nums = ["time","price","bid","ask","sma_fast","sma_slow","rsi","atr"];
-  for (const k of nums) if (!Number.isFinite(p[k])) return {ok:false, msg:`invalid number: ${k}`};
-  if (typeof p.symbol!=="string" || !p.symbol) return {ok:false, msg:"symbol must be string"};
-  if (typeof p.timeframe!=="string" || !p.timeframe) return {ok:false, msg:"timeframe must be string"};
-  // 任意項目は存在するなら数値かだけ軽くチェック
-  const optNums = ["macd","macd_signal","macd_hist","adx","plus_di","minus_di","stoch_k","stoch_d","bb_upper","bb_basis","bb_lower"];
-  for (const k of optNums) if (k in p && !Number.isFinite(p[k])) return {ok:false, msg:`invalid number: ${k}`};
+  if (!p || typeof p!=="object") return {ok:false,msg:"invalid json"};
+  for (const k of req) if(!(k in p)) return {ok:false,msg:`missing ${k}`};
   return {ok:true, data:p as InPayload};
 }
 
-// 銘柄別の上書き適用
-function cfgForSymbol(symbol: string) {
-  const upper = symbol.toUpperCase();
-  const o: SymCfg = OVERRIDES[upper] ?? {};
+function cfgForSymbol(symbol:string){
+  const o:SymCfg = OVERRIDES[symbol.toUpperCase()] ?? {};
   return {
     SPREAD_MAX: o.SPREAD_MAX ?? SPREAD_MAX_DEFAULT,
     ATR_MIN:    o.ATR_MIN    ?? ATR_MIN_DEFAULT,
@@ -157,112 +102,126 @@ function cfgForSymbol(symbol: string) {
   };
 }
 
-// 合議制スコア判定
+// ====== 合議制スコア判定（厳格） ======
 function scoreDecision(p: InPayload): OutPayload {
   const C = cfgForSymbol(p.symbol);
-  const reasons: string[] = [];
+  const reasons:string[] = [];
   const spread = Math.max(0, p.ask - p.bid);
 
-  // セッション
-  if (!inTradeSessionJST()) {
-    return { action: "HOLD", reason: "out_of_session", ttl_sec: TTL_SEC_DEFAULT, version: ver() };
-  }
+  if (!inTradeSessionJST()) return { action:"HOLD", reason:"out_of_session", ttl_sec:TTL_SEC_DEFAULT, version:ver() };
+  if (C.SPREAD_MAX>0 && spread>C.SPREAD_MAX) return { action:"HOLD", reason:`spread>${C.SPREAD_MAX}`, ttl_sec:TTL_SEC_DEFAULT, version:ver() };
+  if (C.ATR_MIN>0 && p.atr<C.ATR_MIN) return { action:"HOLD", reason:`atr<${C.ATR_MIN}`, ttl_sec:TTL_SEC_DEFAULT, version:ver() };
 
-  // フィルタ：スプレッド / 低ボラ
-  if (C.SPREAD_MAX > 0 && spread > C.SPREAD_MAX) {
-    return { action: "HOLD", reason: `spread>${C.SPREAD_MAX.toFixed(6)}`, ttl_sec: TTL_SEC_DEFAULT, version: ver() };
-  }
-  if (C.ATR_MIN > 0 && p.atr < C.ATR_MIN) {
-    return { action: "HOLD", reason: `atr<${C.ATR_MIN.toFixed(6)}`, ttl_sec: TTL_SEC_DEFAULT, version: ver() };
-  }
-
-  // スコアリング
-  let sBuy = 0, sSell = 0;
+  let sBuy=0, sSell=0;
 
   // トレンド（SMA）
-  const trendUp   = p.sma_fast > p.sma_slow;
-  const trendDown = p.sma_fast < p.sma_slow;
-  if (trendUp)   { sBuy += 2; reasons.push("trendUp"); }
-  if (trendDown) { sSell+= 2; reasons.push("trendDown"); }
+  if (p.sma_fast > p.sma_slow){ sBuy+=2; reasons.push("trendUp"); }
+  if (p.sma_fast < p.sma_slow){ sSell+=2; reasons.push("trendDown"); }
 
   // RSI
-  if (p.rsi >= C.RSI_BUY_MIN) { sBuy += 2; reasons.push(`rsi>=${C.RSI_BUY_MIN}`); }
-  if (p.rsi <= C.RSI_SELL_MAX){ sSell+= 2; reasons.push(`rsi<=${C.RSI_SELL_MAX}`); }
+  if (p.rsi >= cfgForSymbol(p.symbol).RSI_BUY_MIN){ sBuy+=2; reasons.push(`rsi>=${cfgForSymbol(p.symbol).RSI_BUY_MIN}`); }
+  if (p.rsi <= cfgForSymbol(p.symbol).RSI_SELL_MAX){ sSell+=2; reasons.push(`rsi<=${cfgForSymbol(p.symbol).RSI_SELL_MAX}`); }
 
-  // MACD（あれば）
-  const hasMACD = Number.isFinite(p.macd) && Number.isFinite(p.macd_signal);
-  if (hasMACD) {
-    if ((p.macd ?? 0) > (p.macd_signal ?? 0)) { sBuy += 1; reasons.push("macdUp"); }
-    else                                      { sSell+= 1; reasons.push("macdDn"); }
-  }
-
-  // ADX（あれば：+DIと-DIもあれば順張り強化）
-  if (Number.isFinite(p.adx)) {
-    if ((p.adx ?? 0) >= C.ADX_MIN) { sBuy += 1; sSell += 1; reasons.push(`adx>=${C.ADX_MIN}`); }
-  }
-  if (Number.isFinite(p.plus_di) && Number.isFinite(p.minus_di)) {
-    if ((p.plus_di ?? 0) > (p.minus_di ?? 0)) { sBuy += 1; reasons.push("+DI>-DI"); }
-    if ((p.plus_di ?? 0) < (p.minus_di ?? 0)) { sSell+= 1; reasons.push("+DI<- -DI"); }
+  // MACD
+  if (Number.isFinite(p.macd) && Number.isFinite(p.macd_signal)){
+    if ((p.macd ?? 0) > (p.macd_signal ?? 0)){ sBuy+=1; reasons.push("macdUp"); }
+    else { sSell+=1; reasons.push("macdDn"); }
   }
 
-  // Stochastic（押し目・戻り目で微加点）
-  if (Number.isFinite(p.stoch_k) && Number.isFinite(p.stoch_d)) {
-    const k = p.stoch_k ?? 0, d = p.stoch_d ?? 0;
-    if (k > d && k < 80) { sBuy += 1; reasons.push("stochUp"); }
-    if (k < d && k > 20) { sSell+= 1; reasons.push("stochDn"); }
+  // ADX & DI
+  const Cfg = cfgForSymbol(p.symbol);
+  if (Number.isFinite(p.adx) && (p.adx ?? 0) >= Cfg.ADX_MIN){ sBuy+=1; sSell+=1; reasons.push(`adx>=${Cfg.ADX_MIN}`); }
+  if (Number.isFinite(p.plus_di) && Number.isFinite(p.minus_di)){
+    if ((p.plus_di ?? 0) > (p.minus_di ?? 0)){ sBuy+=1; reasons.push("+DI>-DI"); }
+    if ((p.plus_di ?? 0) < (p.minus_di ?? 0)){ sSell+=1; reasons.push("+DI<- -DI"); }
   }
 
-  // Bollinger（バンドウォークのヒント：価格がbasisより上/下）
-  if (Number.isFinite(p.bb_basis)) {
-    if (p.price > (p.bb_basis ?? 0)) { sBuy += 1; reasons.push("bb>basis"); }
-    if (p.price < (p.bb_basis ?? 0)) { sSell+= 1; reasons.push("bb<basis"); }
+  // Stochastic
+  if (Number.isFinite(p.stoch_k) && Number.isFinite(p.stoch_d)){
+    const k=p.stoch_k??0, d=p.stoch_d??0;
+    if (k>d && k<80){ sBuy+=1; reasons.push("stochUp"); }
+    if (k<d && k>20){ sSell+=1; reasons.push("stochDn"); }
   }
 
-  // 採択基準
-  if (sBuy >= C.SCORE_FIRE_MIN && (sBuy - sSell) >= C.SCORE_MARGIN_MIN) {
-    return { action: "BUY", reason: `sB=${sBuy},sS=${sSell}|${reasons.join("|")}`, ttl_sec: TTL_SEC_DEFAULT, version: ver() };
+  // Bollinger basis
+  if (Number.isFinite(p.bb_basis)){
+    if (p.price > (p.bb_basis ?? 0)){ sBuy+=1; reasons.push("bb>basis"); }
+    if (p.price < (p.bb_basis ?? 0)){ sSell+=1; reasons.push("bb<basis"); }
   }
-  if (sSell >= C.SCORE_FIRE_MIN && (sSell - sBuy) >= C.SCORE_MARGIN_MIN) {
-    return { action: "SELL", reason: `sB=${sBuy},sS=${sSell}|${reasons.join("|")}`, ttl_sec: TTL_SEC_DEFAULT, version: ver() };
-  }
-  return { action: "HOLD", reason: `consensus_weak sB=${sBuy} sS=${sSell}|${reasons.join("|")}`, ttl_sec: TTL_SEC_DEFAULT, version: ver() };
+
+  if (sBuy >= C.SCORE_FIRE_MIN && (sBuy - sSell) >= C.SCORE_MARGIN_MIN)
+    return { action:"BUY", reason:`sB=${sBuy},sS=${sSell}|${reasons.join("|")}`, ttl_sec:TTL_SEC_DEFAULT, version:ver() };
+  if (sSell >= C.SCORE_FIRE_MIN && (sSell - sBuy) >= C.SCORE_MARGIN_MIN)
+    return { action:"SELL", reason:`sB=${sBuy},sS=${sSell}|${reasons.join("|")}`, ttl_sec:TTL_SEC_DEFAULT, version:ver() };
+  return { action:"HOLD", reason:`consensus_weak sB=${sBuy} sS=${sSell}|${reasons.join("|")}`, ttl_sec:TTL_SEC_DEFAULT, version:ver() };
 }
 
+// ====== LLM（注釈のみ・フォールバック保証） ======
+async function annotateWithLLM(p: InPayload, ruleOut: OutPayload): Promise<OutPayload> {
+  // AIを使って“理由文をちょい補足”するだけ。アクションは**絶対に変えない**
+  if (!OPENAI_API_KEY) throw new Error("no_api_key");
+  const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), LLM_TIMEOUT_MS);
+
+  try {
+    const sys = "You are an FX trading assistant. Return a very short justification string in Japanese (max 120 chars). Do not suggest trades. No symbols other than plain text.";
+    const user = `Symbol=${p.symbol} TF=${p.timeframe} price=${p.price} bid=${p.bid} ask=${p.ask} rsi=${p.rsi} atr=${p.atr} sma_fast=${p.sma_fast} sma_slow=${p.sma_slow} macd=${p.macd} macd_signal=${p.macd_signal} adx=${p.adx} +di=${p.plus_di} -di=${p.minus_di} stoch_k=${p.stoch_k} stoch_d=${p.stoch_d} bb_basis=${p.bb_basis}. Rule-based decision: ${ruleOut.action} (reason: ${ruleOut.reason}). Provide a short additional justification only.`;
+
+    const resp = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{role:"system",content:sys},{role:"user",content:user}],
+      temperature: 0.2,
+    }, { signal: controller.signal });
+
+    const add = resp.choices?.[0]?.message?.content?.trim();
+    if (!add) return ruleOut;
+
+    // アクションは固定、reason にだけ追記
+    return {
+      ...ruleOut,
+      reason: `${ruleOut.reason}|llm_note:${add.replace(/\s+/g," ").slice(0,120)}`
+    };
+  } catch (e) {
+    // 429/401/AbortError/その他 → すべてフォールバック
+    console.log("openai_error", e);
+    return { ...ruleOut, reason: `${ruleOut.reason}|llm_fallback` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ====== Main ======
 serve(async (req) => {
   try {
-    // 説明＆疎通確認
-    if (req.method === "GET") {
-      return okJSON({
-        ok:true, name:"ai-trader", version: ver(),
-        requires: {
-          method:"POST",
-          contentType:"application/json",
-          fields:["symbol","timeframe","time","price","bid","ask","sma_fast","sma_slow","rsi","atr"],
-          optional:["macd","macd_signal","macd_hist","adx","plus_di","minus_di","stoch_k","stoch_d","bb_upper","bb_basis","bb_lower"]
-        }
-      });
-    }
-    if (req.method !== "POST") return okJSON({error:"method not allowed"}, 405);
+    if (req.method === "GET")
+      return okJSON({ ok:true, name:"ai-trader", version:ver() });
+    if (req.method !== "POST")
+      return okJSON({ error:"method not allowed" }, 405);
 
-    // 認証（任意）
+    // 任意のAPIキー認証（SupabaseのJWT検証を切ってる前提）
     if (API_KEY) {
       const auth = req.headers.get("authorization") ?? "";
       const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
       if (token !== API_KEY) return unauthorized();
     }
 
-    // レート制限（ざっくり）
+    // ソフトRateLimit
     const ip = (req.headers.get("x-forwarded-for") ?? req.headers.get("cf-connecting-ip") ?? "unknown").split(",")[0].trim();
     if (!softRateLimit(ip)) return okJSON({ error:"rate_limited" }, 429);
 
     // JSON
-    let body: any;
-    try { body = await req.json(); } catch { return badRequest("invalid json body"); }
-    const v = validate(body);
-    if (!v.ok) return badRequest(v.msg);
+    let body:any; try { body = await req.json(); } catch { return badRequest("invalid json"); }
+    const v = validate(body); if (!v.ok) return badRequest(v.msg);
 
-    // 判定
-    const out = scoreDecision(v.data);
+    // まず合議制（これが“正解”・常に返せる）
+    const ruleOut = scoreDecision(v.data);
+
+    // オプショナルAI：アクションは絶対固定、理由に補足のみ。失敗しても ruleOut を返す
+    const out = (ENABLE_LLM && OPENAI_API_KEY)
+      ? await annotateWithLLM(v.data, ruleOut)
+      : ruleOut;
 
     if (LOG_REASON) {
       console.log(JSON.stringify({
