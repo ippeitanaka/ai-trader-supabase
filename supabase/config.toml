@@ -1,2 +1,7 @@
-[functions]
+# supabase/config.toml[functions]
+
 verify_jwt = false
+
+[functions]
+  [functions.ai-trader]
+    verify_jwt = false
