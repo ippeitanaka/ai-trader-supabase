@@ -1,0 +1,49 @@
+---
+name: バグ報告
+description: 不具合を報告する
+labels: [bug]
+body:
+  - type: input
+    id: env
+    attributes:
+      label: 実行環境
+      description: どの環境で発生しましたか？
+      placeholder: "prod / staging / local"
+  - type: textarea
+    id: what
+    attributes:
+      label: 事象
+      description: 実際に起きたことと、期待した挙動を書いてください。
+      placeholder: |
+        【実際の結果】
+        ...
+        【期待する結果】
+        ...
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現手順
+      description: 再現できる手順を番号付きで書いてください。
+      placeholder: |
+        1) …
+        2) …
+        3) …
+  - type: input
+    id: deploy_sha
+    attributes:
+      label: デプロイSHA / バージョン
+      placeholder: "例) a1b2c3d"
+  - type: textarea
+    id: logs
+    attributes:
+      label: 関連ログ
+      description: functions logs / ブラウザconsole / サーバーログなど
+      placeholder: |
+        - functions logs:
+        - console:
+        - 例外スタック:
+  - type: textarea
+    id: notes
+    attributes:
+      label: 補足
+      placeholder: 影響範囲、暫定対応、スクショURL など
