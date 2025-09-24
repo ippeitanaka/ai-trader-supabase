@@ -1,0 +1,66 @@
+name: healthcheck
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        env:
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+        run: |
+          if [ -z "$HEALTH_URL" ]; then
+            echo "HEALTH_URL not set"; exit 1
+          fi
+          HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL")
+          echo "HTTP_CODE=$HTTP_CODE"
+          cat resp.json || true
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Non-200 from health endpoint"; exit 1
+          fi
+          OK=$(cat resp.json | python3 - <<'PY'
+import sys, json
+print(json.load(sys.stdin).get("ok"))
+PY
+)
+          if [ "$OK" != "True" ] && [ "$OK" != "true" ]; then
+            echo "ok flag is not true"; exit 1
+          fi
+          echo "Health check OK."
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const bodyText = fs.existsSync('resp.json') ? fs.readFileSync('resp.json','utf8') : '(no resp.json)';
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const title = `Healthcheck failed: ${new Date().toISOString()}`;
+            const body = [
+              `**Health URL**: ${process.env.HEALTH_URL || '(secret not set)'}`,
+              `**Run**: ${runUrl}`,
+              '',
+              '---',
+              '### Health API Response',
+              '```json',
+              bodyText,
+              '```',
+              '',
+              '### ひとまず試すこと',
+              '1) /health をブラウザ or curl で再実行',
+              '2) Supabase Functions のログ確認',
+              '3) 直近デプロイ差分の確認（環境変数や権限含む）',
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['bug','healthcheck'],
+              // assignees: ['YOUR_GITHUB_USERNAME'] // 必要なら置き換え
+            });
