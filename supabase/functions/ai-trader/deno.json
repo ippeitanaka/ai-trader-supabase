@@ -1,13 +1,5 @@
-{{
-
-  "deploy": { "verify_jwt": false },  "deploy": {
-
-  "imports": { "std/": "https://deno.land/std@0.224.0/" }    "verify_jwt": false
-
-}  },
-
+{
   "imports": {
     "std/": "https://deno.land/std@0.224.0/"
-  },
-  "main": "index.ts"
+  }
 }
