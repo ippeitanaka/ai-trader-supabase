@@ -13,5 +13,59 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Echo
-        run: echo "ok"
+      - name: Ping health endpoint (with retry)
+        env:
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+        run: |
+          set -e
+          if [ -z "$HEALTH_URL" ]; then
+            echo "HEALTH_URL not set"; exit 1
+          fi
+          RETRY=3
+          for i in $(seq 1 $RETRY); do
+            HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL") || true
+            echo "HTTP_CODE=$HTTP_CODE"
+            cat resp.json || true
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "Non-200 from health endpoint"
+              sleep 2
+              continue
+            fi
+
+            OK=$(python3 -c "import sys,json;print(str(json.load(open('resp.json')).get('ok')).lower())" || echo "")
+            if [ "$OK" = "true" ]; then
+              echo "Health check OK."
+              exit 0
+            else
+              echo "ok flag is not true"
+              sleep 2
+            fi
+          done
+          echo "Health check failed after $RETRY attempts"
+          exit 1
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const bodyText = fs.existsSync('resp.json') ? fs.readFileSync('resp.json','utf8') : '(no resp.json)';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Healthcheck failed: ${new Date().toISOString()}`,
+              body: [
+                `**Health URL**: ${process.env.HEALTH_URL || '(secret not set)'}`,
+                `**Run**: ${runUrl}`,
+                '',
+                '### Health API Response',
+                '```json',
+                bodyText,
+                '```',
+              ].join('\n'),
+              labels: ['bug','healthcheck']
+            });
