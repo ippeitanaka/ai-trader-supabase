@@ -15,7 +15,7 @@ jobs:
 
       - uses: supabase/setup-cli@v1
         with:
-          version: 2.x
+          version: 2.45.5
 
       - name: Deploy edge function
         env:
