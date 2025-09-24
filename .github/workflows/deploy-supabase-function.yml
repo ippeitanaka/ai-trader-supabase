@@ -1,22 +1,76 @@
-name: Deploy Supabase Function
+name: healthcheck
 
 on:
-  push:
-    branches: [ main ]
-  workflow_dispatch: {}   # 手動実行ボタンを出す
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
 
-jobs:
-  deploy:
+permissions:
+  contents: read
+  issues: write
+
+jobs:                     # ←これが必須！
+  ping:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-
-
-      - name: Install Supabase CLI
-        run: npm i supabase@^2
-
-      - name: Deploy edge function
+      - name: Ping health endpoint (with retry)
         env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-        run: npx supabase functions deploy ai-trader --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+        run: |
+          if [ -z "$HEALTH_URL" ]; then
+            echo "HEALTH_URL not set"; exit 1
+          fi
+          RETRY=3
+          for i in $(seq 1 $RETRY); do
+            HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL")
+            echo "HTTP_CODE=$HTTP_CODE"
+            cat resp.json || true
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "Non-200 from health endpoint"
+              sleep 2
+              continue
+            fi
+
+            OK=$(python3 -c "import sys,json;print(str(json.load(open('resp.json')).get('ok')).lower())" || echo "")
+            if [ "$OK" = "true" ]; then
+              echo "Health check OK."
+              exit 0
+            else
+              echo "ok flag is not true"
+              sleep 2
+            fi
+          done
+          echo "Health check failed after $RETRY attempts"
+          exit 1
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const bodyText = fs.existsSync('resp.json') ? fs.readFileSync('resp.json','utf8') : '(no resp.json)';
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Healthcheck failed: ${new Date().toISOString()}`,
+              body: [
+                `**Health URL**: ${process.env.HEALTH_URL || '(secret not set)'}`,
+                `**Run**: ${runUrl}`,
+                '',
+                '---',
+                '### Health API Response',
+                '```json',
+                bodyText,
+                '```',
+                '',
+                '### ひとまず試すこと',
+                '1) /health をブラウザ or curl で再実行',
+                '2) Supabase Functions のログ確認',
+                '3) 直近デプロイ差分の確認（環境変数や権限含む）',
+              ].join('\n'),
+              labels: ['bug','healthcheck']
+            });
