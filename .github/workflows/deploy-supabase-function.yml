@@ -9,7 +9,7 @@ permissions:
   contents: read
   issues: write
 
-jobs:                     # ←これが必須！
+jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
@@ -22,7 +22,7 @@ jobs:                     # ←これが必須！
           fi
           RETRY=3
           for i in $(seq 1 $RETRY); do
-            HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL")
+            HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL") || true
             echo "HTTP_CODE=$HTTP_CODE"
             cat resp.json || true
 
@@ -61,16 +61,10 @@ jobs:                     # ←これが必須！
                 `**Health URL**: ${process.env.HEALTH_URL || '(secret not set)'}`,
                 `**Run**: ${runUrl}`,
                 '',
-                '---',
                 '### Health API Response',
                 '```json',
                 bodyText,
                 '```',
-                '',
-                '### ひとまず試すこと',
-                '1) /health をブラウザ or curl で再実行',
-                '2) Supabase Functions のログ確認',
-                '3) 直近デプロイ差分の確認（環境変数や権限含む）',
               ].join('\n'),
               labels: ['bug','healthcheck']
             });
