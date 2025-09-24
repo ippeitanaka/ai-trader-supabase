@@ -1,46 +1,36 @@
 name: healthcheck
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/30 * * * *"   # 30分ごと。要らんかったら消してOK
+  workflow_dispatch:   # ←手動実行だけにする
 
 permissions:
   contents: read
-  issues: write              # 失敗時にIssueを起票するため
+  issues: write
 
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping health endpoint (with retry)
+      - name: Ping health endpoint
         env:
           HEALTH_URL: ${{ secrets.HEALTH_URL }}
         run: |
-          set -e
           if [ -z "$HEALTH_URL" ]; then
             echo "HEALTH_URL not set"; exit 1
           fi
 
-          RETRY=3
-          for i in $(seq 1 $RETRY); do
-            HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL") || true
-            echo "HTTP_CODE=$HTTP_CODE"
-            cat resp.json || true
+          HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL") || true
+          echo "HTTP_CODE=$HTTP_CODE"
+          cat resp.json || true
 
-            # 200かつ JSONの ok:true を判定
-            OK=$(python3 -c "import sys,json;print(str(json.load(open('resp.json')).get('ok')).lower())" 2>/dev/null || echo "")
-            if [ "$HTTP_CODE" = "200" ] && [ "$OK" = "true" ]; then
-              echo "Health check OK."
-              exit 0
-            fi
-
-            echo "retrying in 3s... ($i/$RETRY)"
-            sleep 3
-          done
-
-          echo "Health check failed after $RETRY attempts"
-          exit 1
+          OK=$(python3 -c "import sys,json;print(str(json.load(open('resp.json')).get('ok')).lower())" 2>/dev/null || echo "")
+          if [ "$HTTP_CODE" = "200" ] && [ "$OK" = "true" ]; then
+            echo "Health check OK."
+            exit 0
+          else
+            echo "Health check failed"
+            exit 1
+          fi
 
       - name: Create issue on failure
         if: failure()
