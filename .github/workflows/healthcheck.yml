@@ -3,32 +3,42 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
-jobs:
+permissions:
+  contents: read
+  issues: write
+
+
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping health endpoint
+      - name: Ping health endpoint (with retry)
         env:
           HEALTH_URL: ${{ secrets.HEALTH_URL }}
         run: |
           if [ -z "$HEALTH_URL" ]; then
             echo "HEALTH_URL not set"; exit 1
           fi
-          HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL")
-          echo "HTTP_CODE=$HTTP_CODE"
-          cat resp.json || true
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Non-200 from health endpoint"; exit 1
-          fi
-          OK=$(cat resp.json | python3 - <<'PY'
-import sys, json
-print(json.load(sys.stdin).get("ok"))
-PY
-)
-          if [ "$OK" != "True" ] && [ "$OK" != "true" ]; then
-            echo "ok flag is not true"; exit 1
-          fi
-          echo "Health check OK."
+          RETRY=3
+          for i in $(seq 1 $RETRY); do
+            HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL")
+            echo "HTTP_CODE=$HTTP_CODE"
+            cat resp.json || true
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "Non-200 from health endpoint"
+              sleep 2
+              continue
+            fi
+            OK=$(python3 -c "import sys, json; print(str(json.load(open('resp.json')).get('ok')).lower())")
+            if [ "$OK" = "true" ]; then
+              echo "Health check OK."
+              exit 0
+            else
+              echo "ok flag is not true"
+              sleep 2
+            fi
+          done
+          echo "Health check failed after $RETRY attempts"
+          exit 1
 
       - name: Create issue on failure
         if: failure()
