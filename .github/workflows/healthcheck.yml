@@ -1,162 +1,81 @@
-name: healthcheckname: healthcheck
-
-
-
-on:on:
-
-  workflow_dispatch:  # 手動実行のみ  workflow_dispatch:  # 手動実行のみ
-
-
-
-permissions:permissions:
-
-  contents: read  contents: read
-
-  issues: write  issues: write
-
-
-
-jobs:jobs:
-
-  ping:  ping:
-
-    runs-on: ubuntu-latest    runs-on: ubuntu-latest
-
-    steps:    steps:
-
-      - name: Resolve HEALTH_URL      - name: Resolve HEALTH_URL
-
-        id: resolve        id: resolve
-
-        run: |        run: |
-
-          if [ -n "${{ secrets.HEALTH_URL }}" ]; then          if [ -n "${{ secrets.HEALTH_URL }}" ]; then
-
-            echo "HEALTH_URL=${{ secrets.HEALTH_URL }}" >> "$GITHUB_OUTPUT"            echo "HEALTH_URL=${{ secrets.HEALTH_URL }}" >> "$GITHUB_OUTPUT"
-
-          elif [ -n "${{ vars.HEALTH_URL }}" ]; then          elif [ -n "${{ vars.HEALTH_URL }}" ]; then
-
-            echo "HEALTH_URL=${{ vars.HEALTH_URL }}" >> "$GITHUB_OUTPUT"            echo "HEALTH_URL=${{ vars.HEALTH_URL }}" >> "$GITHUB_OUTPUT"
-
-          elif [ -n "${{ vars.PROJECT_REF }}" ]; then          elif [ -n "${{ vars.PROJECT_REF }}" ]; then
-
-            echo "HEALTH_URL=https://${{ vars.PROJECT_REF }}.functions.supabase.co/ai-trader/health" >> "$GITHUB_OUTPUT"            echo "HEALTH_URL=https://${{ vars.PROJECT_REF }}.functions.supabase.co/ai-trader/health" >> "$GITHUB_OUTPUT"
-
-          else          else
-
-            echo "HEALTH_URL=" >> "$GITHUB_OUTPUT"            echo "HEALTH_URL=" >> "$GITHUB_OUTPUT"
-
-          fi          fi
-
-
-
-      - name: Ping health endpoint (measure latency)      - name: Ping health endpoint (measure latency)
-
-        env:        env:
-
-          HEALTH_URL: ${{ steps.resolve.outputs.HEALTH_URL }}          HEALTH_URL: ${{ steps.resolve.outputs.HEALTH_URL }}
-
-        run: |        run: |
-
-          if [ -z "$HEALTH_URL" ]; then          if [ -z "$HEALTH_URL" ]; then
-
-            echo "HEALTH_URL not set"; exit 1            echo "HEALTH_URL not set"; exit 1
-
-          fi          fi
-
-          start=$(date +%s%3N)          start=$(date +%s%3N)
-
-          HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL") || true          HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL") || true
-
-          end=$(date +%s%3N)          end=$(date +%s%3N)
-
-          LATENCY=$((end-start))          LATENCY=$((end-start))
-
-          echo "HTTP_CODE=$HTTP_CODE"          echo "HTTP_CODE=$HTTP_CODE"
-
-          echo "Latency=${LATENCY}ms"          echo "Latency=${LATENCY}ms"
-
-          echo "HTTP_CODE=$HTTP_CODE" >> "$GITHUB_ENV"          echo "HTTP_CODE=$HTTP_CODE" >> "$GITHUB_ENV"
-
-          echo "LATENCY=$LATENCY" >> "$GITHUB_ENV"          echo "LATENCY=$LATENCY" >> "$GITHUB_ENV"
-
-          OK=$(jq -r '.ok // "false"' resp.json 2>/dev/null || echo "false")          OK=$(jq -r '.ok // "false"' resp.json 2>/dev/null || echo "false")
-
-          cat resp.json || true          cat resp.json || true
-
-          if [ "$HTTP_CODE" = "200" ] && [ "$OK" = "true" ]; then          if [ "$HTTP_CODE" = "200" ] && [ "$OK" = "true" ]; then
-
-            echo "Health check OK."            echo "Health check OK."
-
-            exit 0            exit 0
-
-          else          else
-
-            echo "Health check failed"            echo "Health check failed"
-
-            exit 1            exit 1
-
-          fi          fi
-
-
-
-      - name: Create issue on failure      - name: Create issue on failure
-
-        if: failure()        if: failure()
-
-        uses: actions/github-script@v7        uses: actions/github-script@v7
-
-        env:        env:
-
-          HEALTH_URL: ${{ steps.resolve.outputs.HEALTH_URL }}          HEALTH_URL: ${{ steps.resolve.outputs.HEALTH_URL }}
-
-          LATENCY: ${{ env.LATENCY }}          LATENCY: ${{ env.LATENCY }}
-
-          HTTP_CODE: ${{ env.HTTP_CODE }}          HTTP_CODE: ${{ env.HTTP_CODE }}
-
-        with:        with:
-
-          github-token: ${{ secrets.GITHUB_TOKEN }}          github-token: ${{ secrets.GITHUB_TOKEN }}
-
-          script: |          script: |
-
-            const fs = require('fs');            const fs = require('fs');
-
-            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-
-            const resp = fs.existsSync('resp.json') ? fs.readFileSync('resp.json','utf8') : '(no resp.json)';            const resp = fs.existsSync('resp.json') ? fs.readFileSync('resp.json','utf8') : '(no resp.json)';
-
-            await github.rest.issues.create({            await github.rest.issues.create({
-
-              owner: context.repo.owner,              owner: context.repo.owner,
-
-              repo: context.repo.repo,              repo: context.repo.repo,
-
-              title: `Healthcheck failed: HTTP ${process.env.HTTP_CODE || '???'} (${new Date().toISOString()})`,              title: `Healthcheck failed: HTTP ${process.env.HTTP_CODE || '???'} (${new Date().toISOString()})`,
-
-              body: [              body: [
-
-                `**HEALTH_URL**: ${process.env.HEALTH_URL || '(not resolved)'}`,                `**HEALTH_URL**: ${process.env.HEALTH_URL || '(not resolved)'}`,
-
-                `**HTTP_CODE**: ${process.env.HTTP_CODE || '(n/a)'}`,                `**HTTP_CODE**: ${process.env.HTTP_CODE || '(n/a)'}`,
-
-                `**Latency**: ${process.env.LATENCY ? process.env.LATENCY + 'ms' : '(n/a)'}`,                `**Latency**: ${process.env.LATENCY ? process.env.LATENCY + 'ms' : '(n/a)'}`,
-
-                `**Run**: ${runUrl}`,                `**Run**: ${runUrl}`,
-
-                '',                '',
-
-                '### Response',                '### Response',
-
-                '```json',                '```json',
-
-                resp,                resp,
-
-                '```'                '```'
-
-              ].join('\n'),              ].join('\n'),
-
-              labels: ['bug','healthcheck']              labels: ['bug','healthcheck']
-
-            });            });
-
+name: healthcheck
+
+on:
+  workflow_dispatch:  # 手動実行のみ
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve HEALTH_URL
+        id: resolve
+        run: |
+          if [ -n "${{ secrets.HEALTH_URL }}" ]; then
+            echo "HEALTH_URL=${{ secrets.HEALTH_URL }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ vars.HEALTH_URL }}" ]; then
+            echo "HEALTH_URL=${{ vars.HEALTH_URL }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ vars.PROJECT_REF }}" ]; then
+            echo "HEALTH_URL=https://${{ vars.PROJECT_REF }}.functions.supabase.co/ai-trader/health" >> "$GITHUB_OUTPUT"
+          else
+            echo "HEALTH_URL=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ping health endpoint (measure latency)
+        env:
+          HEALTH_URL: ${{ steps.resolve.outputs.HEALTH_URL }}
+        run: |
+          if [ -z "$HEALTH_URL" ]; then
+            echo "HEALTH_URL not set"; exit 1
+          fi
+          start=$(date +%s%3N)
+          HTTP_CODE=$(curl -s -o resp.json -w "%{http_code}" "$HEALTH_URL") || true
+          end=$(date +%s%3N)
+          LATENCY=$((end-start))
+          echo "HTTP_CODE=$HTTP_CODE"
+          echo "Latency=${LATENCY}ms"
+          echo "HTTP_CODE=$HTTP_CODE" >> "$GITHUB_ENV"
+          echo "LATENCY=$LATENCY" >> "$GITHUB_ENV"
+          OK=$(jq -r '.ok // "false"' resp.json 2>/dev/null || echo "false")
+          cat resp.json || true
+          if [ "$HTTP_CODE" = "200" ] && [ "$OK" = "true" ]; then
+            echo "Health check OK."
+            exit 0
+          else
+            echo "Health check failed"
+            exit 1
+          fi
+
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        env:
+          HEALTH_URL: ${{ steps.resolve.outputs.HEALTH_URL }}
+          LATENCY: ${{ env.LATENCY }}
+          HTTP_CODE: ${{ env.HTTP_CODE }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const resp = fs.existsSync('resp.json') ? fs.readFileSync('resp.json','utf8') : '(no resp.json)';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Healthcheck failed: HTTP ${process.env.HTTP_CODE || '???'} (${new Date().toISOString()})`,
+              body: [
+                `**HEALTH_URL**: ${process.env.HEALTH_URL || '(not resolved)'}`,
+                `**HTTP_CODE**: ${process.env.HTTP_CODE || '(n/a)'}`,
+                `**Latency**: ${process.env.LATENCY ? process.env.LATENCY + 'ms' : '(n/a)'}`,
+                `**Run**: ${runUrl}`,
+                '',
+                '### Response',
+                '```json',
+                resp,
+                '```'
+              ].join('\n'),
+              labels: ['bug','healthcheck']
+            });
