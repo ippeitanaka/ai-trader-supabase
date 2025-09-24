@@ -12,8 +12,10 @@ jobs:
       - uses: actions/checkout@v4
 
 
-      - name: Install Supabase CLI
-        run: npm i -g supabase@^2
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.x
 
       - name: Deploy edge function
         env:
