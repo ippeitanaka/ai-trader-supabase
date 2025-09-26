@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "lib": ["deno.ns", "dom"]
+  },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100
+  }
+}
