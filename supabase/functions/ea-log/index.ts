@@ -1,190 +1,377 @@
-// EA Log Edge Function for EA v1.2.2// EA Log Edge Function for EA v1.2.2// supabase/functions/ea-log/index.ts
+// EA Log Edge Function for EA v1.2.2// EA Log Edge Function for EA v1.2.2// EA Log Edge Function for EA v1.2.2// supabase/functions/ea-log/index.ts
 
 // Receives log entries from MT5 EA and stores them in ea-log table
 
-// Features: NUL byte removal, column fallback, CORS support, console logging// Receives POST requests from MT5 EA and inserts logs into ea-log table// -------------------------------------------------------------
+// Features: NUL byte removal, column fallback, CORS support, console logging// Receives log entries from MT5 EA and stores them in ea-log table
 
 
 
-import { serve } from "https://deno.land/std@0.224.0/http/server.ts";// Handles NUL byte removal and fallback for missing columns// MQL5 からの POST を安全に受け取り、ea_logs に UPSERT する関数。
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";// Features: NUL byte removal, column fallback, CORS support, console logging// Receives POST requests from MT5 EA and inserts logs into ea-log table// -------------------------------------------------------------
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// ・JSONは text() で受けてクリーンアップ後に safeJsonParse
+
 
 // ====== Environment Variables ======
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;import { serve } from "https://deno.land/std@0.224.0/http/server.ts";// ・bar_ts/at を ISO に正規化
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;import { serve } from "https://deno.land/std@0.224.0/http/server.ts";// Handles NUL byte removal and fallback for missing columns// MQL5 からの POST を安全に受け取り、ea_logs に UPSERT する関数。
 
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";// ・onConflict: bar_ts,sym,tf,account_login で重複吸収
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// ・CORS あり（POST/OPTIONS）
+// ・JSONは text() で受けてクリーンアップ後に safeJsonParse
 
 // ====== Types ======
 
-interface EALogEntry {// ====== Environment Variables ======// ・（任意）x-api-key チェック：EDGE_INGEST_KEY が未設定ならスキップ
+interface EALogEntry {// ====== Environment Variables ======
 
   at: string;
 
-  sym: string;const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;// -------------------------------------------------------------
+  sym: string;const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;import { serve } from "https://deno.land/std@0.224.0/http/server.ts";// ・bar_ts/at を ISO に正規化
 
   tf: string;
 
-  rsi?: number;const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+  rsi?: number;const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
   atr?: number;
 
-  price?: number;import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+  price?: number;import { createClient } from "https://esm.sh/@supabase/supabase-js@2";// ・onConflict: bar_ts,sym,tf,account_login で重複吸収
 
   action?: string;
 
-  win_prob?: number;const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);// ====== 環境変数 ======
+  win_prob?: number;const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-  offset_factor?: number;  // May not exist in older table versions
+  offset_factor?: number;
 
-  expiry_minutes?: number; // May not exist in older table versionsconst SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+  expiry_minutes?: number;// ・CORS あり（POST/OPTIONS）
 
   reason?: string;
 
-  instance?: string;// ====== Types ======const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  instance?: string;// ====== Types ======
 
   version?: string;
 
-  caller?: string;interface EALogEntry {const EDGE_INGEST_KEY = Deno.env.get("EDGE_INGEST_KEY") ?? ""; // 任意。設定したら x-api-key で検証
+  caller?: string;interface EALogEntry {// ====== Environment Variables ======// ・（任意）x-api-key チェック：EDGE_INGEST_KEY が未設定ならスキップ
 
 }
 
-  at: string;const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  at: string;
 
 // ====== Utility Functions ======
 
-function corsHeaders() {  sym: string;// ====== ユーティリティ ======
+function corsHeaders() {  sym: string;const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;// -------------------------------------------------------------
 
   return {
 
-    "Access-Control-Allow-Origin": "*",  tf: string;function corsHeaders(extra = {}) {
+    "Access-Control-Allow-Origin": "*",  tf: string;
 
     "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 
-    "Access-Control-Allow-Methods": "POST, OPTIONS",  rsi?: number;  return {
+    "Access-Control-Allow-Methods": "POST, OPTIONS",  rsi?: number;const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
     "Content-Type": "application/json",
 
-  };  atr?: number;    "Access-Control-Allow-Origin": "*",
+  };  atr?: number;
 
 }
 
-  price?: number;    "Access-Control-Allow-Headers": "*",
+  price?: number;import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // Normalize timestamp to ISO format
 
-function toISO(value: any): string {  action?: string;    "Access-Control-Allow-Methods": "POST,OPTIONS",
+function toISO(value: any): string {  action?: string;
 
   if (!value) return new Date().toISOString();
 
-    win_prob?: number;    "Content-Type": "application/json",
+    win_prob?: number;const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);// ====== 環境変数 ======
 
   if (typeof value === "string") {
 
-    if (/^\d{4}-\d{2}-\d{2}T/.test(value)) {  offset_factor?: number;  // Fallback field    ...extra
+    if (/^\d{4}-\d{2}-\d{2}T/.test(value)) {  offset_factor?: number;  // May not exist in older table versions
 
       const d = new Date(value);
 
-      return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();  expiry_minutes?: number; // Fallback field  };
+      return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();  expiry_minutes?: number; // May not exist in older table versionsconst SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 
     }
 
-    const d = new Date(value);  reason?: string;}
+    const d = new Date(value);  reason?: string;
 
     return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
 
-  }  instance?: string;// 末尾のゴミ(\0/改行/付帯文字)で JSON.parse が落ちないように安全にパース
+  }  instance?: string;// ====== Types ======const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
   
 
-  if (typeof value === "number") {  version?: string;function safeJsonParse(raw) {
+  if (typeof value === "number") {  version?: string;
 
     const ms = value > 1e12 ? value : value * 1000;
 
-    const d = new Date(ms);  caller?: string;  const cleaned = raw.replace(/\u0000/g, "").trim();
+    const d = new Date(ms);  caller?: string;interface EALogEntry {const EDGE_INGEST_KEY = Deno.env.get("EDGE_INGEST_KEY") ?? ""; // 任意。設定したら x-api-key で検証
 
     return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
 
-  }}  try {
+  }}
 
   
 
-  return new Date().toISOString();    return JSON.parse(cleaned);
+  return new Date().toISOString();  at: string;const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 }
 
-// ====== Utility Functions ======  } catch (_e) {
+// ====== Utility Functions ======
 
 // ====== Main Handler ======
 
-serve(async (req: Request) => {function corsHeaders() {    // 最後の } or ] までを切り出して再トライ
+serve(async (req: Request) => {function corsHeaders() {  sym: string;// ====== ユーティリティ ======
 
   // Handle CORS preflight
 
-  if (req.method === "OPTIONS") {  return {    const i = Math.max(cleaned.lastIndexOf("}"), cleaned.lastIndexOf("]"));
+  if (req.method === "OPTIONS") {  return {
 
     return new Response(null, { status: 204, headers: corsHeaders() });
 
-  }    "Access-Control-Allow-Origin": "*",    if (i > 0) {
+  }    "Access-Control-Allow-Origin": "*",  tf: string;function corsHeaders(extra = {}) {
 
   
 
-  // Only accept POST    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",      const sliced = cleaned.slice(0, i + 1);
+  // Only accept POST    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 
   if (req.method !== "POST") {
 
-    return new Response(    "Access-Control-Allow-Methods": "POST, OPTIONS",      return JSON.parse(sliced);
+    return new Response(    "Access-Control-Allow-Methods": "POST, OPTIONS",  rsi?: number;  return {
 
       JSON.stringify({ error: "Method not allowed, POST only" }),
 
-      { status: 405, headers: corsHeaders() }    "Content-Type": "application/json",    }
+      { status: 405, headers: corsHeaders() }    "Content-Type": "application/json",
 
     );
 
-  }  };    throw _e;
+  }  };  atr?: number;    "Access-Control-Allow-Origin": "*",
 
   
 
-  try {}  }
+  try {}
 
     // Read request body as text and remove trailing NUL bytes
 
-    const raw = await req.text();}
-
-    const safe = raw.replace(/\u0000+$/g, "");  // Remove trailing NUL
-
-    const body = JSON.parse(safe);// Remove trailing NUL bytes and parse JSON safely// epoch(s|ms)/ISO/未定義 を ISO 文字列に正規化
+    const raw = await req.text();  price?: number;    "Access-Control-Allow-Headers": "*",
 
     
 
-    // Normalize the log entryfunction safeJsonParse(raw: string): any {function toISO(x) {
+    // Check for empty body// Normalize timestamp to ISO format
 
-    const logEntry: EALogEntry = {
+    if (!raw || raw.trim().length === 0) {
 
-      at: toISO(body.at),  // Remove NUL bytes (\u0000) from the string  if (x === null || x === undefined) return new Date().toISOString();
+      console.warn("[ea-log] Empty request body received");function toISO(value: any): string {  action?: string;    "Access-Control-Allow-Methods": "POST,OPTIONS",
 
-      sym: body.sym || "UNKNOWN",
+      return new Response(
 
-      tf: body.tf || "UNKNOWN",  const cleaned = raw.replace(/\u0000/g, "").trim();  if (typeof x === "string") {
+        JSON.stringify({ error: "Empty request body" }),  if (!value) return new Date().toISOString();
 
-      rsi: body.rsi !== undefined ? Number(body.rsi) : undefined,
+        { status: 400, headers: corsHeaders() }
 
-      atr: body.atr !== undefined ? Number(body.atr) : undefined,  try {    // ざっくり ISO っぽければそのまま
+      );    win_prob?: number;    "Content-Type": "application/json",
 
-      price: body.price !== undefined ? Number(body.price) : undefined,
+    }
 
-      action: body.action || undefined,    return JSON.parse(cleaned);    if (/^\d{4}-\d{2}-\d{2}T/.test(x) || /^\d{4}\.\d{2}\.\d{2} /.test(x)) {
+      if (typeof value === "string") {
 
-      win_prob: body.win_prob !== undefined ? Number(body.win_prob) : undefined,
+    // Remove trailing NUL bytes
+
+    const safe = raw.replace(/\u0000+$/g, "");    if (/^\d{4}-\d{2}-\d{2}T/.test(value)) {  offset_factor?: number;  // Fallback field    ...extra
+
+    
+
+    // Check again after cleaning      const d = new Date(value);
+
+    if (!safe || safe.trim().length === 0) {
+
+      console.warn("[ea-log] Request body contains only NUL bytes");      return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();  expiry_minutes?: number; // Fallback field  };
+
+      return new Response(
+
+        JSON.stringify({ error: "Invalid request body (only NUL bytes)" }),    }
+
+        { status: 400, headers: corsHeaders() }
+
+      );    const d = new Date(value);  reason?: string;}
+
+    }
+
+        return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+
+    // Parse JSON
+
+    let body;  }  instance?: string;// 末尾のゴミ(\0/改行/付帯文字)で JSON.parse が落ちないように安全にパース
+
+    try {
+
+      body = JSON.parse(safe);  
+
+    } catch (parseError) {
+
+      console.error("[ea-log] JSON parse error:", parseError);  if (typeof value === "number") {  version?: string;function safeJsonParse(raw) {
+
+      console.error("[ea-log] Raw body (first 200 chars):", raw.substring(0, 200));
+
+      return new Response(    const ms = value > 1e12 ? value : value * 1000;
+
+        JSON.stringify({ 
+
+          error: "Invalid JSON",     const d = new Date(ms);  caller?: string;  const cleaned = raw.replace(/\u0000/g, "").trim();
+
+          details: parseError instanceof Error ? parseError.message : "Parse failed" 
+
+        }),    return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+
+        { status: 400, headers: corsHeaders() }
+
+      );  }}  try {
+
+    }
+
+      
+
+    // Normalize the log entry
+
+    const logEntry: EALogEntry = {  return new Date().toISOString();    return JSON.parse(cleaned);
+
+      at: toISO(body.at),
+
+      sym: body.sym || "UNKNOWN",}
+
+      tf: body.tf || "UNKNOWN",
+
+      rsi: body.rsi !== undefined ? Number(body.rsi) : undefined,// ====== Utility Functions ======  } catch (_e) {
+
+      atr: body.atr !== undefined ? Number(body.atr) : undefined,
+
+      price: body.price !== undefined ? Number(body.price) : undefined,// ====== Main Handler ======
+
+      action: body.action || undefined,
+
+      win_prob: body.win_prob !== undefined ? Number(body.win_prob) : undefined,serve(async (req: Request) => {function corsHeaders() {    // 最後の } or ] までを切り出して再トライ
+
+      offset_factor: body.offset_factor !== undefined ? Number(body.offset_factor) : undefined,
+
+      expiry_minutes: body.expiry_minutes !== undefined ? Number(body.expiry_minutes) : undefined,  // Handle CORS preflight
+
+      reason: body.reason || undefined,
+
+      instance: body.instance || undefined,  if (req.method === "OPTIONS") {  return {    const i = Math.max(cleaned.lastIndexOf("}"), cleaned.lastIndexOf("]"));
+
+      version: body.version || undefined,
+
+      caller: body.caller || undefined,    return new Response(null, { status: 204, headers: corsHeaders() });
+
+    };
+
+      }    "Access-Control-Allow-Origin": "*",    if (i > 0) {
+
+    // Try to insert with all columns
+
+    let { error } = await supabase  
+
+      .from("ea-log")
+
+      .insert(logEntry);  // Only accept POST    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",      const sliced = cleaned.slice(0, i + 1);
+
+    
+
+    // Fallback: If insert fails due to missing columns  if (req.method !== "POST") {
+
+    if (error && (error.message.includes("offset_factor") || error.message.includes("expiry_minutes"))) {
+
+      console.warn("[ea-log] Retrying without offset_factor/expiry_minutes columns");    return new Response(    "Access-Control-Allow-Methods": "POST, OPTIONS",      return JSON.parse(sliced);
+
+      
+
+      const fallbackEntry = { ...logEntry };      JSON.stringify({ error: "Method not allowed, POST only" }),
+
+      delete fallbackEntry.offset_factor;
+
+      delete fallbackEntry.expiry_minutes;      { status: 405, headers: corsHeaders() }    "Content-Type": "application/json",    }
+
+      
+
+      const result = await supabase    );
+
+        .from("ea-log")
+
+        .insert(fallbackEntry);  }  };    throw _e;
+
+      
+
+      error = result.error;  
+
+    }
+
+      try {}  }
+
+    if (error) {
+
+      console.error("[ea-log] DB insert error:", error);    // Read request body as text and remove trailing NUL bytes
+
+      return new Response(
+
+        JSON.stringify({ error: "Database insert failed", details: error.message }),    const raw = await req.text();}
+
+        { status: 500, headers: corsHeaders() }
+
+      );    const safe = raw.replace(/\u0000+$/g, "");  // Remove trailing NUL
+
+    }
+
+        const body = JSON.parse(safe);// Remove trailing NUL bytes and parse JSON safely// epoch(s|ms)/ISO/未定義 を ISO 文字列に正規化
+
+    // Log successful processing
+
+    console.log(    
+
+      `[ea-log] at=${logEntry.at} sym=${logEntry.sym} tf=${logEntry.tf} ` +
+
+      `caller=${logEntry.caller ?? "-"} win_prob=${logEntry.win_prob !== undefined ? logEntry.win_prob.toFixed(3) : "N/A"}`    // Normalize the log entryfunction safeJsonParse(raw: string): any {function toISO(x) {
+
+    );
+
+        const logEntry: EALogEntry = {
+
+    return new Response(
+
+      JSON.stringify({ ok: true, message: "Log entry created" }),      at: toISO(body.at),  // Remove NUL bytes (\u0000) from the string  if (x === null || x === undefined) return new Date().toISOString();
+
+      { status: 200, headers: corsHeaders() }
+
+    );      sym: body.sym || "UNKNOWN",
+
+    
+
+  } catch (error) {      tf: body.tf || "UNKNOWN",  const cleaned = raw.replace(/\u0000/g, "").trim();  if (typeof x === "string") {
+
+    console.error("[ea-log] Error:", error);
+
+    return new Response(      rsi: body.rsi !== undefined ? Number(body.rsi) : undefined,
+
+      JSON.stringify({ 
+
+        error: "Internal server error",      atr: body.atr !== undefined ? Number(body.atr) : undefined,  try {    // ざっくり ISO っぽければそのまま
+
+        message: error instanceof Error ? error.message : "Unknown error"
+
+      }),      price: body.price !== undefined ? Number(body.price) : undefined,
+
+      { status: 500, headers: corsHeaders() }
+
+    );      action: body.action || undefined,    return JSON.parse(cleaned);    if (/^\d{4}-\d{2}-\d{2}T/.test(x) || /^\d{4}\.\d{2}\.\d{2} /.test(x)) {
+
+  }
+
+});      win_prob: body.win_prob !== undefined ? Number(body.win_prob) : undefined,
+
 
       offset_factor: body.offset_factor !== undefined ? Number(body.offset_factor) : undefined,  } catch (e) {      const d = new Date(x);
 
