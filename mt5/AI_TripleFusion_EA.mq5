@@ -12,7 +12,7 @@ input bool   LockToChartSymbol = true;
 input ENUM_TIMEFRAMES TF_Entry   = PERIOD_M15;
 input ENUM_TIMEFRAMES TF_Recheck = PERIOD_H1;
 
-input double MinWinProb          = 0.75;
+input double MinWinProb          = 75.0;
 input double RiskATRmult         = 1.5;
 input double RewardRR            = 1.2;
 input double PendingOffsetATR    = 0.2;
@@ -20,6 +20,7 @@ input int    PendingExpiryMin    = 90;
 input double Lots                = 0.10;
 input int    SlippagePoints      = 1000;
 input long   Magic               = 26091501;
+input int    MaxPositions        = 1;      // 同一銘柄の最大ポジション数
 
 input bool   DebugLogs           = true;
 input int    LogCooldownSec      = 30;  // 0=全出力, >0=間引き, -1=完全OFF
@@ -207,6 +208,21 @@ void Cancel(string why){if(g_pendingTicket==0)return;if(OrderSelect(g_pendingTic
    trade.OrderDelete(g_pendingTicket);SafePrint("[ORDER] canceled: "+why);}
    g_pendingTicket=0;g_pendingDir=0;g_pendingAt=0;}
 
+// ポジション数チェック
+int CountPositions()
+{
+   int count=0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket<=0) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+      count++;
+   }
+   return count;
+}
+
 // ===== バー処理 =====
 void OnM15NewBar()
 {
@@ -215,6 +231,13 @@ void OnM15NewBar()
    AIOut ai; if(!QueryAI("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai))return;
 
    if(ai.win_prob>=g_curMinWinProb){
+      // ポジション数チェック
+      int posCount=CountPositions();
+      if(posCount>=MaxPositions){
+         SafePrint(StringFormat("[M15] skip: already %d position(s)",posCount));
+         return;
+      }
+      
       if(OrderAlive(g_pendingTicket)) Cancel("replace");
       PendingPlan p=BuildPending(t.dir,t.atr,ai.offset_factor);
       trade.SetExpertMagicNumber(Magic);trade.SetDeviationInPoints(SlippagePoints);
