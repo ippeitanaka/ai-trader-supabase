@@ -1,200 +1,397 @@
-// AI Trader Edge Function for EA v1.2.2// AI Trader Edge Function (Hybrid: Consensus + Optional AI Bias)
+// AI Trader Edge Function for EA v1.2.2// AI Trader Edge Function for EA v1.2.2// AI Trader Edge Function (Hybrid: Consensus + Optional AI Bias)
 
-// Simple AI trading signal endpoint with NUL byte removal and logging// - 汎用：どの通貨ペアでも同じURLでOK（銘柄別上書き可）
+// Receives technical indicators from MT5 EA and returns AI trading signals
 
-// Handles POST requests from MT5 EA, returns trading signals with win probability// - フィルタ：時間帯 / スプレッド / 低ボラ / ソフト・レート制限
+// Features: NUL byte removal, RSI/ATR-based logic, CORS support, console logging// Simple AI trading signal endpoint with NUL byte removal and logging// - 汎用：どの通貨ペアでも同じURLでOK（銘柄別上書き可）
+
+
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";// Handles POST requests from MT5 EA, returns trading signals with win probability// - フィルタ：時間帯 / スプレッド / 低ボラ / ソフト・レート制限
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 // - 合議制：SMA, RSI, MACD, ADX(DI), Stochastic, Bollinger
 
-import { serve } from "https://deno.land/std@0.224.0/http/server.ts";// - DiNapoli拡張：Fib 38.2/50/61.8 ゾーン / 3x3,7x5,25x5(擬似DMA) / MACD Predictor
+// ====== Environment Variables ======
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;import { serve } from "https://deno.land/std@0.224.0/http/server.ts";// - DiNapoli拡張：Fib 38.2/50/61.8 ゾーン / 3x3,7x5,25x5(擬似DMA) / MACD Predictor
+
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";// - AI補助：拮抗局面だけ+1/0/-1の微バイアス & タグ/コメント（失敗時は即フォールバック）
 
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
 // - 認証：Bearer（環境変数AI_TRADER_API_KEYを設定したときだけ必須）
 
-// ====== Environment Variables ======// Deno runtime
+// ====== Types ======
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+interface TradeRequest {// ====== Environment Variables ======// Deno runtime
 
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;import { serve } from "std/http/server.ts";
+  symbol: string;
 
-
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);/* ========================= 環境変数 ========================= */
-
-// 認証（空なら無効＝誰でも可）
-
-// ====== Types ======const API_KEY = Deno.env.get("AI_TRADER_API_KEY") ?? "";
-
-interface TradeRequest {
-
-  symbol: string;// ログ
-
-  timeframe: string;const LOG_REASON = (Deno.env.get("AI_TRADER_LOG_REASON") ?? "true") === "true";
+  timeframe: string;const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 
   dir: number;  // 1=BUY, -1=SELL, 0=NEUTRAL
 
-  rsi: number;// 時間帯フィルタ（JST）
+  rsi: number;const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;import { serve } from "std/http/server.ts";
 
-  atr: number;const ENABLE_TIME_FILTER   = (Deno.env.get("ENABLE_TIME_FILTER") ?? "false") === "true";
+  atr: number;
 
-  price: number;const TRADE_START_HOUR_JST = Number(Deno.env.get("TRADE_START_HOUR_JST") ?? 8);
+  price: number;
 
-  reason: string;const TRADE_END_HOUR_JST   = Number(Deno.env.get("TRADE_END_HOUR_JST") ?? 23);
+  reason: string;
 
-  instance?: string;
+  instance?: string;const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);/* ========================= 環境変数 ========================= */
 
-  version?: string;// フィルタ閾値（汎用デフォルト）
+  version?: string;
 
-}const SPREAD_MAX_DEFAULT = Number(Deno.env.get("SPREAD_MAX") ?? 0); // 0=無効
+}// 認証（空なら無効＝誰でも可）
 
-const ATR_MIN_DEFAULT    = Number(Deno.env.get("ATR_MIN") ?? 0);    // 0=無効
 
-interface TradeResponse {
 
-  win_prob: number;// 合議制しきい値
+interface TradeResponse {// ====== Types ======const API_KEY = Deno.env.get("AI_TRADER_API_KEY") ?? "";
 
-  action: number;  // 1=BUY, -1=SELL, 0=HOLDconst RSI_BUY_MIN_DEFAULT  = Number(Deno.env.get("RSI_BUY_MIN") ?? 55);
+  win_prob: number;
 
-  offset_factor: number;const RSI_SELL_MAX_DEFAULT = Number(Deno.env.get("RSI_SELL_MAX") ?? 45);
+  action: number;  // 1=BUY, -1=SELL, 0=HOLDinterface TradeRequest {
 
-  expiry_minutes: number;const ADX_MIN_DEFAULT      = Number(Deno.env.get("ADX_MIN") ?? 22);
+  offset_factor: number;
+
+  expiry_minutes: number;  symbol: string;// ログ
 
 }
 
-// スコア採択条件
+  timeframe: string;const LOG_REASON = (Deno.env.get("AI_TRADER_LOG_REASON") ?? "true") === "true";
 
-// ====== Utility Functions ======const SCORE_FIRE_MIN_DEFAULT   = Number(Deno.env.get("SCORE_FIRE_MIN") ?? 4);
+// ====== Utility Functions ======
 
-function corsHeaders() {const SCORE_MARGIN_MIN_DEFAULT = Number(Deno.env.get("SCORE_MARGIN_MIN") ?? 2);
+function corsHeaders() {  dir: number;  // 1=BUY, -1=SELL, 0=NEUTRAL
 
   return {
 
-    "Access-Control-Allow-Origin": "*",// TTL（EA側で有効視する秒数）
+    "Access-Control-Allow-Origin": "*",  rsi: number;// 時間帯フィルタ（JST）
 
-    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",const TTL_SEC_DEFAULT = Number(Deno.env.get("TTL_SEC_DEFAULT") ?? 30);
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 
-    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",  atr: number;const ENABLE_TIME_FILTER   = (Deno.env.get("ENABLE_TIME_FILTER") ?? "false") === "true";
 
-    "Content-Type": "application/json",// ソフトRateLimit（インスタンス内メモリ）
+    "Content-Type": "application/json",
 
-  };const RL_MAX_HITS_PER_MIN = Number(Deno.env.get("RL_MAX_HITS_PER_MIN") ?? 120);
+  };  price: number;const TRADE_START_HOUR_JST = Number(Deno.env.get("TRADE_START_HOUR_JST") ?? 8);
 
 }
 
-// 銘柄別上書き（JSON文字列）
+  reason: string;const TRADE_END_HOUR_JST   = Number(Deno.env.get("TRADE_END_HOUR_JST") ?? 23);
 
-// Remove trailing NUL bytes and parse JSON safelytype SymCfg = Partial<{
+// Simple AI logic based on technical indicators
 
-function safeJsonParse(raw: string): any {  SPREAD_MAX:number; ATR_MIN:number;
+function calculateSignal(req: TradeRequest): TradeResponse {  instance?: string;
 
-  // Remove NUL bytes (\u0000) from the string  RSI_BUY_MIN:number; RSI_SELL_MAX:number; ADX_MIN:number;
+  const { dir, rsi, atr } = req;
 
-  const cleaned = raw.replace(/\u0000/g, "").trim();  SCORE_FIRE_MIN:number; SCORE_MARGIN_MIN:number;
+    version?: string;// フィルタ閾値（汎用デフォルト）
 
-  try {}>;
+  let win_prob = 0.5;  // Base probability
 
-    return JSON.parse(cleaned);const OVERRIDES: Record<string, SymCfg> = (() => {
+  let action = 0;      // Default HOLD}const SPREAD_MAX_DEFAULT = Number(Deno.env.get("SPREAD_MAX") ?? 0); // 0=無効
 
-  } catch (e) {  try {
+  let offset_factor = 0.2;
 
-    // Try to recover by finding the last valid JSON closing bracket    const raw = Deno.env.get("AI_TRADER_SYMBOL_OVERRIDES") ?? "";
+  let expiry_minutes = 90;const ATR_MIN_DEFAULT    = Number(Deno.env.get("ATR_MIN") ?? 0);    // 0=無効
 
-    const lastBrace = cleaned.lastIndexOf("}");    return raw ? JSON.parse(raw) : {};
+  
 
-    const lastBracket = cleaned.lastIndexOf("]");  } catch { return {}; }
-
-    const lastValid = Math.max(lastBrace, lastBracket);})();
-
-    
-
-    if (lastValid > 0) {// ====== AI 呼び出し系（任意・安全フォールバック） ======
-
-      const sliced = cleaned.slice(0, lastValid + 1);const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
-
-      return JSON.parse(sliced);const AI_MODEL       = Deno.env.get("AI_MODEL") ?? "gpt-4o-mini";
-
-    }const AI_TIMEOUT_MS  = Number(Deno.env.get("AI_TIMEOUT_MS") ?? 1500);
-
-    throw e;const AI_ENABLE      = (Deno.env.get("AI_ENABLE") ?? "true") === "true";
-
-  }
-
-}/* ========================= 型 ========================= */
-
-type InPayload = {
-
-// Simple AI logic based on technical indicators  symbol: string;
-
-function calculateSignal(req: TradeRequest): TradeResponse {  timeframe: string;
-
-  const { dir, rsi, atr, symbol, timeframe } = req;  time: number;
-
-    price: number;
-
-  let win_prob = 0.5;  // Base probability  bid: number;
-
-  let action = 0;      // Default HOLD  ask: number;
-
-  let offset_factor = 0.2;  sma_fast: number;
-
-  let expiry_minutes = 90;  sma_slow: number;
-
-    rsi: number;
-
-  // RSI-based adjustments  atr: number;
+  // RSI-based adjustmentsinterface TradeResponse {
 
   if (rsi > 70) {
 
-    // Overbought - favor SELL  // 任意（送れば使う）
+    // Overbought - favor SELL  win_prob: number;// 合議制しきい値
 
-    win_prob += (dir < 0) ? 0.15 : -0.10;  macd?: number;
+    win_prob += (dir < 0) ? 0.15 : -0.10;
 
-  } else if (rsi < 30) {  macd_signal?: number;
+  } else if (rsi < 30) {  action: number;  // 1=BUY, -1=SELL, 0=HOLDconst RSI_BUY_MIN_DEFAULT  = Number(Deno.env.get("RSI_BUY_MIN") ?? 55);
 
-    // Oversold - favor BUY  macd_hist?: number;
+    // Oversold - favor BUY
 
-    win_prob += (dir > 0) ? 0.15 : -0.10;
+    win_prob += (dir > 0) ? 0.15 : -0.10;  offset_factor: number;const RSI_SELL_MAX_DEFAULT = Number(Deno.env.get("RSI_SELL_MAX") ?? 45);
 
-  } else if (rsi > 55 && rsi < 70) {  adx?: number;
+  } else if (rsi > 55 && rsi < 70) {
 
-    // Bullish zone  plus_di?: number;
+    // Bullish zone  expiry_minutes: number;const ADX_MIN_DEFAULT      = Number(Deno.env.get("ADX_MIN") ?? 22);
 
-    win_prob += (dir > 0) ? 0.12 : -0.08;  minus_di?: number;
+    win_prob += (dir > 0) ? 0.12 : -0.08;
 
-  } else if (rsi < 45 && rsi > 30) {
+  } else if (rsi < 45 && rsi > 30) {}
 
-    // Bearish zone  stoch_k?: number;
+    // Bearish zone
 
-    win_prob += (dir < 0) ? 0.12 : -0.08;  stoch_d?: number;
+    win_prob += (dir < 0) ? 0.12 : -0.08;// スコア採択条件
 
   }
 
-    bb_upper?: number;
+  // ====== Utility Functions ======const SCORE_FIRE_MIN_DEFAULT   = Number(Deno.env.get("SCORE_FIRE_MIN") ?? 4);
 
-  // Direction confirmation  bb_basis?: number;
+  // Direction confirmation
 
-  if (dir !== 0) {  bb_lower?: number;
+  if (dir !== 0) {function corsHeaders() {const SCORE_MARGIN_MIN_DEFAULT = Number(Deno.env.get("SCORE_MARGIN_MIN") ?? 2);
 
     win_prob += 0.10;  // Bonus for having a direction
 
-  }  // DiNapoli 追加入力（EAで算出）
+  }  return {
 
-    fib_leg_dir?: "UP"|"DOWN"|""; // 押し目/戻り方向
+  
 
-  // ATR-based volatility adjustment  fib_retracement?: number;     // 0..1
+  // ATR-based volatility adjustment    "Access-Control-Allow-Origin": "*",// TTL（EA側で有効視する秒数）
 
-  if (atr > 0) {  dma33_cross?: number;         // -1/0/+1
+  if (atr > 0) {
 
-    // Higher volatility = wider offset  dma75_cross?: number;
+    if (atr > 0.001) {    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",const TTL_SEC_DEFAULT = Number(Deno.env.get("TTL_SEC_DEFAULT") ?? 30);
 
-    if (atr > 0.001) {  dma255_cross?: number;
+      offset_factor = 0.25;
 
-      offset_factor = 0.25;  price_vs_dma33?: number;      // -1/0/+1
+    }    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
 
-    }  price_vs_dma75?: number;
+    if (atr < 0.0005) {
 
-    // Lower volatility = tighter offset  price_vs_dma255?: number;
+      offset_factor = 0.15;    "Content-Type": "application/json",// ソフトRateLimit（インスタンス内メモリ）
+
+      expiry_minutes = 60;
+
+    }  };const RL_MAX_HITS_PER_MIN = Number(Deno.env.get("RL_MAX_HITS_PER_MIN") ?? 120);
+
+  }
+
+  }
+
+  // Clamp probability between 0 and 1
+
+  win_prob = Math.max(0, Math.min(1, win_prob));// 銘柄別上書き（JSON文字列）
+
+  
+
+  // Determine action based on direction and probability// Remove trailing NUL bytes and parse JSON safelytype SymCfg = Partial<{
+
+  if (win_prob >= 0.70) {
+
+    action = dir;function safeJsonParse(raw: string): any {  SPREAD_MAX:number; ATR_MIN:number;
+
+  } else {
+
+    action = 0;  // Remove NUL bytes (\u0000) from the string  RSI_BUY_MIN:number; RSI_SELL_MAX:number; ADX_MIN:number;
+
+  }
+
+    const cleaned = raw.replace(/\u0000/g, "").trim();  SCORE_FIRE_MIN:number; SCORE_MARGIN_MIN:number;
+
+  return {
+
+    win_prob: Math.round(win_prob * 1000) / 1000,  try {}>;
+
+    action,
+
+    offset_factor: Math.round(offset_factor * 1000) / 1000,    return JSON.parse(cleaned);const OVERRIDES: Record<string, SymCfg> = (() => {
+
+    expiry_minutes,
+
+  };  } catch (e) {  try {
+
+}
+
+    // Try to recover by finding the last valid JSON closing bracket    const raw = Deno.env.get("AI_TRADER_SYMBOL_OVERRIDES") ?? "";
+
+// ====== Main Handler ======
+
+serve(async (req: Request) => {    const lastBrace = cleaned.lastIndexOf("}");    return raw ? JSON.parse(raw) : {};
+
+  // Handle CORS preflight
+
+  if (req.method === "OPTIONS") {    const lastBracket = cleaned.lastIndexOf("]");  } catch { return {}; }
+
+    return new Response(null, { status: 204, headers: corsHeaders() });
+
+  }    const lastValid = Math.max(lastBrace, lastBracket);})();
+
+  
+
+  // Handle GET for health check    
+
+  if (req.method === "GET") {
+
+    return new Response(    if (lastValid > 0) {// ====== AI 呼び出し系（任意・安全フォールバック） ======
+
+      JSON.stringify({ 
+
+        ok: true,       const sliced = cleaned.slice(0, lastValid + 1);const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
+
+        service: "ai-trader", 
+
+        version: "1.2.2",      return JSON.parse(sliced);const AI_MODEL       = Deno.env.get("AI_MODEL") ?? "gpt-4o-mini";
+
+        timestamp: new Date().toISOString()
+
+      }),    }const AI_TIMEOUT_MS  = Number(Deno.env.get("AI_TIMEOUT_MS") ?? 1500);
+
+      { status: 200, headers: corsHeaders() }
+
+    );    throw e;const AI_ENABLE      = (Deno.env.get("AI_ENABLE") ?? "true") === "true";
+
+  }
+
+    }
+
+  // Handle POST for trading signals
+
+  if (req.method !== "POST") {}/* ========================= 型 ========================= */
+
+    return new Response(
+
+      JSON.stringify({ error: "Method not allowed" }),type InPayload = {
+
+      { status: 405, headers: corsHeaders() }
+
+    );// Simple AI logic based on technical indicators  symbol: string;
+
+  }
+
+  function calculateSignal(req: TradeRequest): TradeResponse {  timeframe: string;
+
+  try {
+
+    // Read request body as text and remove trailing NUL bytes  const { dir, rsi, atr, symbol, timeframe } = req;  time: number;
+
+    const raw = await req.text();
+
+    const safe = raw.replace(/\u0000+$/g, "");  // Remove trailing NUL    price: number;
+
+    const body = JSON.parse(safe);
+
+      let win_prob = 0.5;  // Base probability  bid: number;
+
+    // Validate required fields
+
+    const required = ["symbol", "timeframe", "dir", "rsi", "atr", "price", "reason"];  let action = 0;      // Default HOLD  ask: number;
+
+    for (const field of required) {
+
+      if (!(field in body)) {  let offset_factor = 0.2;  sma_fast: number;
+
+        return new Response(
+
+          JSON.stringify({ error: `Missing required field: ${field}` }),  let expiry_minutes = 90;  sma_slow: number;
+
+          { status: 400, headers: corsHeaders() }
+
+        );    rsi: number;
+
+      }
+
+    }  // RSI-based adjustments  atr: number;
+
+    
+
+    const tradeReq: TradeRequest = body;  if (rsi > 70) {
+
+    
+
+    // Calculate AI signal    // Overbought - favor SELL  // 任意（送れば使う）
+
+    const response = calculateSignal(tradeReq);
+
+        win_prob += (dir < 0) ? 0.15 : -0.10;  macd?: number;
+
+    // Log successful processing (required by spec)
+
+    console.log(  } else if (rsi < 30) {  macd_signal?: number;
+
+      `[ai-trader] symbol=${tradeReq.symbol} tf=${tradeReq.timeframe} ` +
+
+      `dir=${tradeReq.dir} win=${response.win_prob.toFixed(3)} ` +    // Oversold - favor BUY  macd_hist?: number;
+
+      `off=${response.offset_factor.toFixed(3)} exp=${response.expiry_minutes} ` +
+
+      `inst=${tradeReq.instance ?? "-"} ver=${tradeReq.version ?? "-"}`    win_prob += (dir > 0) ? 0.15 : -0.10;
+
+    );
+
+      } else if (rsi > 55 && rsi < 70) {  adx?: number;
+
+    // Optional: Insert into ai_signals table (commented out for performance)
+
+    // Uncomment below to enable signal history storage    // Bullish zone  plus_di?: number;
+
+    /*
+
+    try {    win_prob += (dir > 0) ? 0.12 : -0.08;  minus_di?: number;
+
+      await supabase.from("ai_signals").insert({
+
+        symbol: tradeReq.symbol,  } else if (rsi < 45 && rsi > 30) {
+
+        timeframe: tradeReq.timeframe,
+
+        dir: tradeReq.dir,    // Bearish zone  stoch_k?: number;
+
+        win_prob: response.win_prob,
+
+        atr: tradeReq.atr,    win_prob += (dir < 0) ? 0.12 : -0.08;  stoch_d?: number;
+
+        rsi: tradeReq.rsi,
+
+        price: tradeReq.price,  }
+
+        reason: tradeReq.reason,
+
+        instance: tradeReq.instance,    bb_upper?: number;
+
+        model_version: tradeReq.version,
+
+      });  // Direction confirmation  bb_basis?: number;
+
+    } catch (dbError) {
+
+      console.error("[ai-trader] DB insert error:", dbError);  if (dir !== 0) {  bb_lower?: number;
+
+      // Continue even if DB insert fails
+
+    }    win_prob += 0.10;  // Bonus for having a direction
+
+    */
+
+      }  // DiNapoli 追加入力（EAで算出）
+
+    return new Response(
+
+      JSON.stringify(response),    fib_leg_dir?: "UP"|"DOWN"|""; // 押し目/戻り方向
+
+      { status: 200, headers: corsHeaders() }
+
+    );  // ATR-based volatility adjustment  fib_retracement?: number;     // 0..1
+
+    
+
+  } catch (error) {  if (atr > 0) {  dma33_cross?: number;         // -1/0/+1
+
+    console.error("[ai-trader] Error:", error);
+
+    return new Response(    // Higher volatility = wider offset  dma75_cross?: number;
+
+      JSON.stringify({ 
+
+        error: "Internal server error",    if (atr > 0.001) {  dma255_cross?: number;
+
+        message: error instanceof Error ? error.message : "Unknown error"
+
+      }),      offset_factor = 0.25;  price_vs_dma33?: number;      // -1/0/+1
+
+      { status: 500, headers: corsHeaders() }
+
+    );    }  price_vs_dma75?: number;
+
+  }
+
+});    // Lower volatility = tighter offset  price_vs_dma255?: number;
+
 
     if (atr < 0.0005) {  macd_hist_slope?: number;     // 予測用の傾き
 

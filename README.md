@@ -189,19 +189,52 @@ supabase db push
 # - 20251013_003_create_ai_signals_table.sql
 ```
 
-### 3. Deploy Edge Functions
+### 3. Set Required Secrets
+
+Edge Functions require these environment variables:
+
+| Secret Name | Description | Example |
+|------------|-------------|---------|
+| `SUPABASE_URL` | Your Supabase project URL | `https://abcdefgh.supabase.co` |
+| `SUPABASE_SERVICE_ROLE_KEY` | Service role key (Settings → API) | `eyJ...` |
+
 ```bash
-# Deploy all functions
+# Set secrets
+supabase secrets set SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+supabase secrets set SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
+
+# Verify secrets
+supabase secrets list
+```
+
+### 4. Deploy Edge Functions
+
+Deploy all three functions:
+
+```bash
+# Deploy individually
 supabase functions deploy ai-trader
 supabase functions deploy ea-log
 supabase functions deploy ai-config
 
-# Set secrets
-supabase secrets set SUPABASE_URL=https://YOUR_PROJECT.supabase.co
-supabase secrets set SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
+# Or deploy all at once (if supported)
+supabase functions deploy
 ```
 
-### 4. Configure MT5 EA
+**Endpoint URLs** will be:
+- `https://<project-ref>.functions.supabase.co/ai-trader`
+- `https://<project-ref>.functions.supabase.co/ea-log`
+- `https://<project-ref>.functions.supabase.co/ai-config`
+
+### 5. Configure MT5 EA
+
+#### Allow WebRequest URLs in MT5
+
+1. Open MT5: **Tools → Options → Expert Advisors**
+2. Check "Allow WebRequest for listed URL:"
+3. Add: `https://<project-ref>.functions.supabase.co`
+
+#### Update EA Parameters
 Update the EA parameters with your Supabase URLs:
 ```mql5
 input string AI_Endpoint_URL = "https://YOUR_PROJECT.functions.supabase.co/ai-trader";
@@ -257,16 +290,76 @@ SET
 WHERE instance = 'main';
 ```
 
-## 📝 EA v1.2.2 Update Summary (2025-10-13)
+## � Technical Details
+
+### NUL Byte Handling
+
+MQL5's `WebRequest()` can append trailing NUL bytes (`\u0000`) to JSON payloads. All Edge Functions handle this:
+
+```typescript
+// Read as text first
+const raw = await req.text();
+// Remove trailing NUL bytes
+const safe = raw.replace(/\u0000+$/g, "");
+// Parse cleaned JSON
+const body = JSON.parse(safe);
+```
+
+**Why this approach:**
+- MQL5 `StringToCharArray()` adds NUL terminators
+- Direct `req.json()` fails with `SyntaxError: Unexpected token`
+- Text-based cleaning ensures compatibility
+
+### Safe Query Pattern
+
+The `ai-config` function uses `.maybeSingle()` instead of `.single()`:
+
+```typescript
+const { data, error } = await supabase
+  .from("ai_config")
+  .select("*")
+  .eq("instance", instance)
+  .maybeSingle();  // Returns null if no rows, first row if multiple
+```
+
+**Benefits:**
+- No error when table is empty
+- Graceful handling of multiple rows
+- Always returns default config as fallback
+
+### Column Fallback Strategy
+
+The `ea-log` function implements retry logic for missing columns:
+
+```typescript
+let { error } = await supabase.from("ea-log").insert(logEntry);
+
+// Retry without optional columns if they don't exist
+if (error && (error.message.includes("offset_factor") || error.message.includes("expiry_minutes"))) {
+  const fallbackEntry = { ...logEntry };
+  delete fallbackEntry.offset_factor;
+  delete fallbackEntry.expiry_minutes;
+  
+  const result = await supabase.from("ea-log").insert(fallbackEntry);
+  error = result.error;
+}
+```
+
+**Why:**
+- Backward compatibility with older table schemas
+- No 500 errors due to schema mismatch
+- Allows gradual migration
+
+## �📝 EA v1.2.2 Update Summary (2025-10-13)
 
 ### Changes
-- ✅ **NUL byte removal**: All functions handle `\u0000` from MQL5 POST requests
-- ✅ **Console logging**: All functions log successful operations
-- ✅ **CORS support**: Full OPTIONS/GET/POST support
-- ✅ **maybeSingle()**: ai-config uses safe query method
-- ✅ **Default fallback**: ai-config returns defaults when table is empty
-- ✅ **Column fallback**: ea-log handles missing offset_factor/expiry_minutes
-- ✅ **Migrations**: Three DDL files for table creation
+- ✅ **NUL byte removal**: All functions use `raw.replace(/\u0000+$/g, "")` pattern
+- ✅ **Console logging**: Structured logs with `[function-name]` prefix
+- ✅ **CORS support**: Complete GET/POST/OPTIONS with proper headers
+- ✅ **maybeSingle()**: Safe query method in ai-config
+- ✅ **Default fallback**: ai-config returns `{min_win_prob:0.7, pending_offset_atr:0.2, pending_expiry_min:90}`
+- ✅ **Column fallback**: ea-log retries without offset_factor/expiry_minutes on failure
+- ✅ **Migrations**: Three DDL files with `IF NOT EXISTS` clauses
 
 ### File Structure
 ```
