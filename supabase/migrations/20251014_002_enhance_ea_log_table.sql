@@ -32,7 +32,7 @@ SELECT
   sym AS symbol,
   tf AS timeframe,
   action AS direction,
-  ROUND(win_prob * 100, 1) || '%' AS win_rate,
+  ROUND(CAST(win_prob * 100 AS NUMERIC), 1) || '%' AS win_rate,
   ai_confidence AS confidence,
   trade_decision AS trade_status,
   CASE 
