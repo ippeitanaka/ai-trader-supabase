@@ -50,16 +50,6 @@ ulong    g_trackedPositionTicket=0;
 datetime g_trackedPositionOpenTime=0;
 double   g_trackedPositionEntryPrice=0;
 
-// 入力（input）の動的コピー（ai-configで上書きするため）
-double g_curMinWinProb;
-double g_curRiskATRmult;
-double g_curRewardRR;
-double g_curPendingOffsetATR;
-int    g_curPendingExpiryMin;
-double g_curLots;
-int    g_curSlippagePoints;
-int    g_curMaxPositions;
-
 // ===== ログ =====
 void SafePrint(string msg)
 {
@@ -267,25 +257,13 @@ void CancelSignal(ulong ticket,const string reason)
    HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000);
 }
 
-// ===== 設定同期 =====
+// ===== 設定同期（無効化：すべてEAプロパティから取得） =====
 void SyncConfig()
 {
-   string resp;
-   if(!HttpGet(AI_Config_URL,AI_Bearer_Token,resp,AI_Timeout_ms)) return;
-   double v; int vi;
-   
-   // 全14パラメータを同期
-   if(ExtractJsonNumber(resp,"min_win_prob",v)&&v>0) g_curMinWinProb=v;
-   if(ExtractJsonNumber(resp,"risk_atr_mult",v)&&v>0) g_curRiskATRmult=v;
-   if(ExtractJsonNumber(resp,"reward_rr",v)&&v>0) g_curRewardRR=v;
-   if(ExtractJsonNumber(resp,"pending_offset_atr",v)&&v>0) g_curPendingOffsetATR=v;
-   if(ExtractJsonInt(resp,"pending_expiry_min",vi)&&vi>0) g_curPendingExpiryMin=vi;
-   if(ExtractJsonNumber(resp,"lots",v)&&v>0) g_curLots=v;
-   if(ExtractJsonInt(resp,"slippage_points",vi)&&vi>=0) g_curSlippagePoints=vi;
-   if(ExtractJsonInt(resp,"max_positions",vi)&&vi>0) g_curMaxPositions=vi;
-   
-   SafePrint(StringFormat("[CONFIG] sync -> MinWinProb=%.2f, Risk=%.2f, RR=%.2f, Offset=%.2f, Expiry=%d, Lots=%.2f, Slip=%d, MaxPos=%d",
-      g_curMinWinProb,g_curRiskATRmult,g_curRewardRR,g_curPendingOffsetATR,g_curPendingExpiryMin,g_curLots,g_curSlippagePoints,g_curMaxPositions));
+   // ai_configテーブルの使用を中止
+   // すべてのパラメータはEAのinputプロパティから取得します
+   SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.2f, Risk=%.2f, RR=%.2f, Offset=%.2f, Expiry=%d, Lots=%.2f, Slip=%d, MaxPos=%d",
+      MinWinProb,RiskATRmult,RewardRR,PendingOffsetATR,PendingExpiryMin,Lots,SlippagePoints,MaxPositions));
 }
 
 // ===== 注文関連 =====
@@ -293,8 +271,8 @@ struct PendingPlan{double price;double sl;double tp;int type;};
 PendingPlan BuildPending(int dir,double atr,double ai_offset){
    PendingPlan p; p.type=0;if(atr<=0)return p;
    double mid=(SymbolInfoDouble(_Symbol,SYMBOL_BID)+SymbolInfoDouble(_Symbol,SYMBOL_ASK))/2.0;
-   double offset=atr*(ai_offset>0?ai_offset:g_curPendingOffsetATR);
-   double slDist=atr*g_curRiskATRmult,tpDist=slDist*g_curRewardRR;  // 動的変数を使用
+   double offset=atr*(ai_offset>0?ai_offset:PendingOffsetATR);
+   double slDist=atr*RiskATRmult,tpDist=slDist*RewardRR;
    if(dir>0){p.type=ORDER_TYPE_BUY_LIMIT;p.price=mid-offset;p.sl=p.price-slDist;p.tp=p.price+tpDist;}
    else if(dir<0){p.type=ORDER_TYPE_SELL_LIMIT;p.price=mid+offset;p.sl=p.price+slDist;p.tp=p.price-tpDist;}
    return p;
@@ -329,10 +307,10 @@ void OnM15NewBar()
    double rsi=RSIv(PERIOD_M15,14,PRICE_CLOSE,0);
    AIOut ai; if(!QueryAI("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai))return;
 
-   if(ai.win_prob>=g_curMinWinProb){
-      // ポジション数チェック（動的変数を使用）
+   if(ai.win_prob>=MinWinProb){
+      // ポジション数チェック
       int posCount=CountPositions();
-      if(posCount>=g_curMaxPositions){
+      if(posCount>=MaxPositions){
          SafePrint(StringFormat("[M15] skip: already %d position(s)",posCount));
          return;
       }
@@ -342,9 +320,9 @@ void OnM15NewBar()
          Cancel("replace");
       }
       PendingPlan p=BuildPending(t.dir,t.atr,ai.offset_factor);
-      trade.SetExpertMagicNumber(Magic);trade.SetDeviationInPoints(g_curSlippagePoints);  // 動的変数を使用
-      if(p.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(g_curLots,p.price,_Symbol,p.sl,p.tp);  // 動的変数を使用
-      else trade.SellLimit(g_curLots,p.price,_Symbol,p.sl,p.tp);  // 動的変数を使用
+      trade.SetExpertMagicNumber(Magic);trade.SetDeviationInPoints(SlippagePoints);
+      if(p.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(Lots,p.price,_Symbol,p.sl,p.tp);
+      else trade.SellLimit(Lots,p.price,_Symbol,p.sl,p.tp);
       g_pendingTicket=trade.ResultOrder();g_pendingAt=TimeCurrent();g_pendingDir=t.dir;
       if(ai.expiry_min>0) g_dynamicExpiryMin=ai.expiry_min;
       
@@ -352,12 +330,12 @@ void OnM15NewBar()
       RecordSignal("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,g_pendingTicket,0);
       
       SafePrint(StringFormat("[M15] set dir=%d prob=%.2f",t.dir,ai.win_prob));
-   }else SafePrint(StringFormat("[M15] skip prob=%.2f<thr=%.2f",ai.win_prob,g_curMinWinProb));
+   }else SafePrint(StringFormat("[M15] skip prob=%.2f<thr=%.2f",ai.win_prob,MinWinProb));
 }
 
 void OnH1NewBar()
 {
-   SyncConfig(); // H1で設定再同期
+   // SyncConfig()は無効化：すべてEAプロパティを使用
    if(g_pendingTicket==0)return;
    if(!OrderAlive(g_pendingTicket)){Cancel("filled");return;}
    if(Expired()){
@@ -369,7 +347,7 @@ void OnH1NewBar()
    double rsi=RSIv(PERIOD_H1,14,PRICE_CLOSE,0);
    AIOut ai; if(!QueryAI("H1",t.dir,rsi,t.atr,t.ref,t.reason,ai))return;
    bool rev=(t.dir!=0&&t.dir!=g_pendingDir);
-   if(rev&&ai.win_prob<g_curMinWinProb){
+   if(rev&&ai.win_prob<MinWinProb){
       CancelSignal(g_pendingTicket,"trend-reversed");
       Cancel("trend-reversed");
    }else SafePrint("[H1] still valid");
@@ -435,17 +413,9 @@ void CheckPositionStatus()
 // ===== メイン =====
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
-   // 全パラメータをinputからコピー
-   g_curMinWinProb       = MinWinProb;
-   g_curRiskATRmult      = RiskATRmult;
-   g_curRewardRR         = RewardRR;
-   g_curPendingOffsetATR = PendingOffsetATR;
-   g_curPendingExpiryMin = PendingExpiryMin;
-   g_curLots             = Lots;
-   g_curSlippagePoints   = SlippagePoints;
-   g_curMaxPositions     = MaxPositions;
-   SafePrint("[INIT] EA 1.2.3 start (ML tracking enabled)");
-   SyncConfig();
+   SafePrint("[INIT] EA 1.2.3 start (ML tracking enabled, config from EA properties only)");
+   SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.2f, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",
+      MinWinProb,RiskATRmult,RewardRR,Lots,MaxPositions));
    return(INIT_SUCCEEDED);
 }
 void OnTick()
