@@ -137,7 +137,9 @@ ${historicalContext}
     });
 
     if (!response.ok) {
-      console.error("[AI] OpenAI API error:", response.status);
+      const errorText = await response.text();
+      console.error(`[AI] OpenAI API error: ${response.status} - ${errorText}`);
+      console.warn("[AI] Falling back to rule-based calculation");
       return calculateSignalFallback(req);
     }
 
@@ -147,7 +149,8 @@ ${historicalContext}
     // JSONを抽出（マークダウンコードブロックを除去）
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      console.error("[AI] No JSON in response");
+      console.error("[AI] No JSON in response. Raw content:", content.substring(0, 200));
+      console.warn("[AI] Falling back to rule-based calculation");
       return calculateSignalFallback(req);
     }
     
@@ -156,7 +159,8 @@ ${historicalContext}
     
     // 安全性チェック
     if (isNaN(win_prob) || win_prob < 0 || win_prob > 1) {
-      console.error("[AI] Invalid win_prob:", win_prob);
+      console.error("[AI] Invalid win_prob:", win_prob, "from AI response:", JSON.stringify(aiResult));
+      console.warn("[AI] Falling back to rule-based calculation");
       return calculateSignalFallback(req);
     }
     
@@ -172,7 +176,9 @@ ${historicalContext}
     };
     
   } catch (error) {
-    console.error("[AI] OpenAI error:", error);
+    console.error("[AI] OpenAI exception:", error instanceof Error ? error.message : String(error));
+    console.error("[AI] Stack trace:", error instanceof Error ? error.stack : "N/A");
+    console.warn("[AI] Falling back to rule-based calculation");
     return calculateSignalFallback(req);
   }
 }
@@ -184,7 +190,13 @@ serve(async (req: Request) => {
   
   if (req.method === "GET") {
     return new Response(
-      JSON.stringify({ ok: true, service: "ai-trader with OpenAI", version: "2.0.0" }),
+      JSON.stringify({ 
+        ok: true, 
+        service: "ai-trader with OpenAI", 
+        version: "2.0.0",
+        ai_enabled: !!OPENAI_API_KEY,
+        fallback_available: true
+      }),
       { status: 200, headers: corsHeaders() }
     );
   }
@@ -224,13 +236,19 @@ serve(async (req: Request) => {
     const tradeReq: TradeRequest = body;
     
     // OpenAI_API_KEYが設定されていればAI使用、なければフォールバック
-    const response = OPENAI_API_KEY 
-      ? await calculateSignalWithAI(tradeReq)
-      : calculateSignalFallback(tradeReq);
+    let response;
+    if (OPENAI_API_KEY) {
+      console.log(`[ai-trader] Using OpenAI GPT for prediction`);
+      response = await calculateSignalWithAI(tradeReq);
+    } else {
+      console.warn(`[ai-trader] OPENAI_API_KEY not set - using rule-based fallback`);
+      response = calculateSignalFallback(tradeReq);
+    }
     
     console.log(
       `[ai-trader] ${tradeReq.symbol} ${tradeReq.timeframe} ` +
-      `dir=${tradeReq.dir} win=${response.win_prob.toFixed(3)}`
+      `dir=${tradeReq.dir} win=${response.win_prob.toFixed(3)} ` +
+      `(${OPENAI_API_KEY ? "AI" : "Fallback"})`
     );
     
     return new Response(
