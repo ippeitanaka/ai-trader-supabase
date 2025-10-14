@@ -13,7 +13,7 @@ input bool   LockToChartSymbol = true;
 input ENUM_TIMEFRAMES TF_Entry   = PERIOD_M15;
 input ENUM_TIMEFRAMES TF_Recheck = PERIOD_H1;
 
-input double MinWinProb          = 75.0;
+input double MinWinProb          = 0.70;  // 0.70 = 70%, 0.75 = 75% (小数形式)
 input double RiskATRmult         = 1.5;
 input double RewardRR            = 1.2;
 input double PendingOffsetATR    = 0.2;
@@ -262,8 +262,8 @@ void SyncConfig()
 {
    // ai_configテーブルの使用を中止
    // すべてのパラメータはEAのinputプロパティから取得します
-   SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.2f, Risk=%.2f, RR=%.2f, Offset=%.2f, Expiry=%d, Lots=%.2f, Slip=%d, MaxPos=%d",
-      MinWinProb,RiskATRmult,RewardRR,PendingOffsetATR,PendingExpiryMin,Lots,SlippagePoints,MaxPositions));
+   SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Offset=%.2f, Expiry=%d, Lots=%.2f, Slip=%d, MaxPos=%d",
+      MinWinProb*100,RiskATRmult,RewardRR,PendingOffsetATR,PendingExpiryMin,Lots,SlippagePoints,MaxPositions));
 }
 
 // ===== 注文関連 =====
@@ -329,8 +329,8 @@ void OnM15NewBar()
       // AI Signalを記録（ML学習用）
       RecordSignal("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,g_pendingTicket,0);
       
-      SafePrint(StringFormat("[M15] set dir=%d prob=%.2f",t.dir,ai.win_prob));
-   }else SafePrint(StringFormat("[M15] skip prob=%.2f<thr=%.2f",ai.win_prob,MinWinProb));
+      SafePrint(StringFormat("[M15] set dir=%d prob=%.0f%%",t.dir,ai.win_prob*100));
+   }else SafePrint(StringFormat("[M15] skip prob=%.0f%% < thr=%.0f%%",ai.win_prob*100,MinWinProb*100));
 }
 
 void OnH1NewBar()
@@ -414,8 +414,8 @@ void CheckPositionStatus()
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
    SafePrint("[INIT] EA 1.2.3 start (ML tracking enabled, config from EA properties only)");
-   SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.2f, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",
-      MinWinProb,RiskATRmult,RewardRR,Lots,MaxPositions));
+   SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",
+      MinWinProb*100,RiskATRmult,RewardRR,Lots,MaxPositions));
    return(INIT_SUCCEEDED);
 }
 void OnTick()
