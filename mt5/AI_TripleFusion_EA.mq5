@@ -1,8 +1,9 @@
 //+------------------------------------------------------------------+
-//| AI_TripleFusion_EA.mq5  (ver 1.2.3)                              |
+//| AI_TripleFusion_EA.mq5  (ver 1.2.4)                              |
 //| - Supabase: ai-config / ai-signals(AI側) / ea-log                |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
+//| - Fix: ポジション約定後の重複ログ出力を修正                      |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -34,7 +35,7 @@ input string AI_Signals_URL      = "https://nebphrnnpmuqbkymwefs.functions.supab
 input string AI_Bearer_Token     = "YOUR_SERVICE_ROLE_KEY";
 
 input string AI_EA_Instance      = "main";
-input string AI_EA_Version       = "1.2.3";
+input string AI_EA_Version       = "1.2.4";
 input int    AI_Timeout_ms       = 5000;
 
 // ===== 内部変数 =====
@@ -372,6 +373,11 @@ void CheckPositionStatus()
          HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000);
          
          SafePrint(StringFormat("[POSITION] Filled ticket=%d at %.5f",g_trackedPositionTicket,g_trackedPositionEntryPrice));
+         
+         // ペンディングチケットをリセット（重複ログ防止）
+         g_pendingTicket=0;
+         g_pendingDir=0;
+         g_pendingAt=0;
       }
    }
    
@@ -413,7 +419,7 @@ void CheckPositionStatus()
 // ===== メイン =====
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
-   SafePrint("[INIT] EA 1.2.3 start (ML tracking enabled, config from EA properties only)");
+   SafePrint("[INIT] EA 1.2.4 start (ML tracking enabled, config from EA properties only)");
    SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",
       MinWinProb*100,RiskATRmult,RewardRR,Lots,MaxPositions));
    return(INIT_SUCCEEDED);
