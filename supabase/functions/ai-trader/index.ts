@@ -24,6 +24,8 @@ interface TradeResponse {
   action: number;
   offset_factor: number;
   expiry_minutes: number;
+  confidence?: string;
+  reasoning?: string;
 }
 
 function corsHeaders() {
@@ -88,7 +90,7 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
   
   let historicalContext = "";
   if (historicalData && historicalData.length > 0) {
-    const winRate = historicalData.filter(d => d.actual_result === "WIN").length / historicalData.length;
+    const winRate = historicalData.filter((d: any) => d.actual_result === "WIN").length / historicalData.length;
     historicalContext = `\n過去50件の取引での勝率: ${(winRate * 100).toFixed(1)}%`;
   }
   
@@ -166,14 +168,19 @@ ${historicalContext}
     
     win_prob = Math.max(0.5, Math.min(0.95, win_prob)); // 50%～95%に制限
     
-    console.log(`[AI] OpenAI prediction: ${(win_prob * 100).toFixed(1)}% (${aiResult.confidence}) - ${aiResult.reasoning}`);
+    const confidence = aiResult.confidence || "unknown";
+    const reasoning = aiResult.reasoning || "N/A";
+    
+    console.log(`[AI] OpenAI prediction: ${(win_prob * 100).toFixed(1)}% (${confidence}) - ${reasoning}`);
     
     return {
       win_prob: Math.round(win_prob * 1000) / 1000,
       action: win_prob >= 0.70 ? dir : 0,
       offset_factor: atr > 0.001 ? 0.25 : 0.2,
       expiry_minutes: 90,
-    };
+      confidence: confidence,
+      reasoning: reasoning,
+    } as any;
     
   } catch (error) {
     console.error("[AI] OpenAI exception:", error instanceof Error ? error.message : String(error));

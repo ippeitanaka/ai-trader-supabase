@@ -1,9 +1,10 @@
 //+------------------------------------------------------------------+
-//| AI_TripleFusion_EA.mq5  (ver 1.2.4)                              |
+//| AI_TripleFusion_EA.mq5  (ver 1.2.5)                              |
 //| - Supabase: ai-config / ai-signals(AI側) / ea-log                |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
 //| - Fix: ポジション約定後の重複ログ出力を修正                      |
+//| - Enhanced: ea-logに詳細なAI判断とトレード状況を記録             |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -35,7 +36,7 @@ input string AI_Signals_URL      = "https://nebphrnnpmuqbkymwefs.functions.supab
 input string AI_Bearer_Token     = "YOUR_SERVICE_ROLE_KEY";
 
 input string AI_EA_Instance      = "main";
-input string AI_EA_Version       = "1.2.4";
+input string AI_EA_Version       = "1.2.5";
 input int    AI_Timeout_ms       = 5000;
 
 // ===== 内部変数 =====
@@ -145,7 +146,7 @@ TechSignal Evaluate(ENUM_TIMEFRAMES tf)
 }
 
 // ===== AI連携 =====
-struct AIOut{double win_prob;int action;double offset_factor;int expiry_min;};
+struct AIOut{double win_prob;int action;double offset_factor;int expiry_min;string reasoning;string confidence;};
 bool ExtractJsonNumber(const string json,const string key,double &out){
    string pat="\""+key+"\":";int pos=StringFind(json,pat);if(pos<0)return false;
    pos+=StringLen(pat);int end=pos;while(end<StringLen(json)){
@@ -153,6 +154,16 @@ bool ExtractJsonNumber(const string json,const string key,double &out){
       if((c>='0'&&c<='9')||c=='-'||c=='+'||c=='.'||c=='e'||c=='E') end++; else break;}
    string num=StringSubstr(json,pos,end-pos);out=StringToDouble(num);return true;}
 bool ExtractJsonInt(const string json,const string key,int &out){double d;if(!ExtractJsonNumber(json,key,d))return false;out=(int)MathRound(d);return true;}
+bool ExtractJsonString(const string json,const string key,string &out){
+   string pat="\""+key+"\":\"";int pos=StringFind(json,pat);if(pos<0)return false;
+   pos+=StringLen(pat);int end=pos;while(end<StringLen(json)){
+      ushort c=StringGetCharacter(json,end);
+      if(c=='\"'&&(end==pos||StringGetCharacter(json,end-1)!='\\'))break;
+      end++;}
+   out=StringSubstr(json,pos,end-pos);
+   StringReplace(out,"\\\"","\"");StringReplace(out,"\\\\","\\");
+   StringReplace(out,"\\n","\n");StringReplace(out,"\\r","\r");
+   return true;}
 
 bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,const string reason,AIOut &out_ai)
 {
@@ -174,8 +185,15 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    ExtractJsonInt(resp,"action",out_ai.action);
    ExtractJsonNumber(resp,"offset_factor",out_ai.offset_factor);
    double tmp; if(ExtractJsonNumber(resp,"expiry_minutes",tmp)) out_ai.expiry_min=(int)MathRound(tmp);
+   ExtractJsonString(resp,"reasoning",out_ai.reasoning);
+   ExtractJsonString(resp,"confidence",out_ai.confidence);
 
-   // === Supabase ea-logに書き込み ===
+   return true;
+}
+
+// ea-logに詳細記録（トレード判定情報含む）
+void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,const string trade_decision,bool threshold_met,int current_pos,ulong ticket=0)
+{
    string logPayload="{"+
    "\"at\":\""+TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS)+"\","+
    "\"sym\":\""+_Symbol+"\","+
@@ -184,16 +202,20 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    "\"atr\":"+DoubleToString(atr,5)+","+
    "\"price\":"+DoubleToString(price,_Digits)+","+
    "\"action\":\""+(dir>0?"BUY":(dir<0?"SELL":"HOLD"))+"\","+
-   "\"win_prob\":"+DoubleToString(out_ai.win_prob,3)+","+
-   "\"offset_factor\":"+DoubleToString(out_ai.offset_factor,3)+","+
-   "\"expiry_minutes\":"+IntegerToString(out_ai.expiry_min)+","+
+   "\"win_prob\":"+DoubleToString(ai.win_prob,3)+","+
+   "\"ai_confidence\":\""+(ai.confidence!=""?JsonEscape(ai.confidence):"unknown")+"\","+
+   "\"ai_reasoning\":\""+(ai.reasoning!=""?JsonEscape(ai.reasoning):"N/A")+"\","+
+   "\"trade_decision\":\""+JsonEscape(trade_decision)+"\","+
+   "\"threshold_met\":"+(threshold_met?"true":"false")+","+
+   "\"current_positions\":"+IntegerToString(current_pos)+","+
+   (ticket>0?"\"order_ticket\":"+IntegerToString(ticket)+",":"")+
+   "\"offset_factor\":"+DoubleToString(ai.offset_factor,3)+","+
+   "\"expiry_minutes\":"+IntegerToString(ai.expiry_min)+","+
    "\"reason\":\""+JsonEscape(reason)+"\","+
    "\"instance\":\""+AI_EA_Instance+"\","+
    "\"version\":\""+AI_EA_Version+"\","+
    "\"caller\":\""+tf_label+"\"}";
    string dummy; HttpPostJson(EA_Log_URL,AI_Bearer_Token,logPayload,dummy,3000);
-
-   return true;
 }
 
 // ===== AI Signals記録（ML学習用） =====
@@ -308,10 +330,13 @@ void OnM15NewBar()
    double rsi=RSIv(PERIOD_M15,14,PRICE_CLOSE,0);
    AIOut ai; if(!QueryAI("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai))return;
 
-   if(ai.win_prob>=MinWinProb){
+   int posCount=CountPositions();
+   bool threshold_met=(ai.win_prob>=MinWinProb);
+   
+   if(threshold_met){
       // ポジション数チェック
-      int posCount=CountPositions();
       if(posCount>=MaxPositions){
+         LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_MAX_POS",threshold_met,posCount,0);
          SafePrint(StringFormat("[M15] skip: already %d position(s)",posCount));
          return;
       }
@@ -330,8 +355,13 @@ void OnM15NewBar()
       // AI Signalを記録（ML学習用）
       RecordSignal("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,g_pendingTicket,0);
       
+      // ea-logに詳細記録
+      LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"EXECUTED",threshold_met,posCount,g_pendingTicket);
       SafePrint(StringFormat("[M15] set dir=%d prob=%.0f%%",t.dir,ai.win_prob*100));
-   }else SafePrint(StringFormat("[M15] skip prob=%.0f%% < thr=%.0f%%",ai.win_prob*100,MinWinProb*100));
+   }else{
+      LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_LOW_PROB",threshold_met,posCount,0);
+      SafePrint(StringFormat("[M15] skip prob=%.0f%% < thr=%.0f%%",ai.win_prob*100,MinWinProb*100));
+   }
 }
 
 void OnH1NewBar()
@@ -347,11 +377,19 @@ void OnH1NewBar()
    TechSignal t=Evaluate(TF_Recheck);
    double rsi=RSIv(PERIOD_H1,14,PRICE_CLOSE,0);
    AIOut ai; if(!QueryAI("H1",t.dir,rsi,t.atr,t.ref,t.reason,ai))return;
+   
+   int posCount=CountPositions();
+   bool threshold_met=(ai.win_prob>=MinWinProb);
    bool rev=(t.dir!=0&&t.dir!=g_pendingDir);
-   if(rev&&ai.win_prob<MinWinProb){
+   
+   if(rev&&!threshold_met){
+      LogAIDecision("H1",t.dir,rsi,t.atr,t.ref,t.reason,ai,"CANCELLED_REVERSAL",threshold_met,posCount,g_pendingTicket);
       CancelSignal(g_pendingTicket,"trend-reversed");
       Cancel("trend-reversed");
-   }else SafePrint("[H1] still valid");
+   }else{
+      LogAIDecision("H1",t.dir,rsi,t.atr,t.ref,t.reason,ai,"RECHECK_OK",threshold_met,posCount,g_pendingTicket);
+      SafePrint("[H1] still valid");
+   }
 }
 
 // ===== ポジション監視（ML学習用） =====
@@ -419,7 +457,7 @@ void CheckPositionStatus()
 // ===== メイン =====
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
-   SafePrint("[INIT] EA 1.2.4 start (ML tracking enabled, config from EA properties only)");
+   SafePrint("[INIT] EA 1.2.5 start (Enhanced ea-log with AI decision tracking)");
    SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",
       MinWinProb*100,RiskATRmult,RewardRR,Lots,MaxPositions));
    return(INIT_SUCCEEDED);
