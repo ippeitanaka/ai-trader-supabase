@@ -13,16 +13,38 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ====== Default Configuration ======
 const DEFAULT_CONFIG = {
-  min_win_prob: 0.70,
-  pending_offset_atr: 0.20,
+  min_win_prob: 70.0,
+  risk_atr_mult: 1.5,
+  reward_rr: 1.2,
+  pending_offset_atr: 0.2,
   pending_expiry_min: 90,
+  lots: 0.10,
+  slippage_points: 1000,
+  magic: 26091501,
+  max_positions: 1,
+  lock_to_chart_symbol: true,
+  tf_entry: "M15",
+  tf_recheck: "H1",
+  debug_logs: true,
+  log_cooldown_sec: 30,
 };
 
 // ====== Types ======
 interface AIConfig {
   min_win_prob: number;
+  risk_atr_mult: number;
+  reward_rr: number;
   pending_offset_atr: number;
   pending_expiry_min: number;
+  lots: number;
+  slippage_points: number;
+  magic: number;
+  max_positions: number;
+  lock_to_chart_symbol: boolean;
+  tf_entry: string;
+  tf_recheck: string;
+  debug_logs: boolean;
+  log_cooldown_sec: number;
   instance?: string;
   updated_at?: string;
 }
@@ -82,8 +104,19 @@ serve(async (req: Request) => {
     // Use data if available, otherwise use defaults
     const config: AIConfig = data ? {
       min_win_prob: data.min_win_prob ?? DEFAULT_CONFIG.min_win_prob,
+      risk_atr_mult: data.risk_atr_mult ?? DEFAULT_CONFIG.risk_atr_mult,
+      reward_rr: data.reward_rr ?? DEFAULT_CONFIG.reward_rr,
       pending_offset_atr: data.pending_offset_atr ?? DEFAULT_CONFIG.pending_offset_atr,
       pending_expiry_min: data.pending_expiry_min ?? DEFAULT_CONFIG.pending_expiry_min,
+      lots: data.lots ?? DEFAULT_CONFIG.lots,
+      slippage_points: data.slippage_points ?? DEFAULT_CONFIG.slippage_points,
+      magic: data.magic ?? DEFAULT_CONFIG.magic,
+      max_positions: data.max_positions ?? DEFAULT_CONFIG.max_positions,
+      lock_to_chart_symbol: data.lock_to_chart_symbol ?? DEFAULT_CONFIG.lock_to_chart_symbol,
+      tf_entry: data.tf_entry ?? DEFAULT_CONFIG.tf_entry,
+      tf_recheck: data.tf_recheck ?? DEFAULT_CONFIG.tf_recheck,
+      debug_logs: data.debug_logs ?? DEFAULT_CONFIG.debug_logs,
+      log_cooldown_sec: data.log_cooldown_sec ?? DEFAULT_CONFIG.log_cooldown_sec,
       instance: data.instance,
       updated_at: data.updated_at,
     } : DEFAULT_CONFIG;
@@ -91,7 +124,7 @@ serve(async (req: Request) => {
     // Log successful retrieval
     console.log(
       `[ai-config] ok inst=${instance} min=${config.min_win_prob.toFixed(2)} ` +
-      `off=${config.pending_offset_atr.toFixed(2)} exp=${config.pending_expiry_min}`
+      `lots=${config.lots.toFixed(2)} max_pos=${config.max_positions}`
     );
     
     return new Response(

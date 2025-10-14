@@ -12,6 +12,17 @@ CREATE TABLE IF NOT EXISTS public.ai_config (
   pending_expiry_min INTEGER
 );
 
+-- Add instance column if it doesn't exist (for existing tables)
+DO $$ 
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                 WHERE table_schema = 'public' 
+                 AND table_name = 'ai_config' 
+                 AND column_name = 'instance') THEN
+    ALTER TABLE public.ai_config ADD COLUMN instance TEXT;
+  END IF;
+END $$;
+
 -- Create unique index on instance to prevent duplicates
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_config_instance ON public.ai_config (instance);
 

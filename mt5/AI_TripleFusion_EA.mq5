@@ -52,8 +52,13 @@ double   g_trackedPositionEntryPrice=0;
 
 // 入力（input）の動的コピー（ai-configで上書きするため）
 double g_curMinWinProb;
+double g_curRiskATRmult;
+double g_curRewardRR;
 double g_curPendingOffsetATR;
 int    g_curPendingExpiryMin;
+double g_curLots;
+int    g_curSlippagePoints;
+int    g_curMaxPositions;
 
 // ===== ログ =====
 void SafePrint(string msg)
@@ -268,10 +273,19 @@ void SyncConfig()
    string resp;
    if(!HttpGet(AI_Config_URL,AI_Bearer_Token,resp,AI_Timeout_ms)) return;
    double v; int vi;
+   
+   // 全14パラメータを同期
    if(ExtractJsonNumber(resp,"min_win_prob",v)&&v>0) g_curMinWinProb=v;
+   if(ExtractJsonNumber(resp,"risk_atr_mult",v)&&v>0) g_curRiskATRmult=v;
+   if(ExtractJsonNumber(resp,"reward_rr",v)&&v>0) g_curRewardRR=v;
    if(ExtractJsonNumber(resp,"pending_offset_atr",v)&&v>0) g_curPendingOffsetATR=v;
    if(ExtractJsonInt(resp,"pending_expiry_min",vi)&&vi>0) g_curPendingExpiryMin=vi;
-   SafePrint(StringFormat("[CONFIG] sync -> MinWinProb=%.2f, Offset=%.2f, Expiry=%d",g_curMinWinProb,g_curPendingOffsetATR,g_curPendingExpiryMin));
+   if(ExtractJsonNumber(resp,"lots",v)&&v>0) g_curLots=v;
+   if(ExtractJsonInt(resp,"slippage_points",vi)&&vi>=0) g_curSlippagePoints=vi;
+   if(ExtractJsonInt(resp,"max_positions",vi)&&vi>0) g_curMaxPositions=vi;
+   
+   SafePrint(StringFormat("[CONFIG] sync -> MinWinProb=%.2f, Risk=%.2f, RR=%.2f, Offset=%.2f, Expiry=%d, Lots=%.2f, Slip=%d, MaxPos=%d",
+      g_curMinWinProb,g_curRiskATRmult,g_curRewardRR,g_curPendingOffsetATR,g_curPendingExpiryMin,g_curLots,g_curSlippagePoints,g_curMaxPositions));
 }
 
 // ===== 注文関連 =====
@@ -280,7 +294,7 @@ PendingPlan BuildPending(int dir,double atr,double ai_offset){
    PendingPlan p; p.type=0;if(atr<=0)return p;
    double mid=(SymbolInfoDouble(_Symbol,SYMBOL_BID)+SymbolInfoDouble(_Symbol,SYMBOL_ASK))/2.0;
    double offset=atr*(ai_offset>0?ai_offset:g_curPendingOffsetATR);
-   double slDist=atr*RiskATRmult,tpDist=slDist*RewardRR;
+   double slDist=atr*g_curRiskATRmult,tpDist=slDist*g_curRewardRR;  // 動的変数を使用
    if(dir>0){p.type=ORDER_TYPE_BUY_LIMIT;p.price=mid-offset;p.sl=p.price-slDist;p.tp=p.price+tpDist;}
    else if(dir<0){p.type=ORDER_TYPE_SELL_LIMIT;p.price=mid+offset;p.sl=p.price+slDist;p.tp=p.price-tpDist;}
    return p;
@@ -316,9 +330,9 @@ void OnM15NewBar()
    AIOut ai; if(!QueryAI("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai))return;
 
    if(ai.win_prob>=g_curMinWinProb){
-      // ポジション数チェック
+      // ポジション数チェック（動的変数を使用）
       int posCount=CountPositions();
-      if(posCount>=MaxPositions){
+      if(posCount>=g_curMaxPositions){
          SafePrint(StringFormat("[M15] skip: already %d position(s)",posCount));
          return;
       }
@@ -328,9 +342,9 @@ void OnM15NewBar()
          Cancel("replace");
       }
       PendingPlan p=BuildPending(t.dir,t.atr,ai.offset_factor);
-      trade.SetExpertMagicNumber(Magic);trade.SetDeviationInPoints(SlippagePoints);
-      if(p.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(Lots,p.price,_Symbol,p.sl,p.tp);
-      else trade.SellLimit(Lots,p.price,_Symbol,p.sl,p.tp);
+      trade.SetExpertMagicNumber(Magic);trade.SetDeviationInPoints(g_curSlippagePoints);  // 動的変数を使用
+      if(p.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(g_curLots,p.price,_Symbol,p.sl,p.tp);  // 動的変数を使用
+      else trade.SellLimit(g_curLots,p.price,_Symbol,p.sl,p.tp);  // 動的変数を使用
       g_pendingTicket=trade.ResultOrder();g_pendingAt=TimeCurrent();g_pendingDir=t.dir;
       if(ai.expiry_min>0) g_dynamicExpiryMin=ai.expiry_min;
       
@@ -421,9 +435,15 @@ void CheckPositionStatus()
 // ===== メイン =====
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
-   g_curMinWinProb=MinWinProb;
-   g_curPendingOffsetATR=PendingOffsetATR;
-   g_curPendingExpiryMin=PendingExpiryMin;
+   // 全パラメータをinputからコピー
+   g_curMinWinProb       = MinWinProb;
+   g_curRiskATRmult      = RiskATRmult;
+   g_curRewardRR         = RewardRR;
+   g_curPendingOffsetATR = PendingOffsetATR;
+   g_curPendingExpiryMin = PendingExpiryMin;
+   g_curLots             = Lots;
+   g_curSlippagePoints   = SlippagePoints;
+   g_curMaxPositions     = MaxPositions;
    SafePrint("[INIT] EA 1.2.3 start (ML tracking enabled)");
    SyncConfig();
    return(INIT_SUCCEEDED);
