@@ -59,13 +59,25 @@ ai-trader-supabase/
 > **Note**: `archive/` ディレクトリには過去のバックアップと開発履歴が保存されています。
 > 現在のプロジェクトでは使用されていませんが、参考用に保持されています。
 
-## � Quick Start
+## 🚀 Quick Start
 
 ### Daily Health Check (30 seconds)
+
+#### 💻 PC/Terminal
 ```bash
 ./health_check.sh
 ```
 Expected output: `✅ ステータス: 正常` with `ai_enabled: true`
+
+#### 📱 Smartphone
+Open in browser: https://nebphrnnpmuqbkymwefs.functions.supabase.co/ai-trader
+
+Or scan QR code:
+```bash
+./generate_qr.sh
+```
+
+See [MOBILE_HEALTH_CHECK.md](./MOBILE_HEALTH_CHECK.md) for smartphone usage guide.
 
 ### Deploy Edge Functions
 ```bash
