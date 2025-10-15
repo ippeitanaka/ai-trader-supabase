@@ -7,7 +7,16 @@ Supabase Edge Functions backend for MT5 AI Trading EA (Expert Advisor).
 
 ## 🎯 Overview
 
-This repository provides the backend infrastructure for **AI_TripleFusion_EA v1.2.2**, a MetaTrader 5 Expert Advisor that integrates AI-powered trading signals with Supabase Edge Functions.
+This repository provides the backend infrastructure for **AI_QuadFusion_EA v1.3.0**, a MetaTrader 5 Expert Advisor that integrates AI-powered trading signals with Supabase Edge Functions.
+
+### ⭐ Latest Update (v1.3.0 EA + v2.2.0 Edge Functions)
+**Ichimoku Kinko Hyo (一目均衡表) Full Integration** - AI-Powered Quad Fusion!
+- 🎯 **EA v1.3.0**: 4 technical indicators: RSI + ATR + Moving Averages + **Ichimoku** 
+- 🧠 **AI v2.2.0**: OpenAI GPT-4 deeply understands Ichimoku signals for smarter predictions
+- 🔍 Signal quality classification (excellent/good/moderate/weak/conflicting)
+- 🛡️ Conflict detection: Skip trades when indicators disagree
+- 📊 Dynamic win probability ranges based on signal quality
+- See docs: [ICHIMOKU_INTEGRATION.md](./ICHIMOKU_INTEGRATION.md) | [AI_PREDICTION_ENHANCEMENT.md](./AI_PREDICTION_ENHANCEMENT.md)
 
 ### Architecture
 
@@ -19,23 +28,53 @@ MT5 EA (MQL5) ←→ Supabase Edge Functions ←→ PostgreSQL Database
 - **Edge Functions**: Process requests, calculate signals, manage configuration
 - **Database**: Store logs, configuration, and optional signal history
 
-## 📦 Components
+## � Project Structure
+
+```
+ai-trader-supabase/
+├── supabase/
+│   ├── functions/              # Edge Functions (TypeScript/Deno)
+│   │   ├── ai-trader/         # メイン取引シグナルエンドポイント
+│   │   ├── ai-config/         # 動的設定管理
+│   │   ├── ea-log/            # EAログ保存
+│   │   ├── ai-signals/        # シグナル履歴（オプション）
+│   │   ├── ai-signals-update/ # シグナル更新
+│   │   └── ai-reason/         # AI推論ログ
+│   ├── migrations/            # データベースマイグレーション
+│   └── config.toml            # Supabase設定
+├── mt5/
+│   ├── AI_TripleFusion_EA.mq5 # MT5 Expert Advisor
+│   └── README.md              # EA マニュアル
+├── archive/                   # 古いファイル・バックアップ（保守用）
+│   ├── backup_functions/      # 旧バージョンのEdge Functions
+│   ├── old_docs/              # 初期開発ドキュメント
+│   └── old_sql/               # 移行前の個別SQLファイル
+├── deno.json                  # Deno設定
+└── README.md                  # このファイル
+```
+
+> **Note**: `archive/` ディレクトリには過去のバックアップと開発履歴が保存されています。
+> 現在のプロジェクトでは使用されていませんが、参考用に保持されています。
+
+## �📦 Components
 
 ### Supabase Edge Functions
 
-#### 1. `ai-trader` - AI Trading Signal Endpoint
+#### 1. `ai-trader` - AI Trading Signal Endpoint (v2.2.0)
 - **Purpose**: Receives technical indicator data from EA and returns trading signals
 - **Method**: POST
 - **Features**:
   - NUL byte removal for MQL5 compatibility
   - RSI-based signal calculation
   - ATR-based volatility adjustment
-  - Win probability estimation
+  - **⭐ NEW: Ichimoku score integration** - Enhanced signal confidence with 一目均衡表
+  - OpenAI GPT-4 integration for smart predictions
+  - Win probability estimation with ML learning
   - Dynamic offset and expiry calculation
   - Console logging for monitoring
   - Optional storage to `ai_signals` table
 
-**Request Example**:
+**Request Example** (v1.3.0+):
 ```json
 {
   "symbol": "BTCUSD",
@@ -43,6 +82,7 @@ MT5 EA (MQL5) ←→ Supabase Edge Functions ←→ PostgreSQL Database
   "dir": 1,
   "rsi": 62.5,
   "atr": 0.00085,
+  "ichimoku_score": 1.0,
   "price": 43250.50,
   "reason": "MA↑",
   "instance": "main",
@@ -361,25 +401,16 @@ if (error && (error.message.includes("offset_factor") || error.message.includes(
 - ✅ **Column fallback**: ea-log retries without offset_factor/expiry_minutes on failure
 - ✅ **Migrations**: Three DDL files with `IF NOT EXISTS` clauses
 
-### File Structure
-```
-supabase/
-├── functions/
-│   ├── ai-trader/
-│   │   └── index.ts          (Rewritten for v1.2.2)
-│   ├── ea-log/
-│   │   └── index.ts          (Rewritten for v1.2.2)
-│   └── ai-config/
-│       └── index.ts          (New for v1.2.2)
-└── migrations/
-    ├── 20251013_001_create_ea_log_table.sql
-    ├── 20251013_002_create_ai_config_table.sql
-    └── 20251013_003_create_ai_signals_table.sql
+### Maintenance (2025-10-15)
 
-mt5/
-├── AI_TripleFusion_EA.mq5    (EA v1.2.2)
-└── README.md                 (EA documentation)
-```
+プロジェクトのメンテナンスを実施し、以下を整理しました:
+
+- **アーカイブ化**: バックアップファイルと古いドキュメントを `archive/` ディレクトリに移動
+- **ファイル整理**: 
+  - Edge Functions のバックアップ (`index_fallback_backup.ts`, `index_with_openai.ts`)
+  - 個別SQLファイル（マイグレーションに統合済み）
+  - 初期開発ドキュメント（13ファイル）
+- **構造改善**: プロジェクト構造をより明確に整理
 
 ## 🔐 Security
 

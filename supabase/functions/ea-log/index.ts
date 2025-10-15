@@ -5,13 +5,28 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+// Simplified interface - only essential columns for ea-log table
 interface EALogEntry {
+  at: string;                    // トレード判断日時
+  sym: string;                   // 銘柄
+  tf?: string;                   // タイムフレーム（補足情報）
+  action?: string;               // 売買の判断 (BUY/SELL/HOLD)
+  trade_decision?: string;       // 実際の取引状況
+  win_prob?: number;             // AIの算出した勝率
+  ai_reasoning?: string;         // AIの判断根拠
+  order_ticket?: number;         // 注文番号
+}
+
+// Full interface for backwards compatibility (accepts all fields from EA)
+interface EALogInput {
   at: string;
   sym: string;
-  tf: string;
+  tf?: string;
   rsi?: number;
   atr?: number;
   price?: number;
+  bid?: number;
+  ask?: number;
   action?: string;
   win_prob?: number;
   offset_factor?: number;
@@ -20,6 +35,19 @@ interface EALogEntry {
   instance?: string;
   version?: string;
   caller?: string;
+  ai_confidence?: string;
+  ai_reasoning?: string;
+  trade_decision?: string;
+  threshold_met?: boolean;
+  current_positions?: number;
+  order_ticket?: number;
+  ema25s2?: number;
+  ma100?: number;
+  ma200?: number;
+  spread?: number;
+  bar_ts?: string;
+  account_login?: string;
+  broker?: string;
 }
 
 function corsHeaders() {
@@ -82,7 +110,7 @@ serve(async (req: Request) => {
       );
     }
     
-    let body;
+    let body: EALogInput;
     try {
       body = JSON.parse(safe);
     } catch (parseError) {
@@ -93,43 +121,30 @@ serve(async (req: Request) => {
       );
     }
     
+    // Extract only essential columns for simplified ea-log table
+    // EA can send all fields, but we only store what's needed for monitoring
     const logEntry: EALogEntry = {
       at: toISO(body.at),
       sym: body.sym || "UNKNOWN",
-      tf: body.tf || "UNKNOWN",
-      rsi: body.rsi !== undefined ? Number(body.rsi) : undefined,
-      atr: body.atr !== undefined ? Number(body.atr) : undefined,
-      price: body.price !== undefined ? Number(body.price) : undefined,
+      tf: body.tf || undefined,
       action: body.action || undefined,
+      trade_decision: body.trade_decision || undefined,
       win_prob: body.win_prob !== undefined ? Number(body.win_prob) : undefined,
-      offset_factor: body.offset_factor !== undefined ? Number(body.offset_factor) : undefined,
-      expiry_minutes: body.expiry_minutes !== undefined ? Number(body.expiry_minutes) : undefined,
-      reason: body.reason || undefined,
-      instance: body.instance || undefined,
-      version: body.version || undefined,
-      caller: body.caller || undefined,
+      ai_reasoning: body.ai_reasoning || undefined,
+      order_ticket: body.order_ticket !== undefined ? Number(body.order_ticket) : undefined,
     };
     
-    let { error } = await supabase.from("ea-log").insert(logEntry);
-    
-    if (error && (error.message.includes("offset_factor") || error.message.includes("expiry_minutes"))) {
-      console.warn("[ea-log] Retrying without new columns");
-      const fallbackEntry = { ...logEntry };
-      delete fallbackEntry.offset_factor;
-      delete fallbackEntry.expiry_minutes;
-      const result = await supabase.from("ea-log").insert(fallbackEntry);
-      error = result.error;
-    }
+    const { error } = await supabase.from("ea-log").insert(logEntry);
     
     if (error) {
       console.error("[ea-log] DB error:", error);
       return new Response(
-        JSON.stringify({ error: "DB insert failed" }),
+        JSON.stringify({ error: "DB insert failed", details: error.message }),
         { status: 500, headers: corsHeaders() }
       );
     }
     
-    console.log(`[ea-log] ${logEntry.sym} ${logEntry.tf} ${logEntry.caller || "-"}`);
+    console.log(`[ea-log] ${logEntry.sym} ${logEntry.tf || "?"} ${body.caller || "-"} ${logEntry.action || "?"}`);
     
     return new Response(
       JSON.stringify({ ok: true }),

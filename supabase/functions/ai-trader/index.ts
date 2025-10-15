@@ -15,6 +15,7 @@ interface TradeRequest {
   atr: number;
   price: number;
   reason: string;
+  ichimoku_score?: number;  // ⭐ NEW: 一目均衡表スコア (0.0-1.0)
   instance?: string;
   version?: string;
 }
@@ -39,12 +40,13 @@ function corsHeaders() {
 
 // フォールバック計算（OpenAI失敗時用）
 function calculateSignalFallback(req: TradeRequest): TradeResponse {
-  const { dir, rsi, atr } = req;
+  const { dir, rsi, atr, ichimoku_score } = req;
   let win_prob = 0.55;
   let action = 0;
   let offset_factor = 0.2;
   let expiry_minutes = 90;
   
+  // RSIによる調整
   if (rsi > 70) win_prob += (dir < 0) ? 0.20 : -0.05;
   else if (rsi < 30) win_prob += (dir > 0) ? 0.20 : -0.05;
   else if (rsi >= 60 && rsi <= 70) win_prob += (dir > 0) ? 0.15 : 0.0;
@@ -52,6 +54,26 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
   
   if (dir !== 0) win_prob += 0.15;
   
+  // ⭐ 一目均衡表スコアによる調整（NEW）
+  if (ichimoku_score !== undefined && ichimoku_score !== null) {
+    // ichimoku_score: 1.0 = 両指標一致（最強）, 0.7 = 一目のみ, 0.5 = MAのみ, 0.0 = 矛盾
+    if (ichimoku_score >= 0.9) {
+      // MA + 一目の両方が一致 → 高い信頼度
+      win_prob += 0.15;
+      console.log(`[Fallback] Ichimoku boost: +15% (score=${ichimoku_score})`);
+    } else if (ichimoku_score >= 0.6) {
+      // 一目のみまたは強めのシグナル
+      win_prob += 0.10;
+      console.log(`[Fallback] Ichimoku boost: +10% (score=${ichimoku_score})`);
+    } else if (ichimoku_score >= 0.4) {
+      // MAのみまたは弱めのシグナル
+      win_prob += 0.05;
+      console.log(`[Fallback] Ichimoku boost: +5% (score=${ichimoku_score})`);
+    }
+    // ichimoku_score = 0.0（矛盾）の場合は加算なし
+  }
+  
+  // ATRによる調整
   if (atr > 0) {
     if (atr > 0.001) {
       offset_factor = 0.25;
@@ -67,6 +89,17 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
   win_prob = Math.max(0, Math.min(1, win_prob));
   if (win_prob >= 0.70) action = dir;
   
+  // 一目スコアに基づく最終ログ
+  const ichimokuQuality = ichimoku_score !== undefined 
+    ? ichimoku_score >= 0.9 ? "excellent" : ichimoku_score >= 0.6 ? "good" : ichimoku_score >= 0.4 ? "moderate" : ichimoku_score > 0 ? "weak" : "conflicting"
+    : "N/A";
+  
+  console.log(
+    `[Fallback] Final calculation: win_prob=${(win_prob * 100).toFixed(1)}% ` +
+    `action=${action} ichimoku_quality=${ichimokuQuality} ` +
+    `(RSI=${rsi.toFixed(1)}, ATR=${atr.toFixed(5)})`
+  );
+  
   return {
     win_prob: Math.round(win_prob * 1000) / 1000,
     action,
@@ -77,7 +110,7 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
 
 // OpenAI APIを使用したAI予測
 async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> {
-  const { symbol, timeframe, dir, rsi, atr, price, reason } = req;
+  const { symbol, timeframe, dir, rsi, atr, price, reason, ichimoku_score } = req;
   
   // 過去の取引データを取得（ML学習データ）
   const { data: historicalData, error } = await supabase
@@ -94,30 +127,121 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
     historicalContext = `\n過去50件の取引での勝率: ${(winRate * 100).toFixed(1)}%`;
   }
   
-  const prompt = `あなたは金融市場の取引予測AIです。以下の情報から勝率を0.0～1.0の範囲で予測してください。
+  // ⭐ 一目均衡表スコアの詳細分析を追加
+  let ichimokuContext = "";
+  let signalQuality = "unknown";
+  let confidenceBoost = 0;
+  
+  if (ichimoku_score !== undefined && ichimoku_score !== null) {
+    if (ichimoku_score >= 0.9) {
+      // 最強シグナル: MA + 一目の両方が完全一致
+      signalQuality = "excellent";
+      confidenceBoost = 15;
+      ichimokuContext = `
+- 一目均衡表分析: **最強シグナル（信頼度95%）**
+  * 移動平均線（EMA25 vs SMA100）が${dir > 0 ? "上昇" : "下降"}トレンドを示す
+  * 一目均衡表の転換線が基準線を${dir > 0 ? "上" : "下"}抜け
+  * 価格が雲の${dir > 0 ? "上" : "下"}に位置（強いトレンド）
+  * 雲が${dir > 0 ? "青色（陽転）" : "赤色（陰転）"}でトレンドを確認
+  → 複数の独立したテクニカル指標が同一方向を示す極めて強いシグナル`;
+    } else if (ichimoku_score >= 0.6) {
+      // 一目のみが強シグナル
+      signalQuality = "good";
+      confidenceBoost = 10;
+      ichimokuContext = `
+- 一目均衡表分析: **強シグナル（信頼度80%）**
+  * 一目均衡表が明確な${dir > 0 ? "買い" : "売り"}シグナル
+  * 転換線・基準線・雲の3要素が揃っている
+  * 移動平均線は中立だが、一目が強い方向性を示す
+  → 一目均衡表単独でも信頼できるシグナル`;
+    } else if (ichimoku_score >= 0.4) {
+      // MAのみが強シグナル
+      signalQuality = "moderate";
+      confidenceBoost = 5;
+      ichimokuContext = `
+- 一目均衡表分析: **中程度シグナル（信頼度65%）**
+  * 移動平均線が${dir > 0 ? "上昇" : "下降"}トレンドを示す
+  * 一目均衡表は中立（雲の中または転換・基準線が接近）
+  * トレンド初期または調整局面の可能性
+  → 移動平均線のみのシグナルのため慎重に判断`;
+    } else if (ichimoku_score > 0) {
+      // 弱いシグナル
+      signalQuality = "weak";
+      confidenceBoost = 0;
+      ichimokuContext = `
+- 一目均衡表分析: **弱シグナル（信頼度50%）**
+  * 指標間の一致度が低い
+  * トレンドが不明瞭またはレンジ相場
+  → エントリーは慎重に、勝率は低めに見積もるべき`;
+    } else {
+      // シグナル矛盾
+      signalQuality = "conflicting";
+      confidenceBoost = -10;
+      ichimokuContext = `
+- 一目均衡表分析: **⚠️ シグナル矛盾（信頼度30%）**
+  * 移動平均線と一目均衡表が逆方向を示している
+  * 相場の転換点またはダマシの可能性が高い
+  * 例: MAは買いだが、価格が雲の下にある
+  → **エントリー非推奨**: 複数指標が矛盾する局面は避けるべき`;
+    }
+  }
+  
+  const prompt = `あなたはプロの金融トレーダー兼AIアナリストです。複数のテクニカル指標を総合的に分析し、取引の成功確率（勝率）を0.0～1.0の範囲で予測してください。
 
-【市場情報】
-- 銘柄: ${symbol}
-- 時間軸: ${timeframe}
-- 方向: ${dir > 0 ? "買い" : dir < 0 ? "売り" : "中立"}
-- RSI: ${rsi.toFixed(2)} ${rsi > 70 ? "(買われすぎ)" : rsi < 30 ? "(売られすぎ)" : "(中立)"}
-- ATR: ${atr.toFixed(5)} (ボラティリティ)
-- 現在価格: ${price}
-- テクニカル理由: ${reason}
-${historicalContext}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 市場情報
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• 銘柄: ${symbol}
+• 時間軸: ${timeframe}
+• エントリー方向: ${dir > 0 ? "買い（ロング）" : dir < 0 ? "売り（ショート）" : "中立"}
+• 現在価格: ${price}
 
-【予測ルール】
-1. RSI 70以上で売り、30以下で買いは高勝率
-2. トレンドと方向が一致すれば勝率UP
-3. ボラティリティが高い時はトレンドが明確
-4. 過去の勝率も考慮
-5. 勝率は0.50～0.95の範囲で現実的に
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📈 テクニカル指標
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• RSI: ${rsi.toFixed(2)} ${rsi > 70 ? "⚠️ 買われすぎ（70超）→ 売りシグナル強化" : rsi < 30 ? "⚠️ 売られすぎ（30未満）→ 買いシグナル強化" : "✓ 中立圏（30-70）"}
+• ATR: ${atr.toFixed(5)} ${atr > 0.001 ? "（高ボラティリティ→トレンド明確）" : atr < 0.0005 ? "（低ボラティリティ→レンジ相場）" : "（通常ボラティリティ）"}
+• 総合判定: ${reason}
+${ichimokuContext}
+${historicalContext ? `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📊 過去実績${historicalContext}` : ""}
 
-以下のJSON形式で回答してください（説明不要）:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 勝率予測ガイドライン
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. **一目均衡表スコアを最重視**（最も信頼性の高い指標）
+   - excellent (0.9+): 基準勝率 85%～95%
+   - good (0.6-0.9): 基準勝率 75%～85%
+   - moderate (0.4-0.6): 基準勝率 65%～75%
+   - weak (0.0-0.4): 基準勝率 55%～65%
+   - conflicting (0.0): 基準勝率 40%～55% ⚠️ エントリー非推奨
+
+2. **RSIとの相乗効果**
+   - RSI 70超 + 売り方向 → +5～10%
+   - RSI 30未満 + 買い方向 → +5～10%
+   - RSI逆行（RSI高で買い等） → -5～10%
+
+3. **ATRによる調整**
+   - 高ボラティリティ（0.001超）→ トレンド明確 → +3～5%
+   - 低ボラティリティ（0.0005未満）→ レンジ相場 → -3～5%
+
+4. **過去実績の反映**
+   - 過去勝率が高い → +2～5%
+   - 過去勝率が低い → -2～5%
+
+5. **最終調整**
+   - 複数指標が完全一致 → 高信頼度 → confidence: "high"
+   - 一部指標のみ一致 → 中信頼度 → confidence: "medium"
+   - 指標が矛盾 → 低信頼度 → confidence: "low"
+   - **勝率範囲: 0.40～0.95**（現実的な範囲）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 回答形式（JSON）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+以下のJSON形式で回答してください（説明文は不要）:
 {
-  "win_prob": 0.75,
-  "confidence": "high",
-  "reasoning": "理由を1行で"
+  "win_prob": 0.XX,
+  "confidence": "high" | "medium" | "low",
+  "reasoning": "一目均衡表の状態、RSIとの相乗効果、過去実績を踏まえた簡潔な判断理由（1行、30文字以内）"
 }`;
 
   try {
@@ -128,13 +252,16 @@ ${historicalContext}
         "Authorization": `Bearer ${OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",  // または "gpt-3.5-turbo"
+        model: "gpt-4o-mini",  // または "gpt-4o" for better analysis
         messages: [
-          { role: "system", content: "あなたは金融市場の予測AIです。JSON形式で簡潔に回答します。" },
+          { 
+            role: "system", 
+            content: "あなたはプロの金融トレーダーです。テクニカル指標を総合的に分析し、特に一目均衡表を重視して勝率を予測します。JSON形式で簡潔に回答してください。" 
+          },
           { role: "user", content: prompt }
         ],
-        temperature: 0.3,
-        max_tokens: 200,
+        temperature: 0.2,  // より一貫性のある予測のため低めに設定
+        max_tokens: 250,
       }),
     });
 
@@ -166,12 +293,27 @@ ${historicalContext}
       return calculateSignalFallback(req);
     }
     
-    win_prob = Math.max(0.5, Math.min(0.95, win_prob)); // 50%～95%に制限
+    // 一目スコアに基づく範囲調整
+    let minProb = 0.40;
+    let maxProb = 0.95;
+    if (ichimoku_score !== undefined && ichimoku_score !== null) {
+      if (ichimoku_score >= 0.9) {
+        minProb = 0.70;  // 最強シグナルは70%から
+      } else if (ichimoku_score <= 0.1) {
+        maxProb = 0.65;  // シグナル矛盾は65%まで
+      }
+    }
+    
+    win_prob = Math.max(minProb, Math.min(maxProb, win_prob));
     
     const confidence = aiResult.confidence || "unknown";
     const reasoning = aiResult.reasoning || "N/A";
     
-    console.log(`[AI] OpenAI prediction: ${(win_prob * 100).toFixed(1)}% (${confidence}) - ${reasoning}`);
+    // 詳細ログ出力
+    console.log(
+      `[AI] OpenAI GPT-4 prediction: ${(win_prob * 100).toFixed(1)}% (${confidence}) - ${reasoning} | ` +
+      `ichimoku=${ichimoku_score?.toFixed(2) || "N/A"} quality=${signalQuality}`
+    );
     
     return {
       win_prob: Math.round(win_prob * 1000) / 1000,
@@ -196,13 +338,21 @@ serve(async (req: Request) => {
   }
   
   if (req.method === "GET") {
+    // OpenAI API KEY の詳細確認
+    const hasKey = OPENAI_API_KEY && OPENAI_API_KEY.length > 10 && !OPENAI_API_KEY.includes("YOUR_");
+    const keyStatus = OPENAI_API_KEY 
+      ? (hasKey ? `configured (${OPENAI_API_KEY.length} chars)` : "invalid or placeholder")
+      : "NOT SET";
+    
     return new Response(
       JSON.stringify({ 
         ok: true, 
-        service: "ai-trader with OpenAI", 
-        version: "2.0.0",
-        ai_enabled: !!OPENAI_API_KEY,
-        fallback_available: true
+        service: "ai-trader with OpenAI + Ichimoku", 
+        version: "2.2.0",
+        ai_enabled: hasKey,
+        openai_key_status: keyStatus,
+        fallback_available: true,
+        features: ["ichimoku_score", "openai_gpt", "ml_learning", "detailed_logging"]
       }),
       { status: 200, headers: corsHeaders() }
     );
@@ -242,21 +392,54 @@ serve(async (req: Request) => {
     
     const tradeReq: TradeRequest = body;
     
-    // OpenAI_API_KEYが設定されていればAI使用、なければフォールバック
-    let response;
-    if (OPENAI_API_KEY) {
-      console.log(`[ai-trader] Using OpenAI GPT for prediction`);
-      response = await calculateSignalWithAI(tradeReq);
+    // ⭐ OpenAI API KEY の存在確認とログ
+    const hasOpenAIKey = OPENAI_API_KEY && OPENAI_API_KEY.length > 10 && !OPENAI_API_KEY.includes("YOUR_");
+    
+    if (!hasOpenAIKey) {
+      console.warn(`[ai-trader] ⚠️ OPENAI_API_KEY not properly configured!`);
+      console.warn(`[ai-trader] Key status: ${OPENAI_API_KEY ? `exists (length=${OPENAI_API_KEY.length})` : "NOT SET"}`);
+      console.warn(`[ai-trader] Using FALLBACK calculation only`);
     } else {
-      console.warn(`[ai-trader] OPENAI_API_KEY not set - using rule-based fallback`);
-      response = calculateSignalFallback(tradeReq);
+      console.log(`[ai-trader] ✓ OpenAI API KEY configured (length=${OPENAI_API_KEY.length})`);
     }
     
+    // OpenAI_API_KEYが設定されていればAI使用、なければフォールバック
+    let response;
+    let predictionMethod = "UNKNOWN";
+    
+    if (hasOpenAIKey) {
+      console.log(`[ai-trader] 🤖 Attempting OpenAI GPT prediction...`);
+      try {
+        response = await calculateSignalWithAI(tradeReq);
+        predictionMethod = "OpenAI-GPT";
+        console.log(`[ai-trader] ✓ OpenAI prediction successful`);
+      } catch (aiError) {
+        console.error(`[ai-trader] ❌ OpenAI prediction failed:`, aiError);
+        console.warn(`[ai-trader] Switching to fallback calculation...`);
+        response = calculateSignalFallback(tradeReq);
+        predictionMethod = "Fallback-AfterAI-Error";
+      }
+    } else {
+      console.warn(`[ai-trader] ⚠️ Using rule-based FALLBACK (no OpenAI key)`);
+      response = calculateSignalFallback(tradeReq);
+      predictionMethod = "Fallback-NoKey";
+    }
+    
+    // ⭐ 詳細ログ出力（判定方法を明示）
+    const ichimokuInfo = tradeReq.ichimoku_score !== undefined 
+      ? ` ichimoku=${tradeReq.ichimoku_score.toFixed(2)}` 
+      : "";
+    
     console.log(
-      `[ai-trader] ${tradeReq.symbol} ${tradeReq.timeframe} ` +
-      `dir=${tradeReq.dir} win=${response.win_prob.toFixed(3)} ` +
-      `(${OPENAI_API_KEY ? "AI" : "Fallback"})`
+      `[ai-trader] 📊 RESULT: ${tradeReq.symbol} ${tradeReq.timeframe} ` +
+      `dir=${tradeReq.dir} win=${response.win_prob.toFixed(3)}${ichimokuInfo} ` +
+      `reason="${tradeReq.reason}" method=${predictionMethod}`
     );
+    
+    // ⚠️ フォールバックの場合は警告
+    if (predictionMethod.startsWith("Fallback")) {
+      console.warn(`[ai-trader] ⚠️ WARNING: Using fallback calculation! Check OpenAI API key configuration.`);
+    }
     
     return new Response(
       JSON.stringify(response),

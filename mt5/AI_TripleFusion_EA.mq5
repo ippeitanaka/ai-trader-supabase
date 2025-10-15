@@ -1,10 +1,12 @@
 //+------------------------------------------------------------------+
-//| AI_TripleFusion_EA.mq5  (ver 1.2.5)                              |
+//| AI_QuadFusion_EA.mq5  (ver 1.3.0)                                |
 //| - Supabase: ai-config / ai-signals(AI側) / ea-log                |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
 //| - Fix: ポジション約定後の重複ログ出力を修正                      |
 //| - Enhanced: ea-logに詳細なAI判断とトレード状況を記録             |
+//| - New: ai-signals-update エンドポイントで約定価格を記録          |
+//| - v1.3.0: 一目均衡表（Ichimoku）を統合 - Quad Fusion化           |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -33,11 +35,18 @@ input string AI_Endpoint_URL     = "https://nebphrnnpmuqbkymwefs.functions.supab
 input string EA_Log_URL          = "https://nebphrnnpmuqbkymwefs.functions.supabase.co/ea-log";
 input string AI_Config_URL       = "https://nebphrnnpmuqbkymwefs.functions.supabase.co/ai-config";
 input string AI_Signals_URL      = "https://nebphrnnpmuqbkymwefs.functions.supabase.co/ai-signals";
+input string AI_Signals_Update_URL = "https://nebphrnnpmuqbkymwefs.functions.supabase.co/ai-signals-update";
 input string AI_Bearer_Token     = "YOUR_SERVICE_ROLE_KEY";
 
 input string AI_EA_Instance      = "main";
-input string AI_EA_Version       = "1.2.5";
+input string AI_EA_Version       = "1.3.0";
 input int    AI_Timeout_ms       = 5000;
+
+// ===== 一目均衡表設定 =====
+input bool   UseIchimoku         = true;   // 一目均衡表を使用
+input int    Ichimoku_Tenkan     = 9;      // 転換線期間
+input int    Ichimoku_Kijun      = 26;     // 基準線期間
+input int    Ichimoku_Senkou     = 52;     // 先行スパン期間
 
 // ===== 内部変数 =====
 datetime g_lastBar_M15=0, g_lastBar_H1=0;
@@ -131,17 +140,154 @@ double MA(ENUM_TIMEFRAMES tf,int period,ENUM_MA_METHOD method,ENUM_APPLIED_PRICE
  double b[];if(CopyBuffer(h,0,shift,1,b)<=0){IndicatorRelease(h);return EMPTY_VALUE;}
  IndicatorRelease(h);return b[0];}
 
+// 一目均衡表の各ライン取得
+struct IchimokuValues{
+   double tenkan;    // 転換線
+   double kijun;     // 基準線
+   double senkou_a;  // 先行スパンA
+   double senkou_b;  // 先行スパンB
+   double chikou;    // 遅行スパン
+};
+
+bool GetIchimoku(ENUM_TIMEFRAMES tf,IchimokuValues &ich,int shift=0)
+{
+   int h=iIchimoku(_Symbol,tf,Ichimoku_Tenkan,Ichimoku_Kijun,Ichimoku_Senkou);
+   if(h==INVALID_HANDLE){
+      Print("[Ichimoku] Failed to create indicator handle");
+      return false;
+   }
+   
+   double tenkan_buf[],kijun_buf[],senkou_a_buf[],senkou_b_buf[],chikou_buf[];
+   
+   // 各バッファからデータを取得
+   // 0:Tenkan, 1:Kijun, 2:SpanA, 3:SpanB, 4:Chikou
+   bool ok=true;
+   ok=ok&&CopyBuffer(h,0,shift,1,tenkan_buf)>0;
+   ok=ok&&CopyBuffer(h,1,shift,1,kijun_buf)>0;
+   ok=ok&&CopyBuffer(h,2,shift,1,senkou_a_buf)>0;
+   ok=ok&&CopyBuffer(h,3,shift,1,senkou_b_buf)>0;
+   ok=ok&&CopyBuffer(h,4,shift,1,chikou_buf)>0;
+   
+   if(!ok){
+      IndicatorRelease(h);
+      Print("[Ichimoku] Failed to copy buffers");
+      return false;
+   }
+   
+   ich.tenkan=tenkan_buf[0];
+   ich.kijun=kijun_buf[0];
+   ich.senkou_a=senkou_a_buf[0];
+   ich.senkou_b=senkou_b_buf[0];
+   ich.chikou=chikou_buf[0];
+   
+   IndicatorRelease(h);
+   return true;
+}
+
+// 一目均衡表のシグナル判定
+int IchimokuSignal(ENUM_TIMEFRAMES tf,double current_price)
+{
+   if(!UseIchimoku) return 0;
+   
+   IchimokuValues ich;
+   if(!GetIchimoku(tf,ich,0)) return 0;
+   
+   int signal=0;
+   int score=0;
+   
+   // 1. 転換線と基準線のクロス（最も重要）
+   if(ich.tenkan>ich.kijun) score+=2;      // 強い買いシグナル
+   else if(ich.tenkan<ich.kijun) score-=2; // 強い売りシグナル
+   
+   // 2. 価格と雲の位置関係
+   double kumo_top=MathMax(ich.senkou_a,ich.senkou_b);
+   double kumo_bottom=MathMin(ich.senkou_a,ich.senkou_b);
+   
+   if(current_price>kumo_top) score+=1;       // 価格が雲の上 -> 買い優勢
+   else if(current_price<kumo_bottom) score-=1; // 価格が雲の下 -> 売り優勢
+   
+   // 3. 雲の厚さ（薄い雲は突破しやすい）
+   double kumo_thickness=MathAbs(ich.senkou_a-ich.senkou_b);
+   double atr=ATRv(tf,14,0);
+   if(atr>0 && kumo_thickness<atr*0.5){
+      // 薄い雲 -> 中立（トレンド転換の可能性）
+      score=0;
+   }
+   
+   // 4. 雲の色（先行スパンAとBの関係）
+   if(ich.senkou_a>ich.senkou_b) score+=1;    // 上昇雲（陽転）
+   else if(ich.senkou_a<ich.senkou_b) score-=1; // 下降雲（陰転）
+   
+   // スコアからシグナルを決定
+   if(score>=3) signal=1;       // 強い買い
+   else if(score<=-3) signal=-1; // 強い売り
+   
+   return signal;
+}
+
 // ===== テクニカルシグナル =====
-struct TechSignal{int dir;string reason;double atr;double ref;};
+struct TechSignal{int dir;string reason;double atr;double ref;double ichimoku_score;};
 TechSignal Evaluate(ENUM_TIMEFRAMES tf)
 {
-   TechSignal s; s.dir=0; s.reason=""; s.atr=ATRv(tf,14,0);
+   TechSignal s; s.dir=0; s.reason=""; s.atr=ATRv(tf,14,0); s.ichimoku_score=0;
    double mid=(SymbolInfoDouble(_Symbol,SYMBOL_BID)+SymbolInfoDouble(_Symbol,SYMBOL_ASK))/2.0;
    s.ref=mid;
+   
+   // 移動平均線のシグナル
    double fast=MA(tf,25,MODE_EMA,PRICE_CLOSE,0);
    double slow=MA(tf,100,MODE_SMA,PRICE_CLOSE,0);
-   if(fast>slow){s.dir=1;s.reason="MA↑";}
-   else if(fast<slow){s.dir=-1;s.reason="MA↓";}
+   int ma_signal=0;
+   if(fast>slow) ma_signal=1;
+   else if(fast<slow) ma_signal=-1;
+   
+   // 一目均衡表のシグナル
+   int ichimoku_signal=IchimokuSignal(tf,mid);
+   
+   // 総合判定（両方が一致する場合は強いシグナル）
+   if(UseIchimoku){
+      if(ma_signal==1 && ichimoku_signal==1){
+         s.dir=1; 
+         s.reason="MA↑+一目買";
+         s.ichimoku_score=1.0;
+      }
+      else if(ma_signal==-1 && ichimoku_signal==-1){
+         s.dir=-1; 
+         s.reason="MA↓+一目売";
+         s.ichimoku_score=1.0;
+      }
+      else if(ma_signal==1 && ichimoku_signal==0){
+         s.dir=1; 
+         s.reason="MA↑";
+         s.ichimoku_score=0.5;
+      }
+      else if(ma_signal==-1 && ichimoku_signal==0){
+         s.dir=-1; 
+         s.reason="MA↓";
+         s.ichimoku_score=0.5;
+      }
+      else if(ma_signal==0 && ichimoku_signal==1){
+         s.dir=1; 
+         s.reason="一目買";
+         s.ichimoku_score=0.7;
+      }
+      else if(ma_signal==0 && ichimoku_signal==-1){
+         s.dir=-1; 
+         s.reason="一目売";
+         s.ichimoku_score=0.7;
+      }
+      else if(ma_signal!=0 && ichimoku_signal!=0 && ma_signal!=ichimoku_signal){
+         // シグナルが矛盾 -> 見送り
+         s.dir=0; 
+         s.reason="シグナル矛盾";
+         s.ichimoku_score=0;
+      }
+   }
+   else{
+      // 一目均衡表を使わない場合は従来通り
+      if(ma_signal==1){s.dir=1;s.reason="MA↑";}
+      else if(ma_signal==-1){s.dir=-1;s.reason="MA↓";}
+   }
+   
    return s;
 }
 
@@ -165,7 +311,7 @@ bool ExtractJsonString(const string json,const string key,string &out){
    StringReplace(out,"\\n","\n");StringReplace(out,"\\r","\r");
    return true;}
 
-bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,const string reason,AIOut &out_ai)
+bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,const string reason,double ichimoku_score,AIOut &out_ai)
 {
    string payload="{"+
    "\"symbol\":\""+JsonEscape(_Symbol)+"\","+
@@ -175,6 +321,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    "\"atr\":"+DoubleToString(atr,5)+","+
    "\"price\":"+DoubleToString(price,_Digits)+","+
    "\"reason\":\""+JsonEscape(reason)+"\","+
+   "\"ichimoku_score\":"+DoubleToString(ichimoku_score,2)+","+
    "\"instance\":\""+JsonEscape(AI_EA_Instance)+"\","+
    "\"version\":\""+JsonEscape(AI_EA_Version)+"\"}";
 
@@ -328,7 +475,7 @@ void OnM15NewBar()
 {
    TechSignal t=Evaluate(TF_Entry); if(t.dir==0)return;
    double rsi=RSIv(PERIOD_M15,14,PRICE_CLOSE,0);
-   AIOut ai; if(!QueryAI("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai))return;
+   AIOut ai; if(!QueryAI("M15",t.dir,rsi,t.atr,t.ref,t.reason,t.ichimoku_score,ai))return;
 
    int posCount=CountPositions();
    bool threshold_met=(ai.win_prob>=MinWinProb);
@@ -376,7 +523,7 @@ void OnH1NewBar()
    }
    TechSignal t=Evaluate(TF_Recheck);
    double rsi=RSIv(PERIOD_H1,14,PRICE_CLOSE,0);
-   AIOut ai; if(!QueryAI("H1",t.dir,rsi,t.atr,t.ref,t.reason,ai))return;
+   AIOut ai; if(!QueryAI("H1",t.dir,rsi,t.atr,t.ref,t.reason,t.ichimoku_score,ai))return;
    
    int posCount=CountPositions();
    bool threshold_met=(ai.win_prob>=MinWinProb);
@@ -403,12 +550,12 @@ void CheckPositionStatus()
          g_trackedPositionOpenTime=PositionGetInteger(POSITION_TIME);
          g_trackedPositionEntryPrice=PositionGetDouble(POSITION_PRICE_OPEN);
          
-         // シグナル更新（エントリー価格を記録）
+         // シグナル更新（エントリー価格を記録） - 新しいエンドポイントを使用
          string payload="{\"order_ticket\":"+IntegerToString(g_trackedPositionTicket)+
                         ",\"entry_price\":"+DoubleToString(g_trackedPositionEntryPrice,_Digits)+
                         ",\"actual_result\":\"FILLED\"}";
          string resp;
-         HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000);
+         HttpPostJson(AI_Signals_Update_URL,AI_Bearer_Token,payload,resp,3000);
          
          SafePrint(StringFormat("[POSITION] Filled ticket=%d at %.5f",g_trackedPositionTicket,g_trackedPositionEntryPrice));
          
@@ -457,7 +604,7 @@ void CheckPositionStatus()
 // ===== メイン =====
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
-   SafePrint("[INIT] EA 1.2.5 start (Enhanced ea-log with AI decision tracking)");
+   SafePrint("[INIT] EA 1.2.6 start (Entry price tracking for ML learning)");
    SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",
       MinWinProb*100,RiskATRmult,RewardRR,Lots,MaxPositions));
    return(INIT_SUCCEEDED);
