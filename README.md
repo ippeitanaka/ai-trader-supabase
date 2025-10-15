@@ -10,13 +10,16 @@ Supabase Edge Functions backend for MT5 AI Trading EA (Expert Advisor).
 This repository provides the backend infrastructure for **AI_QuadFusion_EA v1.3.0**, a MetaTrader 5 Expert Advisor that integrates AI-powered trading signals with Supabase Edge Functions.
 
 ### ⭐ Latest Update (v1.3.0 EA + v2.2.0 Edge Functions)
-**Ichimoku Kinko Hyo (一目均衡表) Full Integration** - AI-Powered Quad Fusion!
+**Ichimoku Kinko Hyo (一目均衡表) Full Integration + Comprehensive Diagnostics** - AI-Powered Quad Fusion!
 - 🎯 **EA v1.3.0**: 4 technical indicators: RSI + ATR + Moving Averages + **Ichimoku** 
 - 🧠 **AI v2.2.0**: OpenAI GPT-4 deeply understands Ichimoku signals for smarter predictions
 - 🔍 Signal quality classification (excellent/good/moderate/weak/conflicting)
 - 🛡️ Conflict detection: Skip trades when indicators disagree
 - 📊 Dynamic win probability ranges based on signal quality
-- See docs: [ICHIMOKU_INTEGRATION.md](./ICHIMOKU_INTEGRATION.md) | [AI_PREDICTION_ENHANCEMENT.md](./AI_PREDICTION_ENHANCEMENT.md)
+- 🩺 **NEW: Comprehensive diagnostic system** - Detect OpenAI API issues instantly
+- ⚠️ **NEW: Enhanced logging** - Track prediction method (OpenAI vs Fallback)
+- 🔧 **NEW: Health check script** - Daily monitoring tool (`./health_check.sh`)
+- See docs: [ICHIMOKU_INTEGRATION.md](./ICHIMOKU_INTEGRATION.md) | [CHECK_AI_STATUS.md](./CHECK_AI_STATUS.md)
 
 ### Architecture
 
@@ -55,6 +58,26 @@ ai-trader-supabase/
 
 > **Note**: `archive/` ディレクトリには過去のバックアップと開発履歴が保存されています。
 > 現在のプロジェクトでは使用されていませんが、参考用に保持されています。
+
+## � Quick Start
+
+### Daily Health Check (30 seconds)
+```bash
+./health_check.sh
+```
+Expected output: `✅ ステータス: 正常` with `ai_enabled: true`
+
+### Deploy Edge Functions
+```bash
+supabase functions deploy ai-trader
+```
+
+### Verify Deployment
+```bash
+curl https://nebphrnnpmuqbkymwefs.functions.supabase.co/ai-trader
+```
+
+See [DEPLOYMENT_CHECKLIST.md](./DEPLOYMENT_CHECKLIST.md) for detailed setup instructions.
 
 ## �📦 Components
 
@@ -401,16 +424,29 @@ if (error && (error.message.includes("offset_factor") || error.message.includes(
 - ✅ **Column fallback**: ea-log retries without offset_factor/expiry_minutes on failure
 - ✅ **Migrations**: Three DDL files with `IF NOT EXISTS` clauses
 
-### Maintenance (2025-10-15)
+### Maintenance & Updates (2025-10-15)
 
-プロジェクトのメンテナンスを実施し、以下を整理しました:
-
+#### プロジェクトメンテナンス
 - **アーカイブ化**: バックアップファイルと古いドキュメントを `archive/` ディレクトリに移動
 - **ファイル整理**: 
   - Edge Functions のバックアップ (`index_fallback_backup.ts`, `index_with_openai.ts`)
   - 個別SQLファイル（マイグレーションに統合済み）
   - 初期開発ドキュメント（13ファイル）
 - **構造改善**: プロジェクト構造をより明確に整理
+
+#### 診断システムの追加
+- **OpenAI API Key 検証強化**: 長さチェック、プレースホルダー検出
+- **予測方法トラッキング**: `OpenAI-GPT`, `Fallback-NoKey`, `Fallback-AfterAI-Error`
+- **詳細ロギング**: 各ステップで明確なログメッセージと警告
+- **診断エンドポイント**: GET `/ai-trader` で `ai_enabled` と `openai_key_status` を返す
+- **健康チェックスクリプト**: `./health_check.sh` で日次監視が可能
+
+#### 新規ドキュメント
+- [CHECK_AI_STATUS.md](./CHECK_AI_STATUS.md) - AI接続状況の確認方法（詳細ガイド）
+- [QUICK_DIAGNOSIS.md](./QUICK_DIAGNOSIS.md) - クイック診断チートシート
+- [OPENAI_TROUBLESHOOTING.md](./OPENAI_TROUBLESHOOTING.md) - トラブルシューティングガイド
+- [DEPLOYMENT_CHECKLIST.md](./DEPLOYMENT_CHECKLIST.md) - デプロイ前チェックリスト
+- [DIAGNOSTIC_CHANGES.md](./DIAGNOSTIC_CHANGES.md) - コード変更の詳細
 
 ## 🔐 Security
 
