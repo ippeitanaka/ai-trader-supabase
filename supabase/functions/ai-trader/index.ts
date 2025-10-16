@@ -7,20 +7,56 @@ const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-interface TradeRequest {
+export interface TradeRequest {
   symbol: string;
   timeframe: string;
-  dir: number;
+  
+  // 価格情報
+  price: number;
+  bid: number;
+  ask: number;
+  
+  // 移動平均線
+  ema_25: number;
+  sma_100: number;
+  ma_cross: number;  // 1=golden cross, -1=dead cross
+  
+  // モメンタム指標
   rsi: number;
   atr: number;
-  price: number;
-  reason: string;
-  ichimoku_score?: number;  // ⭐ NEW: 一目均衡表スコア (0.0-1.0)
+  
+  // MACD
+  macd: {
+    main: number;
+    signal: number;
+    histogram: number;
+    cross: number;  // 1=bullish, -1=bearish
+  };
+  
+  // 一目均衡表
+  ichimoku: {
+    tenkan: number;
+    kijun: number;
+    senkou_a: number;
+    senkou_b: number;
+    chikou: number;
+    tk_cross: number;       // 転換線 vs 基準線
+    cloud_color: number;    // 雲の色
+    price_vs_cloud: number; // 価格 vs 雲の位置
+  };
+  
+  // EA側の判断（参考情報として）
+  ea_suggestion: {
+    dir: number;
+    reason: string;
+    ichimoku_score: number;
+  };
+  
   instance?: string;
   version?: string;
 }
 
-interface TradeResponse {
+export interface TradeResponse {
   win_prob: number;
   action: number;
   offset_factor: number;
@@ -38,81 +74,88 @@ function corsHeaders() {
   };
 }
 
-// フォールバック計算（OpenAI失敗時用）
+import { calculateQuadFusionScore } from "./quad-fusion.ts";
+
+// フォールバック計算（OpenAI失敗時用） - QuadFusionを使用
 function calculateSignalFallback(req: TradeRequest): TradeResponse {
-  const { dir, rsi, atr, ichimoku_score } = req;
-  let win_prob = 0.55;
-  let action = 0;
+  // ★ QuadFusion分析を使用
+  const analysis = calculateQuadFusionScore(req);
+  const { atr } = req;
+  
   let offset_factor = 0.2;
   let expiry_minutes = 90;
   
-  // RSIによる調整
-  if (rsi > 70) win_prob += (dir < 0) ? 0.20 : -0.05;
-  else if (rsi < 30) win_prob += (dir > 0) ? 0.20 : -0.05;
-  else if (rsi >= 60 && rsi <= 70) win_prob += (dir > 0) ? 0.15 : 0.0;
-  else if (rsi >= 30 && rsi <= 40) win_prob += (dir < 0) ? 0.15 : 0.0;
-  
-  if (dir !== 0) win_prob += 0.15;
-  
-  // ⭐ 一目均衡表スコアによる調整（NEW）
-  if (ichimoku_score !== undefined && ichimoku_score !== null) {
-    // ichimoku_score: 1.0 = 両指標一致（最強）, 0.7 = 一目のみ, 0.5 = MAのみ, 0.0 = 矛盾
-    if (ichimoku_score >= 0.9) {
-      // MA + 一目の両方が一致 → 高い信頼度
-      win_prob += 0.15;
-      console.log(`[Fallback] Ichimoku boost: +15% (score=${ichimoku_score})`);
-    } else if (ichimoku_score >= 0.6) {
-      // 一目のみまたは強めのシグナル
-      win_prob += 0.10;
-      console.log(`[Fallback] Ichimoku boost: +10% (score=${ichimoku_score})`);
-    } else if (ichimoku_score >= 0.4) {
-      // MAのみまたは弱めのシグナル
-      win_prob += 0.05;
-      console.log(`[Fallback] Ichimoku boost: +5% (score=${ichimoku_score})`);
-    }
-    // ichimoku_score = 0.0（矛盾）の場合は加算なし
-  }
-  
-  // ATRによる調整
+  // ATRによるリスク調整
   if (atr > 0) {
     if (atr > 0.001) {
       offset_factor = 0.25;
-      win_prob += 0.05;
-    }
-    if (atr < 0.0005) {
+      expiry_minutes = 120; // 高ボラティリティは長めの有効期限
+    } else if (atr < 0.0005) {
       offset_factor = 0.15;
-      expiry_minutes = 60;
-      win_prob -= 0.05;
+      expiry_minutes = 60; // 低ボラティリティは短めの有効期限
     }
   }
   
-  win_prob = Math.max(0, Math.min(1, win_prob));
-  if (win_prob >= 0.70) action = dir;
-  
-  // 一目スコアに基づく最終ログ
-  const ichimokuQuality = ichimoku_score !== undefined 
-    ? ichimoku_score >= 0.9 ? "excellent" : ichimoku_score >= 0.6 ? "good" : ichimoku_score >= 0.4 ? "moderate" : ichimoku_score > 0 ? "weak" : "conflicting"
-    : "N/A";
-  
   console.log(
-    `[Fallback] Final calculation: win_prob=${(win_prob * 100).toFixed(1)}% ` +
-    `action=${action} ichimoku_quality=${ichimokuQuality} ` +
-    `(RSI=${rsi.toFixed(1)}, ATR=${atr.toFixed(5)})`
+    `[Fallback] QuadFusion: win_prob=${(analysis.win_prob * 100).toFixed(1)}% ` +
+    `direction=${analysis.direction} confidence=${analysis.confidence}`
   );
   
   return {
-    win_prob: Math.round(win_prob * 1000) / 1000,
-    action,
+    win_prob: Math.round(analysis.win_prob * 1000) / 1000,
+    action: analysis.direction,
     offset_factor: Math.round(offset_factor * 1000) / 1000,
     expiry_minutes,
+    confidence: analysis.confidence,
+    reasoning: analysis.reasoning,
   };
 }
 
 // OpenAI APIを使用したAI予測
 async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> {
-  const { symbol, timeframe, dir, rsi, atr, price, reason, ichimoku_score } = req;
+  const { symbol, timeframe, rsi, atr, price, ea_suggestion } = req;
+  const dir = ea_suggestion.dir;
+  const reason = ea_suggestion.reason;
+  const ichimoku_score = ea_suggestion.ichimoku_score;
   
-  // 過去の取引データを取得（ML学習データ）
+  // ⭐ ML学習済みパターンを検索
+  const { data: matchedPatterns } = await supabase
+    .from("ml_patterns")
+    .select("*")
+    .eq("symbol", symbol)
+    .eq("timeframe", timeframe)
+    .eq("direction", dir)
+    .eq("is_active", true)
+    .gte("rsi_max", rsi)
+    .lte("rsi_min", rsi)
+    .gte("total_trades", 5) // 最低サンプル数
+    .order("confidence_score", { ascending: false })
+    .limit(3);
+  
+  let mlContext = "";
+  let mlWinRateBoost = 0;
+  
+  if (matchedPatterns && matchedPatterns.length > 0) {
+    const bestMatch = matchedPatterns[0];
+    mlContext = `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📚 ML学習済みパターン検出\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+    mlContext += `\n• パターン名: ${bestMatch.pattern_name}`;
+    mlContext += `\n• 過去勝率: ${(bestMatch.win_rate * 100).toFixed(1)}% (${bestMatch.total_trades}件)`;
+    mlContext += `\n• 平均利益: ${bestMatch.avg_profit.toFixed(0)}, 平均損失: ${bestMatch.avg_loss.toFixed(0)}`;
+    mlContext += `\n• プロフィットファクター: ${bestMatch.profit_factor.toFixed(2)}`;
+    mlContext += `\n• 信頼度スコア: ${(bestMatch.confidence_score * 100).toFixed(1)}%`;
+    mlContext += `\n→ この条件での過去実績を重視して勝率を調整してください`;
+    
+    // ML学習結果に基づく勝率調整（最大±10%）
+    if (bestMatch.win_rate >= 0.70) {
+      mlWinRateBoost = +0.05; // 高勝率パターン
+    } else if (bestMatch.win_rate < 0.50) {
+      mlWinRateBoost = -0.08; // 低勝率パターン（強めに抑制）
+    }
+    
+    console.log(`[AI] ML Pattern matched: ${bestMatch.pattern_name}, win_rate=${bestMatch.win_rate}, boost=${mlWinRateBoost}`);
+  }
+  
+  // 過去の取引データを取得(追加の参考データ)
   const { data: historicalData, error } = await supabase
     .from("ai_signals")
     .select("win_prob, rsi, atr, actual_result")
@@ -203,32 +246,38 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
 • ATR: ${atr.toFixed(5)} ${atr > 0.001 ? "（高ボラティリティ→トレンド明確）" : atr < 0.0005 ? "（低ボラティリティ→レンジ相場）" : "（通常ボラティリティ）"}
 • 総合判定: ${reason}
 ${ichimokuContext}
+${mlContext}
 ${historicalContext ? `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📊 過去実績${historicalContext}` : ""}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 勝率予測ガイドライン
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. **一目均衡表スコアを最重視**（最も信頼性の高い指標）
+1. **ML学習パターンを最優先**（実績データに基づく最も信頼できる指標）
+   - ML学習パターンが検出された場合は、その過去勝率を強く重視
+   - サンプル数が多いほど信頼性が高い
+   - プロフィットファクターも考慮
+
+2. **一目均衡表スコアを次に重視**
    - excellent (0.9+): 基準勝率 85%～95%
    - good (0.6-0.9): 基準勝率 75%～85%
    - moderate (0.4-0.6): 基準勝率 65%～75%
    - weak (0.0-0.4): 基準勝率 55%～65%
    - conflicting (0.0): 基準勝率 40%～55% ⚠️ エントリー非推奨
 
-2. **RSIとの相乗効果**
+3. **RSIとの相乗効果**
    - RSI 70超 + 売り方向 → +5～10%
    - RSI 30未満 + 買い方向 → +5～10%
    - RSI逆行（RSI高で買い等） → -5～10%
 
-3. **ATRによる調整**
+4. **ATRによる調整**
    - 高ボラティリティ（0.001超）→ トレンド明確 → +3～5%
    - 低ボラティリティ（0.0005未満）→ レンジ相場 → -3～5%
 
-4. **過去実績の反映**
+5. **過去実績の反映**
    - 過去勝率が高い → +2～5%
    - 過去勝率が低い → -2～5%
 
-5. **最終調整**
+6. **最終調整**
    - 複数指標が完全一致 → 高信頼度 → confidence: "high"
    - 一部指標のみ一致 → 中信頼度 → confidence: "medium"
    - 指標が矛盾 → 低信頼度 → confidence: "low"
@@ -241,7 +290,7 @@ ${historicalContext ? `\n━━━━━━━━━━━━━━━━━━�
 {
   "win_prob": 0.XX,
   "confidence": "high" | "medium" | "low",
-  "reasoning": "一目均衡表の状態、RSIとの相乗効果、過去実績を踏まえた簡潔な判断理由（1行、30文字以内）"
+  "reasoning": "ML学習結果、一目均衡表、RSIを踏まえた簡潔な判断理由（1行、30文字以内）"
 }`;
 
   try {
@@ -291,6 +340,13 @@ ${historicalContext ? `\n━━━━━━━━━━━━━━━━━━�
       console.error("[AI] Invalid win_prob:", win_prob, "from AI response:", JSON.stringify(aiResult));
       console.warn("[AI] Falling back to rule-based calculation");
       return calculateSignalFallback(req);
+    }
+    
+    // ⭐ ML学習結果に基づく勝率調整を適用
+    if (mlWinRateBoost !== 0) {
+      const originalProb = win_prob;
+      win_prob = win_prob + mlWinRateBoost;
+      console.log(`[AI] ML adjustment applied: ${originalProb.toFixed(3)} → ${win_prob.toFixed(3)} (boost: ${mlWinRateBoost.toFixed(3)})`);
     }
     
     // 一目スコアに基づく範囲調整
@@ -380,7 +436,8 @@ serve(async (req: Request) => {
       );
     }
     
-    const required = ["symbol", "timeframe", "dir", "rsi", "atr", "price", "reason"];
+    // v1.4.0 新構造のバリデーション
+    const required = ["symbol", "timeframe", "price", "rsi", "atr"];
     for (const field of required) {
       if (!(field in body)) {
         return new Response(
@@ -388,6 +445,21 @@ serve(async (req: Request) => {
           { status: 400, headers: corsHeaders() }
         );
       }
+    }
+    
+    // ea_suggestionの存在確認
+    if (!body.ea_suggestion || typeof body.ea_suggestion !== 'object') {
+      return new Response(
+        JSON.stringify({ error: "Missing: ea_suggestion" }),
+        { status: 400, headers: corsHeaders() }
+      );
+    }
+    
+    if (!("dir" in body.ea_suggestion)) {
+      return new Response(
+        JSON.stringify({ error: "Missing: ea_suggestion.dir" }),
+        { status: 400, headers: corsHeaders() }
+      );
     }
     
     const tradeReq: TradeRequest = body;
@@ -426,14 +498,14 @@ serve(async (req: Request) => {
     }
     
     // ⭐ 詳細ログ出力（判定方法を明示）
-    const ichimokuInfo = tradeReq.ichimoku_score !== undefined 
-      ? ` ichimoku=${tradeReq.ichimoku_score.toFixed(2)}` 
+    const ichimokuInfo = tradeReq.ea_suggestion.ichimoku_score !== undefined 
+      ? ` ichimoku=${tradeReq.ea_suggestion.ichimoku_score.toFixed(2)}` 
       : "";
     
     console.log(
       `[ai-trader] 📊 RESULT: ${tradeReq.symbol} ${tradeReq.timeframe} ` +
-      `dir=${tradeReq.dir} win=${response.win_prob.toFixed(3)}${ichimokuInfo} ` +
-      `reason="${tradeReq.reason}" method=${predictionMethod}`
+      `dir=${tradeReq.ea_suggestion.dir} win=${response.win_prob.toFixed(3)}${ichimokuInfo} ` +
+      `reason="${tradeReq.ea_suggestion.reason}" method=${predictionMethod}`
     );
     
     // ⚠️ フォールバックの場合は警告

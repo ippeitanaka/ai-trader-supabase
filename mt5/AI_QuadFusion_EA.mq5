@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| AI_QuadFusion_EA.mq5  (ver 1.3.0)                                |
+//| AI_QuadFusion_EA.mq5  (ver 1.4.0)                                |
 //| - Supabase: ai-config / ai-signals(AI側) / ea-log                |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
@@ -7,6 +7,9 @@
 //| - Enhanced: ea-logに詳細なAI判断とトレード状況を記録             |
 //| - New: ai-signals-update エンドポイントで約定価格を記録          |
 //| - v1.3.0: 一目均衡表（Ichimoku）を統合 - Quad Fusion化           |
+//| - v1.4.0: 全テクニカル指標の生データをAIに送信、真のQuadFusion実装|
+//|          MACD追加、AI側で独自に4指標評価（トレンド・モメンタム    |
+//|          ・ボラティリティ・一目）、EA判断は参考情報に             |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -39,7 +42,7 @@ input string AI_Signals_Update_URL = "https://nebphrnnpmuqbkymwefs.functions.sup
 input string AI_Bearer_Token     = "YOUR_SERVICE_ROLE_KEY";
 
 input string AI_EA_Instance      = "main";
-input string AI_EA_Version       = "1.3.0";
+input string AI_EA_Version       = "1.4.0";
 input int    AI_Timeout_ms       = 5000;
 
 // ===== 一目均衡表設定 =====
@@ -139,6 +142,35 @@ double MA(ENUM_TIMEFRAMES tf,int period,ENUM_MA_METHOD method,ENUM_APPLIED_PRICE
 {int h=iMA(_Symbol,tf,period,0,method,price);if(h==INVALID_HANDLE)return EMPTY_VALUE;
  double b[];if(CopyBuffer(h,0,shift,1,b)<=0){IndicatorRelease(h);return EMPTY_VALUE;}
  IndicatorRelease(h);return b[0];}
+
+// MACD取得関数
+bool GetMACD(ENUM_TIMEFRAMES tf,double &macd_main,double &macd_signal,double &macd_hist,int shift=0)
+{
+   int h=iMACD(_Symbol,tf,12,26,9,PRICE_CLOSE);
+   if(h==INVALID_HANDLE){
+      Print("[MACD] Failed to create indicator handle");
+      return false;
+   }
+   
+   double main_buf[],signal_buf[];
+   
+   bool ok=true;
+   ok=ok&&CopyBuffer(h,0,shift,1,main_buf)>0;    // MACD Main
+   ok=ok&&CopyBuffer(h,1,shift,1,signal_buf)>0;  // Signal
+   
+   if(!ok){
+      IndicatorRelease(h);
+      Print("[MACD] Failed to copy buffers");
+      return false;
+   }
+   
+   macd_main=main_buf[0];
+   macd_signal=signal_buf[0];
+   macd_hist=macd_main-macd_signal;
+   
+   IndicatorRelease(h);
+   return true;
+}
 
 // 一目均衡表の各ライン取得
 struct IchimokuValues{
@@ -313,15 +345,71 @@ bool ExtractJsonString(const string json,const string key,string &out){
 
 bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,const string reason,double ichimoku_score,AIOut &out_ai)
 {
+   // ★ テクニカル指標の詳細データを取得
+   ENUM_TIMEFRAMES tf=(tf_label=="M15")?TF_Entry:TF_Recheck;
+   double ema_25=MA(tf,25,MODE_EMA,PRICE_CLOSE,0);
+   double sma_100=MA(tf,100,MODE_SMA,PRICE_CLOSE,0);
+   
+   // MACD取得
+   double macd_main,macd_signal,macd_hist;
+   bool has_macd=GetMACD(tf,macd_main,macd_signal,macd_hist,0);
+   
+   // 一目均衡表取得
+   IchimokuValues ich;
+   bool has_ichimoku=GetIchimoku(tf,ich,0);
+   
+   // 価格情報
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   
+   // ★ すべての生データをAIに送信
    string payload="{"+
    "\"symbol\":\""+JsonEscape(_Symbol)+"\","+
    "\"timeframe\":\""+JsonEscape(tf_label)+"\","+
-   "\"dir\":"+IntegerToString(dir)+","+
+   
+   // 価格情報
+   "\"price\":"+DoubleToString(price,_Digits)+","+
+   "\"bid\":"+DoubleToString(bid,_Digits)+","+
+   "\"ask\":"+DoubleToString(ask,_Digits)+","+
+   
+   // 移動平均線（生データ）
+   "\"ema_25\":"+DoubleToString(ema_25,_Digits)+","+
+   "\"sma_100\":"+DoubleToString(sma_100,_Digits)+","+
+   "\"ma_cross\":"+(ema_25>sma_100?"1":"-1")+","+
+   
+   // RSI & ATR
    "\"rsi\":"+DoubleToString(rsi,2)+","+
    "\"atr\":"+DoubleToString(atr,5)+","+
-   "\"price\":"+DoubleToString(price,_Digits)+","+
-   "\"reason\":\""+JsonEscape(reason)+"\","+
-   "\"ichimoku_score\":"+DoubleToString(ichimoku_score,2)+","+
+   
+   // MACD（生データ）
+   "\"macd\":{"+
+      "\"main\":"+DoubleToString(macd_main,5)+","+
+      "\"signal\":"+DoubleToString(macd_signal,5)+","+
+      "\"histogram\":"+DoubleToString(macd_hist,5)+","+
+      "\"cross\":"+(macd_main>macd_signal?"1":"-1")+
+   "},"+
+   
+   // 一目均衡表（全ライン）
+   "\"ichimoku\":{"+
+      "\"tenkan\":"+DoubleToString(ich.tenkan,_Digits)+","+
+      "\"kijun\":"+DoubleToString(ich.kijun,_Digits)+","+
+      "\"senkou_a\":"+DoubleToString(ich.senkou_a,_Digits)+","+
+      "\"senkou_b\":"+DoubleToString(ich.senkou_b,_Digits)+","+
+      "\"chikou\":"+DoubleToString(ich.chikou,_Digits)+","+
+      "\"tk_cross\":"+(ich.tenkan>ich.kijun?"1":"-1")+","+
+      "\"cloud_color\":"+(ich.senkou_a>ich.senkou_b?"1":"-1")+","+
+      "\"price_vs_cloud\":"+
+         (price>MathMax(ich.senkou_a,ich.senkou_b)?"1":
+          (price<MathMin(ich.senkou_a,ich.senkou_b)?"-1":"0"))+
+   "},"+
+   
+   // EA側の判断（参考情報として）
+   "\"ea_suggestion\":{"+
+      "\"dir\":"+IntegerToString(dir)+","+
+      "\"reason\":\""+JsonEscape(reason)+"\","+
+      "\"ichimoku_score\":"+DoubleToString(ichimoku_score,2)+
+   "},"+
+   
    "\"instance\":\""+JsonEscape(AI_EA_Instance)+"\","+
    "\"version\":\""+JsonEscape(AI_EA_Version)+"\"}";
 
@@ -604,9 +692,10 @@ void CheckPositionStatus()
 // ===== メイン =====
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
-   SafePrint("[INIT] EA 1.2.6 start (Entry price tracking for ML learning)");
+   SafePrint("[INIT] EA 1.4.0 start (Quad Fusion with full technical data to AI)");
    SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",
       MinWinProb*100,RiskATRmult,RewardRR,Lots,MaxPositions));
+   SafePrint("[INFO] Sending EMA25, SMA100, MACD, RSI, ATR, Ichimoku (all lines) to AI");
    return(INIT_SUCCEEDED);
 }
 void OnTick()

@@ -1,0 +1,65 @@
+name: ML Training Daily
+
+# 毎日 UTC 3:00 (JST 12:00) に自動実行
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 毎日 UTC 3:00
+  
+  # 手動実行も可能
+  workflow_dispatch:
+
+jobs:
+  ml-training:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 🤖 ML Training 実行
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🤖 ML Training を開始します"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.SUPABASE_URL }}/functions/v1/ml-training" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{"triggered_by": "github-actions"}')
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "HTTP Status: $HTTP_CODE"
+          echo ""
+          echo "Response:"
+          echo "$BODY" | jq '.' || echo "$BODY"
+          
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo ""
+            echo "✅ ML Training が正常に完了しました"
+            exit 0
+          else
+            echo ""
+            echo "❌ ML Training に失敗しました"
+            exit 1
+          fi
+      
+      - name: 📊 結果サマリー
+        if: success()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ ML Training 完了"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "実行時刻: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "実行日時 (JST): $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S JST')"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      
+      - name: ❌ エラー通知
+        if: failure()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "❌ ML Training に失敗しました"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "実行時刻: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "ログを確認してください"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
