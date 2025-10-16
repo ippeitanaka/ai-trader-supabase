@@ -38,6 +38,7 @@ jobs:
               "symbol": "USDJPY",
               "timeframe": "H1",
               "direction": "BUY",
+              "price": 150.50,
               "rsi": 45.5,
               "ichimoku_score": 0.6,
               "test_mode": true
@@ -74,6 +75,7 @@ jobs:
               "symbol": "EURUSD",
               "timeframe": "H4",
               "direction": "SELL",
+              "price": 1.0850,
               "rsi": 65.0,
               "ichimoku_score": 0.75,
               "test_mode": true
