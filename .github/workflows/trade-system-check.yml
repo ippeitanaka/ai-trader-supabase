@@ -1,0 +1,221 @@
+name: Trade System Check
+
+# トレードシステムの稼働チェック
+# OpenAI API接続、各Edge Functionの動作確認
+
+on:
+  # 毎日 UTC 0:00, 6:00, 12:00, 18:00 (6時間ごと)
+  schedule:
+    - cron: '0 0,6,12,18 * * *'
+  
+  # 手動実行も可能
+  workflow_dispatch:
+
+jobs:
+  system-health-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 🏥 トレードシステム稼働チェック開始
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🏥 Trade System Health Check"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "実行時刻: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "実行時刻 (JST): $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S JST')"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      
+      - name: 1️⃣ ai-trader エンドポイント確認
+        id: check_ai_trader
+        run: |
+          echo "📡 ai-trader エンドポイントをチェック中..."
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.SUPABASE_URL }}/functions/v1/ai-trader" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "symbol": "USDJPY",
+              "timeframe": "H1",
+              "direction": "BUY",
+              "rsi": 45.5,
+              "ichimoku_score": 0.6,
+              "test_mode": true
+            }')
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "HTTP Status: $HTTP_CODE"
+          echo "$BODY" | jq '.' || echo "$BODY"
+          
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ ai-trader: 正常"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ ai-trader: エラー (HTTP $HTTP_CODE)"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: 2️⃣ OpenAI API 接続確認
+        id: check_openai
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🤖 OpenAI API 接続確認"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.SUPABASE_URL }}/functions/v1/ai-trader" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "symbol": "EURUSD",
+              "timeframe": "H4",
+              "direction": "SELL",
+              "rsi": 65.0,
+              "ichimoku_score": 0.75,
+              "test_mode": true
+            }')
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          # OpenAI APIからの応答があるかチェック
+          WIN_PROB=$(echo "$BODY" | jq -r '.win_prob // empty' 2>/dev/null)
+          REASONING=$(echo "$BODY" | jq -r '.reasoning // empty' 2>/dev/null)
+          
+          if [ -n "$WIN_PROB" ] && [ -n "$REASONING" ]; then
+            echo "✅ OpenAI API: 正常接続"
+            echo "   勝率予測: $WIN_PROB"
+            echo "   推論取得: OK"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ OpenAI API: 応答異常"
+            echo "$BODY"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: 3️⃣ ML学習機能確認
+        id: check_ml
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🤖 ML学習機能確認"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
+            "${{ secrets.SUPABASE_URL }}/functions/v1/ml-training" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "HTTP Status: $HTTP_CODE"
+          echo "$BODY" | jq '.' || echo "$BODY"
+          
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ ML学習機能: 正常"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ ML学習機能: エラー"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: 4️⃣ ea-log エンドポイント確認
+        id: check_ea_log
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📝 ea-log エンドポイント確認"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.SUPABASE_URL }}/functions/v1/ea-log" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "level": "INFO",
+              "message": "Health check from GitHub Actions",
+              "test_mode": true
+            }')
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "HTTP Status: $HTTP_CODE"
+          
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ ea-log: 正常"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ ea-log: エラー (HTTP $HTTP_CODE)"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: 5️⃣ ai-config エンドポイント確認
+        id: check_ai_config
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "⚙️  ai-config エンドポイント確認"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
+            "${{ secrets.SUPABASE_URL }}/functions/v1/ai-config" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          echo "HTTP Status: $HTTP_CODE"
+          echo "$BODY" | jq '.' || echo "$BODY"
+          
+          if [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ ai-config: 正常"
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ ai-config: エラー (HTTP $HTTP_CODE)"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+      
+      - name: ✅ 全チェック完了
+        if: success()
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ すべてのシステムが正常に稼働しています"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "チェック項目:"
+          echo "  ✅ ai-trader エンドポイント"
+          echo "  ✅ OpenAI API 接続"
+          echo "  ✅ ML学習機能"
+          echo "  ✅ ea-log エンドポイント"
+          echo "  ✅ ai-config エンドポイント"
+          echo ""
+          echo "実行完了時刻: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "実行完了時刻 (JST): $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S JST')"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      
+      - name: ❌ エラー検出
+        if: failure()
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "❌ システムチェックでエラーが検出されました"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "上記のログを確認してください"
+          echo "Supabase Dashboard で詳細を確認:"
+          echo "https://supabase.com/dashboard/project/nebphrnnpmuqbkymwefs"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          exit 1
