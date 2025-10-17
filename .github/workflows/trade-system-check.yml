@@ -37,10 +37,35 @@ jobs:
             -d '{
               "symbol": "USDJPY",
               "timeframe": "H1",
-              "direction": "BUY",
               "price": 150.50,
               "rsi": 45.5,
-              "ichimoku_score": 0.6,
+              "atr": 0.0008,
+              "ema_13": 150.45,
+              "ema_25": 150.40,
+              "sma_100": 150.30,
+              "ma_cross": 1,
+              "macd": {
+                "main": 0.05,
+                "signal": 0.03,
+                "histogram": 0.02,
+                "cross": 1
+              },
+              "ichimoku": {
+                "tenkan": 150.60,
+                "kijun": 150.50,
+                "senkou_a": 150.55,
+                "senkou_b": 150.45,
+                "chikou": 150.40,
+                "tk_cross": 1,
+                "cloud_color": 1,
+                "price_vs_cloud": 1
+              },
+              "ea_suggestion": {
+                "dir": 1,
+                "entry": 150.50,
+                "sl": 150.30,
+                "tp": 150.80
+              },
               "test_mode": true
             }')
           
@@ -74,10 +99,35 @@ jobs:
             -d '{
               "symbol": "EURUSD",
               "timeframe": "H4",
-              "direction": "SELL",
               "price": 1.0850,
               "rsi": 65.0,
-              "ichimoku_score": 0.75,
+              "atr": 0.0012,
+              "ema_13": 1.0855,
+              "ema_25": 1.0860,
+              "sma_100": 1.0870,
+              "ma_cross": -1,
+              "macd": {
+                "main": -0.02,
+                "signal": -0.01,
+                "histogram": -0.01,
+                "cross": -1
+              },
+              "ichimoku": {
+                "tenkan": 1.0840,
+                "kijun": 1.0850,
+                "senkou_a": 1.0845,
+                "senkou_b": 1.0855,
+                "chikou": 1.0860,
+                "tk_cross": -1,
+                "cloud_color": -1,
+                "price_vs_cloud": -1
+              },
+              "ea_suggestion": {
+                "dir": -1,
+                "entry": 1.0850,
+                "sl": 1.0870,
+                "tp": 1.0820
+              },
               "test_mode": true
             }')
           
