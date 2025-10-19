@@ -5,7 +5,7 @@
 
 -- Step 1: Create new simplified table
 CREATE TABLE IF NOT EXISTS public."ea-log-new" (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id BIGSERIAL PRIMARY KEY,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   at TIMESTAMPTZ NOT NULL,                    -- トレード判断日時
   sym TEXT NOT NULL,                           -- 銘柄
@@ -18,18 +18,16 @@ CREATE TABLE IF NOT EXISTS public."ea-log-new" (
 );
 
 -- Step 2: Copy existing data from old table (only essential columns)
-INSERT INTO public."ea-log-new" (id, created_at, at, sym, tf, action, trade_decision, win_prob, ai_reasoning, order_ticket)
+INSERT INTO public."ea-log-new" (id, created_at, at, sym, tf, action, win_prob, ai_reasoning)
 SELECT 
-  id::uuid,
-  created_at,
+  id,
+  at as created_at,
   at,
   sym,
   tf,
   action,
-  COALESCE(trade_decision, 'UNKNOWN') as trade_decision,
   win_prob,
-  ai_reasoning,
-  order_ticket
+  reason as ai_reasoning
 FROM public."ea-log"
 ON CONFLICT (id) DO NOTHING;
 

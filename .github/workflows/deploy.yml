@@ -1,0 +1,48 @@
+name: Deploy to Supabase
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v1.x
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Deploy Edge Functions
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+        run: |
+          supabase link --project-ref $PROJECT_REF
+          supabase functions deploy ai-trader
+          supabase functions deploy ea-log
+          supabase functions deploy ai-signals
+          supabase functions deploy ai-signals-update
+          supabase functions deploy ai-reason
+          supabase functions deploy ai-config
+          supabase functions deploy ml-training
+
+      - name: Set Secrets
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          supabase secrets set OPENAI_API_KEY="$OPENAI_API_KEY" --project-ref $PROJECT_REF
+          supabase secrets set OPENAI_MODEL="gpt-4o-mini" --project-ref $PROJECT_REF

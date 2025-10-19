@@ -32,15 +32,13 @@ CREATE INDEX IF NOT EXISTS idx_ai_config_updated_at ON public.ai_config (updated
 -- Add comment
 COMMENT ON TABLE public.ai_config IS 'Dynamic configuration for EA instances';
 
--- Insert default configuration for "main" instance (with all required fields)
+-- Insert default configuration for "main" instance (without symbol/timeframe - those will be added in later migration)
 INSERT INTO public.ai_config (
   instance, 
-  symbol, 
-  timeframe,
   min_win_prob, 
   pending_offset_atr, 
   pending_expiry_min, 
   updated_at
 )
-VALUES ('main', 'ANY', 'M15', 0.70, 0.20, 90, NOW())
+VALUES ('main', 0.70, 0.20, 90, NOW())
 ON CONFLICT (instance) DO NOTHING;

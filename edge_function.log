@@ -1,0 +1,37 @@
+Setting up Edge Functions runtime...
+2025-10-19T01:16:43.724010211Z Serving functions on http://127.0.0.1:54321/functions/v1/<function-name>
+2025-10-19T01:16:43.724054684Z  - http://127.0.0.1:54321/functions/v1/ai-config
+2025-10-19T01:16:43.724060034Z  - http://127.0.0.1:54321/functions/v1/ai-reason
+2025-10-19T01:16:43.724064112Z  - http://127.0.0.1:54321/functions/v1/ai-signals
+2025-10-19T01:16:43.724067388Z  - http://127.0.0.1:54321/functions/v1/ai-signals-update
+2025-10-19T01:16:43.724070373Z  - http://127.0.0.1:54321/functions/v1/ai-trader
+2025-10-19T01:16:43.724073479Z ... and 3 more functions
+2025-10-19T01:16:43.724076655Z Using supabase-edge-runtime-1.69.12 (compatible with Deno v2.1.4)
+2025-10-19T01:16:56.003231727Z serving the request with supabase/functions/ai-trader
+2025-10-19T01:16:56.071398353Z [Info] Listening on http://localhost:9999/
+2025-10-19T01:16:56.071420334Z 
+2025-10-19T01:16:56.077901165Z [Info] [ai-trader] ✓ OpenAI API KEY configured (length=164)
+2025-10-19T01:16:56.077914701Z 
+2025-10-19T01:16:56.078265145Z [Info] [ai-trader] 🤖 Attempting OpenAI GPT prediction...
+2025-10-19T01:16:56.078272158Z 
+2025-10-19T01:16:58.257752753Z [Info] [AI] OpenAI GPT-4 prediction: 82.0% (high) - 強気シグナルと高ボラで信頼性高 | ichimoku=0.75 quality=good
+2025-10-19T01:16:58.257809269Z 
+2025-10-19T01:16:58.257814619Z [Info] [ai-trader] ✓ OpenAI prediction successful
+2025-10-19T01:16:58.257818476Z 
+2025-10-19T01:16:58.258924571Z [Info] [ai-trader] 📊 RESULT: XAUUSD M15 dir=1 win=0.820 ichimoku=0.75 reason="ゴールデンクロス発生、一目均衡表も強気シグナル" method=OpenAI-GPT
+2025-10-19T01:16:58.258935882Z 
+2025-10-19T01:17:23.255717720Z serving the request with supabase/functions/ea-log
+2025-10-19T01:17:23.329663157Z [Info] Listening on http://localhost:9999/
+2025-10-19T01:17:23.329696870Z 
+2025-10-19T01:17:23.839675464Z [Info] [ea-log] XAUUSD M15 - BUY
+2025-10-19T01:17:23.839694610Z 
+2025-10-19T01:17:35.178899365Z serving the request with supabase/functions/ea-log
+2025-10-19T01:17:35.194889272Z [Info] [ea-log] USDJPY M5 - SELL
+2025-10-19T01:17:35.195034674Z 
+2025-10-19T01:17:35.210841389Z serving the request with supabase/functions/ea-log
+2025-10-19T01:17:35.216402714Z [Info] [ea-log] EURUSD M15 - BUY
+2025-10-19T01:17:35.216417882Z 
+2025-10-19T01:20:16.060416323Z wall clock duration warning: isolate: bf183c08-0c6f-4193-9dc6-5f60c811e827
+2025-10-19T01:20:16.080401070Z early termination has been triggered: isolate: bf183c08-0c6f-4193-9dc6-5f60c811e827
+2025-10-19T01:20:43.321595920Z wall clock duration warning: isolate: d56e4707-1417-4dd9-81c4-afb7a78c82ca
+2025-10-19T01:20:43.337336900Z early termination has been triggered: isolate: d56e4707-1417-4dd9-81c4-afb7a78c82ca

@@ -1,0 +1,33 @@
+{
+  "symbol": "XAUUSD",
+  "timeframe": "M15",
+  "price": 2650.50,
+  "bid": 2650.30,
+  "ask": 2650.70,
+  "ema_25": 2645.30,
+  "sma_100": 2640.10,
+  "ma_cross": 1,
+  "rsi": 65.5,
+  "atr": 15.2,
+  "macd": {
+    "main": 2.5,
+    "signal": 1.8,
+    "histogram": 0.7,
+    "cross": 1
+  },
+  "ichimoku": {
+    "tenkan": 2648.50,
+    "kijun": 2642.30,
+    "senkou_a": 2645.40,
+    "senkou_b": 2638.20,
+    "chikou": 2655.10,
+    "tk_cross": 1,
+    "cloud_color": 1,
+    "price_vs_cloud": 1
+  },
+  "ea_suggestion": {
+    "dir": 1,
+    "reason": "ゴールデンクロス発生、一目均衡表も強気シグナル",
+    "ichimoku_score": 0.75
+  }
+}
