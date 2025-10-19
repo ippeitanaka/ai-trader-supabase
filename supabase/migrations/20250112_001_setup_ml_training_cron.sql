@@ -38,7 +38,9 @@ SELECT cron.schedule(
 -- Cron Job履歴確認用ビュー
 -- ============================================================================
 
-CREATE OR REPLACE VIEW cron_ml_training_history AS
+CREATE OR REPLACE VIEW cron_ml_training_history 
+WITH (security_invoker = true)
+AS
 SELECT 
   runid,
   jobid,
@@ -70,7 +72,7 @@ RETURNS TABLE (
   total_runs BIGINT
 ) 
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY INVOKER
 AS $$
 BEGIN
   RETURN QUERY
