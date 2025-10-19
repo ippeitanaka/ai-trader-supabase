@@ -210,34 +210,6 @@ jobs:
             exit 1
           fi
       
-      - name: 5️⃣ ai-config エンドポイント確認
-        id: check_ai_config
-        run: |
-          echo ""
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "⚙️  ai-config エンドポイント確認"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
-            "${{ secrets.SUPABASE_URL }}/functions/v1/ai-config" \
-            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
-            -H "Content-Type: application/json")
-          
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
-          BODY=$(echo "$RESPONSE" | sed '$d')
-          
-          echo "HTTP Status: $HTTP_CODE"
-          echo "$BODY" | jq '.' || echo "$BODY"
-          
-          if [ "$HTTP_CODE" -eq 200 ]; then
-            echo "✅ ai-config: 正常"
-            echo "status=success" >> $GITHUB_OUTPUT
-          else
-            echo "❌ ai-config: エラー (HTTP $HTTP_CODE)"
-            echo "status=failed" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-      
       - name: ✅ 全チェック完了
         if: success()
         run: |
@@ -251,7 +223,6 @@ jobs:
           echo "  ✅ OpenAI API 接続"
           echo "  ✅ ML学習機能"
           echo "  ✅ ea-log エンドポイント"
-          echo "  ✅ ai-config エンドポイント"
           echo ""
           echo "実行完了時刻: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "実行完了時刻 (JST): $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S JST')"

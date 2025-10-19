@@ -50,8 +50,6 @@ jobs:
           supabase functions deploy ea-log
           supabase functions deploy ai-signals
           supabase functions deploy ai-signals-update
-          supabase functions deploy ai-reason
-          supabase functions deploy ai-config
           supabase functions deploy ml-training
 
       - name: Set Secrets
