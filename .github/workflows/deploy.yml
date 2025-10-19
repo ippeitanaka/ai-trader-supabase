@@ -29,7 +29,7 @@ jobs:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SB_ACCESS_TOKEN }}
           PROJECT_REF: ${{ secrets.PROJECT_ID }}
         run: |
-          supabase link --project-ref $PROJECT_REF
+          supabase link --project-ref "$PROJECT_REF"
           supabase functions deploy ai-trader
           supabase functions deploy ea-log
           supabase functions deploy ai-signals
@@ -44,5 +44,5 @@ jobs:
           PROJECT_REF: ${{ secrets.PROJECT_ID }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          supabase secrets set OPENAI_API_KEY="$OPENAI_API_KEY" --project-ref $PROJECT_REF
-          supabase secrets set OPENAI_MODEL="gpt-4o-mini" --project-ref $PROJECT_REF
+          supabase secrets set OPENAI_API_KEY="$OPENAI_API_KEY" --project-ref "$PROJECT_REF"
+          supabase secrets set OPENAI_MODEL="gpt-4o-mini" --project-ref "$PROJECT_REF"
