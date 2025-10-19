@@ -24,11 +24,27 @@ jobs:
         with:
           version: latest
 
+      - name: Debug Environment Variables
+        env:
+          PROJECT_REF: ${{ secrets.PROJECT_ID }}
+        run: |
+          echo "Checking environment variables..."
+          echo "PROJECT_REF value: '$PROJECT_REF'"
+          echo "PROJECT_REF length: ${#PROJECT_REF}"
+          if [ -z "$PROJECT_REF" ]; then
+            echo "ERROR: PROJECT_REF is empty!"
+            echo "Please verify that GitHub Secret 'PROJECT_ID' is set correctly"
+            exit 1
+          fi
+          echo "✅ PROJECT_REF is set correctly (length: ${#PROJECT_REF})"
+
       - name: Deploy Edge Functions
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SB_ACCESS_TOKEN }}
           PROJECT_REF: ${{ secrets.PROJECT_ID }}
         run: |
+          echo "Linking to Supabase project..."
+          echo "Project ref: $PROJECT_REF"
           supabase link --project-ref "$PROJECT_REF"
           supabase functions deploy ai-trader
           supabase functions deploy ea-log
