@@ -34,12 +34,12 @@ input bool   DebugLogs           = true;
 input int    LogCooldownSec      = 30;  // 0=全出力, >0=間引き, -1=完全OFF
 
 // ★ URLは自分のプロジェクトに合わせて設定
-input string AI_Endpoint_URL     = "https://nebphrnnpmuqbkymwefs.functions.supabase.co/ai-trader";
-input string EA_Log_URL          = "https://nebphrnnpmuqbkymwefs.functions.supabase.co/ea-log";
-input string AI_Config_URL       = "https://nebphrnnpmuqbkymwefs.functions.supabase.co/ai-config";
-input string AI_Signals_URL      = "https://nebphrnnpmuqbkymwefs.functions.supabase.co/ai-signals";
-input string AI_Signals_Update_URL = "https://nebphrnnpmuqbkymwefs.functions.supabase.co/ai-signals-update";
-input string AI_Bearer_Token     = "YOUR_SERVICE_ROLE_KEY";
+input string AI_Endpoint_URL     = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-trader";
+input string EA_Log_URL          = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ea-log";
+input string AI_Config_URL       = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-config";
+input string AI_Signals_URL      = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals";
+input string AI_Signals_Update_URL = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals-update";
+input string AI_Bearer_Token     = "YOUR_SERVICE_ROLE_KEY_HERE";
 
 input string AI_EA_Instance      = "main";
 input string AI_EA_Version       = "1.4.0";

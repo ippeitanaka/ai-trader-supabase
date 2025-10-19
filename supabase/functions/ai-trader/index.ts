@@ -119,7 +119,9 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
   const reason = ea_suggestion.reason;
   const ichimoku_score = ea_suggestion.ichimoku_score;
   
-  // ⭐ ML学習済みパターンを検索
+  // ⭐⭐⭐ Step 2 + Step 4: ML学習済みパターンと過去実績の詳細取得 ⭐⭐⭐
+  
+  // 1. ML学習済みパターンをTOP3まで取得
   const { data: matchedPatterns } = await supabase
     .from("ml_patterns")
     .select("*")
@@ -133,42 +135,133 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
     .order("confidence_score", { ascending: false })
     .limit(3);
   
+  // 2. ML推奨事項を取得
+  const { data: recommendations } = await supabase
+    .from("ml_recommendations")
+    .select("*")
+    .eq("status", "active")
+    .order("priority", { ascending: true })
+    .limit(3);
+  
+  // 3. 過去の類似トレードを取得（成功事例と失敗事例）
+  const { data: historicalTrades } = await supabase
+    .from("ai_signals")
+    .select("*")
+    .eq("symbol", symbol)
+    .eq("timeframe", timeframe)
+    .eq("dir", dir)
+    .not("actual_result", "is", null)
+    .in("actual_result", ["WIN", "LOSS"])
+    .order("created_at", { ascending: false })
+    .limit(30);
+  
   let mlContext = "";
   let mlWinRateBoost = 0;
+  let successCases = "";
+  let failureCases = "";
+  let recommendationsText = "";
   
+  // パターンマッチング結果を整形
   if (matchedPatterns && matchedPatterns.length > 0) {
-    const bestMatch = matchedPatterns[0];
-    mlContext = `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📚 ML学習済みパターン検出\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
-    mlContext += `\n• パターン名: ${bestMatch.pattern_name}`;
-    mlContext += `\n• 過去勝率: ${(bestMatch.win_rate * 100).toFixed(1)}% (${bestMatch.total_trades}件)`;
-    mlContext += `\n• 平均利益: ${bestMatch.avg_profit.toFixed(0)}, 平均損失: ${bestMatch.avg_loss.toFixed(0)}`;
-    mlContext += `\n• プロフィットファクター: ${bestMatch.profit_factor.toFixed(2)}`;
-    mlContext += `\n• 信頼度スコア: ${(bestMatch.confidence_score * 100).toFixed(1)}%`;
-    mlContext += `\n→ この条件での過去実績を重視して勝率を調整してください`;
+    mlContext = `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📚 ML学習済みパターン検出 (TOP ${matchedPatterns.length})\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
     
-    // ML学習結果に基づく勝率調整（最大±10%）
-    if (bestMatch.win_rate >= 0.70) {
-      mlWinRateBoost = +0.05; // 高勝率パターン
-    } else if (bestMatch.win_rate < 0.50) {
-      mlWinRateBoost = -0.08; // 低勝率パターン（強めに抑制）
-    }
+    matchedPatterns.forEach((pattern: any, index: number) => {
+      mlContext += `\n\n【パターン${index + 1}】${pattern.pattern_name}`;
+      mlContext += `\n• 過去勝率: ${(pattern.win_rate * 100).toFixed(1)}% (${pattern.win_count}勝 ${pattern.loss_count}敗 / 全${pattern.total_trades}件)`;
+      mlContext += `\n• 平均利益: +${pattern.avg_profit.toFixed(0)}, 平均損失: -${pattern.avg_loss.toFixed(0)}`;
+      mlContext += `\n• プロフィットファクター: ${pattern.profit_factor.toFixed(2)}`;
+      mlContext += `\n• 信頼度スコア: ${(pattern.confidence_score * 100).toFixed(1)}%`;
+      mlContext += `\n• サンプル数: ${pattern.sample_size_adequate ? "✅ 十分" : "⚠️ 不足"}`;
+      
+      // 最も信頼できるパターンで勝率調整
+      if (index === 0) {
+        if (pattern.win_rate >= 0.75 && pattern.sample_size_adequate) {
+          mlWinRateBoost = +0.08; // 高勝率パターン（強化）
+        } else if (pattern.win_rate >= 0.65 && pattern.sample_size_adequate) {
+          mlWinRateBoost = +0.03; // 中程度の勝率
+        } else if (pattern.win_rate < 0.50 && pattern.sample_size_adequate) {
+          mlWinRateBoost = -0.12; // 低勝率パターン（強く抑制）
+        } else if (pattern.win_rate < 0.45) {
+          mlWinRateBoost = -0.18; // 極めて低い勝率（非常に強く抑制）
+        }
+      }
+    });
     
-    console.log(`[AI] ML Pattern matched: ${bestMatch.pattern_name}, win_rate=${bestMatch.win_rate}, boost=${mlWinRateBoost}`);
+    mlContext += `\n\n⚡ ML学習の重要性: このパターンは実際の取引データに基づいています。過去勝率を最重視してください。`;
+    
+    console.log(`[AI] ML Pattern matched: ${matchedPatterns[0].pattern_name}, win_rate=${matchedPatterns[0].win_rate}, boost=${mlWinRateBoost}`);
   }
   
-  // 過去の取引データを取得(追加の参考データ)
-  const { data: historicalData, error } = await supabase
-    .from("ai_signals")
-    .select("win_prob, rsi, atr, actual_result")
-    .eq("symbol", symbol)
-    .not("actual_result", "is", null)
-    .order("created_at", { ascending: false })
-    .limit(50);
+  // 過去の成功事例を抽出
+  if (historicalTrades && historicalTrades.length > 0) {
+    const winTrades = historicalTrades.filter((t: any) => t.actual_result === "WIN");
+    const lossTrades = historicalTrades.filter((t: any) => t.actual_result === "LOSS");
+    
+    if (winTrades.length > 0) {
+      successCases = `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n✅ 過去の成功事例 (直近${Math.min(winTrades.length, 3)}件)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+      
+      winTrades.slice(0, 3).forEach((trade: any, index: number) => {
+        const createdDate = new Date(trade.created_at);
+        successCases += `\n\n【成功${index + 1}】${createdDate.toLocaleString('ja-JP', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`;
+        successCases += `\n• RSI: ${trade.rsi?.toFixed(1) || "N/A"}, ATR: ${trade.atr?.toFixed(5) || "N/A"}`;
+        successCases += `\n• 理由: ${trade.reason || "N/A"}`;
+        successCases += `\n• AI予測勝率: ${(trade.win_prob * 100).toFixed(0)}%`;
+        successCases += `\n• 結果: WIN 🎯 (利益: +${trade.profit_loss?.toFixed(0) || "N/A"})`;
+        if (trade.tp_hit) successCases += ` ← TP到達`;
+        if (trade.hold_duration_minutes) successCases += `\n• 保有時間: ${trade.hold_duration_minutes}分`;
+      });
+      
+      successCases += `\n\n💡 成功の共通点を分析し、現在の条件と照らし合わせてください。`;
+    }
+    
+    if (lossTrades.length > 0) {
+      failureCases = `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n❌ 過去の失敗事例 (直近${Math.min(lossTrades.length, 3)}件)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+      
+      lossTrades.slice(0, 3).forEach((trade: any, index: number) => {
+        const createdDate = new Date(trade.created_at);
+        failureCases += `\n\n【失敗${index + 1}】${createdDate.toLocaleString('ja-JP', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`;
+        failureCases += `\n• RSI: ${trade.rsi?.toFixed(1) || "N/A"}, ATR: ${trade.atr?.toFixed(5) || "N/A"}`;
+        failureCases += `\n• 理由: ${trade.reason || "N/A"}`;
+        failureCases += `\n• AI予測勝率: ${(trade.win_prob * 100).toFixed(0)}%`;
+        failureCases += `\n• 結果: LOSS 💥 (損失: ${trade.profit_loss?.toFixed(0) || "N/A"})`;
+        if (trade.sl_hit) failureCases += ` ← SL損切り`;
+        if (trade.hold_duration_minutes) failureCases += `\n• 保有時間: ${trade.hold_duration_minutes}分`;
+      });
+      
+      failureCases += `\n\n⚠️ 失敗の共通点: これらと類似条件では勝率を下げるべきです。`;
+    }
+    
+    // 全体の勝率統計
+    const totalWins = winTrades.length;
+    const totalLosses = lossTrades.length;
+    const totalTrades = totalWins + totalLosses;
+    const overallWinRate = totalTrades > 0 ? (totalWins / totalTrades * 100).toFixed(1) : "N/A";
+    
+    successCases += `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📊 直近30件の統計\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+    successCases += `\n• WIN: ${totalWins}件, LOSS: ${totalLosses}件`;
+    successCases += `\n• 勝率: ${overallWinRate}%`;
+    successCases += totalTrades > 0 ? `\n• トレンド: ${parseFloat(overallWinRate) >= 60 ? "📈 好調" : parseFloat(overallWinRate) >= 50 ? "➡️ 普通" : "📉 不調"}` : "";
+  }
   
-  let historicalContext = "";
-  if (historicalData && historicalData.length > 0) {
-    const winRate = historicalData.filter((d: any) => d.actual_result === "WIN").length / historicalData.length;
-    historicalContext = `\n過去50件の取引での勝率: ${(winRate * 100).toFixed(1)}%`;
+  // ML推奨事項を整形
+  if (recommendations && recommendations.length > 0) {
+    recommendationsText = `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n💡 ML推奨事項 (アクティブ)\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+    
+    recommendations.forEach((rec: any, index: number) => {
+      const icon = rec.recommendation_type === "favor_pattern" ? "✅" : 
+                   rec.recommendation_type === "avoid_pattern" ? "⚠️" : "ℹ️";
+      const priority = rec.priority === "high" ? "🔴 高" : 
+                       rec.priority === "medium" ? "🟡 中" : "⚫ 低";
+      
+      recommendationsText += `\n\n【推奨${index + 1}】${icon} ${rec.title}`;
+      recommendationsText += `\n• 優先度: ${priority}`;
+      recommendationsText += `\n• 内容: ${rec.description}`;
+      if (rec.expected_win_rate_improvement) {
+        recommendationsText += `\n• 期待勝率改善: ${rec.expected_win_rate_improvement > 0 ? "+" : ""}${(rec.expected_win_rate_improvement * 100).toFixed(0)}%`;
+      }
+    });
+    
+    recommendationsText += `\n\n⚡ これらの推奨事項を勝率予測に反映してください。`;
   }
   
   // ⭐ 一目均衡表スコアの詳細分析を追加
@@ -248,51 +341,66 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
 • 総合判定: ${reason}
 ${ichimokuContext}
 ${mlContext}
-${historicalContext ? `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📊 過去実績${historicalContext}` : ""}
+${successCases}
+${failureCases}
+${recommendationsText}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 勝率予測ガイドライン
+🎯 勝率予測ガイドライン（重要度順）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. **ML学習パターンを最優先**（実績データに基づく最も信頼できる指標）
-   - ML学習パターンが検出された場合は、その過去勝率を強く重視
-   - サンプル数が多いほど信頼性が高い
-   - プロフィットファクターも考慮
+1. **ML学習パターンを最優先** ⭐⭐⭐
+   - ML学習パターンが検出された場合、その過去勝率を最重視
+   - サンプル数が多く信頼度スコアが高いほど信頼性UP
+   - プロフィットファクター > 2.0 なら更に信頼度UP
+   
+2. **過去の成功/失敗事例を分析** ⭐⭐⭐
+   - 成功事例と類似条件 → 勝率を上げる (+5～15%)
+   - 失敗事例と類似条件 → 勝率を下げる (-10～20%)
+   - RSI、ATR、理由(reason)の類似性を確認
+   - 直近の失敗が多い場合は慎重に判断
 
-2. **一目均衡表スコアを次に重視**
-   - excellent (0.9+): 基準勝率 85%～95%
-   - good (0.6-0.9): 基準勝率 75%～85%
-   - moderate (0.4-0.6): 基準勝率 65%～75%
-   - weak (0.0-0.4): 基準勝率 55%～65%
-   - conflicting (0.0): 基準勝率 40%～55% ⚠️ エントリー非推奨
+3. **ML推奨事項に従う** ⭐⭐
+   - favor_pattern → 積極的に勝率を上げる
+   - avoid_pattern → 慎重に、勝率を下げる
+   - 優先度が高いほど強く反映
 
-3. **RSIとの相乗効果**
-   - RSI 70超 + 売り方向 → +5～10%
-   - RSI 30未満 + 買い方向 → +5～10%
+4. **一目均衡表スコアを考慮** ⭐⭐
+   - excellent (0.9+): 基準勝率 75%～85%
+   - good (0.6-0.9): 基準勝率 65%～75%
+   - moderate (0.4-0.6): 基準勝率 55%～65%
+   - weak (0.0-0.4): 基準勝率 50%～60%
+   - conflicting (0.0): 基準勝率 40%～50% ⚠️ エントリー非推奨
+
+5. **RSIとの相乗効果** ⭐
+   - RSI 70超 + 売り方向 → +3～7%
+   - RSI 30未満 + 買い方向 → +3～7%
    - RSI逆行（RSI高で買い等） → -5～10%
 
-4. **ATRによる調整**
-   - 高ボラティリティ（0.001超）→ トレンド明確 → +3～5%
-   - 低ボラティリティ（0.0005未満）→ レンジ相場 → -3～5%
+6. **ATRによる調整** ⭐
+   - 高ボラティリティ（0.001超）→ +2～5%
+   - 低ボラティリティ（0.0005未満）→ -3～5%
 
-5. **過去実績の反映**
-   - 過去勝率が高い → +2～5%
-   - 過去勝率が低い → -2～5%
-
-6. **最終調整**
-   - 複数指標が完全一致 → 高信頼度 → confidence: "high"
-   - 一部指標のみ一致 → 中信頼度 → confidence: "medium"
-   - 指標が矛盾 → 低信頼度 → confidence: "low"
-   - **勝率範囲: 0.40～0.95**（現実的な範囲）
+7. **最終調整**
+   - 複数のポジティブ要因 → confidence: "high"
+   - 混在 → confidence: "medium"
+   - ネガティブ要因が多い → confidence: "low"
+   - **勝率範囲: 0.40～0.90**（過信を防ぐため上限引き下げ）
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📋 回答形式（JSON）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-以下のJSON形式で回答してください（説明文は不要）:
+以下のJSON形式で回答してください:
 {
-  "win_prob": 0.XX,
-  "confidence": "high" | "medium" | "low",
-  "reasoning": "ML学習結果、一目均衡表、RSIを踏まえた簡潔な判断理由（1行、30文字以内）"
-}`;
+  "win_prob": 0.XX,  // 0.40～0.90の範囲で設定（過去の実績を重視、楽観的予測は禁止）
+  "confidence": "high" | "medium" | "low",  // 不確実性が高い場合は必ず "low"
+  "reasoning": "ML学習結果と過去の成功/失敗事例を踏まえた判断理由（1行、40文字以内）"
+}
+
+重要な注意事項:
+• 過去の失敗事例と類似する状況では勝率を40-50%に抑える
+• MLパターンの勝率が60%未満なら楽観的予測は避ける
+• 成功事例が少ない場合は confidence を "low" に設定
+• reasoning には必ず「ML: XX%」または「過去: 成功3件/失敗2件」等の実績データを含める`;
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -306,7 +414,20 @@ ${historicalContext ? `\n━━━━━━━━━━━━━━━━━━�
         messages: [
           { 
             role: "system", 
-            content: "あなたはプロの金融トレーダーです。テクニカル指標を総合的に分析し、特に一目均衡表を重視して勝率を予測します。JSON形式で簡潔に回答してください。" 
+            content: `あなたはプロの金融トレーダーです。以下の優先順位で分析してください:
+
+⭐⭐⭐ 最優先: ML学習済みパターンの実績データ（勝率、利益率、サンプル数）
+⭐⭐⭐ 最優先: 過去の成功・失敗事例から学ぶ（同じ失敗を繰り返さない）
+⭐⭐ 重要: ML推奨事項（favor/avoid）に従う
+⭐ 参考: テクニカル指標（一目均衡表、RSI、ATR）
+
+重要な判断基準:
+• 過去の失敗事例と類似する場合は勝率を大幅に下げる（-20%以上）
+• ML学習済みパターンの勝率が50%未満の場合は慎重に（40-50%範囲で予測）
+• 成功事例が多く、MLパターンも良好な場合のみ高勝率（70-85%）
+• 不確実性が高い場合は必ず "low" confidence を設定
+
+JSON形式で簡潔に回答してください。過度に楽観的な予測は避け、実績データを最重視してください。` 
           },
           { role: "user", content: prompt }
         ],
