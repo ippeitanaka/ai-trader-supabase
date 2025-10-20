@@ -32,6 +32,7 @@ input int    MaxPositions        = 1;      // 同一銘柄の最大ポジショ�
 
 input bool   DebugLogs           = true;
 input int    LogCooldownSec      = 30;  // 0=全出力, >0=間引き, -1=完全OFF
+input int    CooldownAfterCloseMin = 30; // TP/SL後のクールダウン（分）
 
 // ★ URLは自分のプロジェクトに合わせて設定
 input string AI_Endpoint_URL     = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-trader";
@@ -58,6 +59,7 @@ ulong    g_pendingTicket=0;
 int      g_pendingDir=0;
 datetime g_pendingAt=0;
 int      g_dynamicExpiryMin=PendingExpiryMin;
+datetime g_cooldownUntil=0; // TP/SLクローズ後のクールダウン期限
 
 // ポジション追跡用（ML学習用）
 ulong    g_trackedPositionTicket=0;
@@ -73,6 +75,12 @@ void SafePrint(string msg)
    if(LogCooldownSec == 0 || now - g_lastLogTs >= LogCooldownSec){
       Print(msg); g_lastLogTs = now;
    }
+}
+
+// クールダウン判定
+bool InCooldown()
+{
+   return (g_cooldownUntil>0 && TimeCurrent()<g_cooldownUntil);
 }
 
 // ===== HTTPユーティリティ（★POSTはNUL無しで送る） =====
@@ -561,6 +569,11 @@ int CountPositions()
 // ===== バー処理 =====
 void OnM15NewBar()
 {
+   // TP/SL後のクールダウン中は一切の新規アクションを停止
+   if(InCooldown()){
+      SafePrint(StringFormat("[M15] cooldown active for %d sec",(int)(g_cooldownUntil-TimeCurrent())));
+      return;
+   }
    TechSignal t=Evaluate(TF_Entry); if(t.dir==0)return;
    double rsi=RSIv(PERIOD_M15,14,PRICE_CLOSE,0);
    AIOut ai; if(!QueryAI("M15",t.dir,rsi,t.atr,t.ref,t.reason,t.ichimoku_score,ai))return;
@@ -601,6 +614,11 @@ void OnM15NewBar()
 
 void OnH1NewBar()
 {
+   // クールダウン中は再チェック・キャンセル等も行わない
+   if(InCooldown()){
+      SafePrint(StringFormat("[H1] cooldown active for %d sec",(int)(g_cooldownUntil-TimeCurrent())));
+      return;
+   }
    // SyncConfig()は無効化：すべてEAプロパティを使用
    if(g_pendingTicket==0)return;
    if(!OrderAlive(g_pendingTicket)){Cancel("filled");return;}
@@ -676,6 +694,13 @@ void CheckPositionStatus()
                      else if(profit<-0.01) result="LOSS";
                      
                      UpdateSignalResult(g_trackedPositionTicket,exit_price,profit,result,sl_hit,tp_hit);
+
+                     // ★ TP/SL時のみクールダウンを設定
+                     if(sl_hit || tp_hit){
+                        g_cooldownUntil = TimeCurrent() + (CooldownAfterCloseMin*60);
+                        SafePrint(StringFormat("[COOLDOWN] Start %d min after %s (ticket=%d)",
+                           CooldownAfterCloseMin, (tp_hit?"TP":"SL"), g_trackedPositionTicket));
+                     }
                      
                      g_trackedPositionTicket=0;
                      g_trackedPositionOpenTime=0;
