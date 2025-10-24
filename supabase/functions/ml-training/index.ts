@@ -409,10 +409,14 @@ async function runTraining(triggeredBy: string = "manual"): Promise<TrainingResu
     .from("ai_signals")
     .select("*", { count: "exact", head: true });
   
-  // 2. 完結した取引数を取得
+  // 2. 完結した取引数を取得（ビューではなく直接クエリ）
   const { count: completeTrades } = await supabase
-    .from("ai_signals_training_complete")
-    .select("*", { count: "exact", head: true });
+    .from("ai_signals")
+    .select("*", { count: "exact", head: true })
+    .in("actual_result", ["WIN", "LOSS"])
+    .not("exit_price", "is", null)
+    .not("profit_loss", "is", null)
+    .not("closed_at", "is", null);
   
   console.log(`[ML] Total signals: ${totalSignals}, Complete trades: ${completeTrades}`);
   
@@ -440,10 +444,14 @@ async function runTraining(triggeredBy: string = "manual"): Promise<TrainingResu
   // 5. インサイトと推奨事項の生成
   const { insights, recommendations } = await generateInsights(patterns);
   
-  // 6. 全体の勝率計算
+  // 6. 全体の勝率計算（ビューではなく直接クエリ）
   const { data: allTrades } = await supabase
-    .from("ai_signals_training_complete")
-    .select("actual_result");
+    .from("ai_signals")
+    .select("actual_result")
+    .in("actual_result", ["WIN", "LOSS"])
+    .not("exit_price", "is", null)
+    .not("profit_loss", "is", null)
+    .not("closed_at", "is", null);
   
   const overallWinRate = allTrades
     ? allTrades.filter((t) => t.actual_result === "WIN").length / allTrades.length
