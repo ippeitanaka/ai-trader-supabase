@@ -17,6 +17,12 @@ interface AISignalEntry {
   reason?: string;
   instance?: string;
   model_version?: string;
+  // エントリー手法情報（任意）
+  entry_method?: string | null; // 'pullback' | 'breakout' | 'mtf_confirm' | 'none'
+  entry_params?: any | null;    // JSON パラメータ（k, o, expiry_bars など）
+  method_selected_by?: string | null; // 'OpenAI' | 'Fallback' | 'Manual'
+  method_confidence?: number | null;  // 0.0 - 1.0
+  method_reason?: string | null;
   
   // 注文情報
   order_ticket?: number;
@@ -42,7 +48,7 @@ function corsHeaders() {
   };
 }
 
-serve(async (req) => {
+serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders() });
   }
@@ -65,6 +71,11 @@ serve(async (req) => {
         model_version: body.model_version,
         order_ticket: body.order_ticket,
         entry_price: body.entry_price,
+        entry_method: body.entry_method ?? null,
+        entry_params: body.entry_params ?? null,
+        method_selected_by: body.method_selected_by ?? null,
+        method_confidence: body.method_confidence ?? null,
+        method_reason: body.method_reason ?? null,
         actual_result: body.actual_result || 'PENDING',
       };
 
@@ -90,7 +101,23 @@ serve(async (req) => {
 
     // PUT: 取引結果の更新
     if (req.method === "PUT") {
-      const { order_ticket, exit_price, profit_loss, actual_result, closed_at, hold_duration_minutes, sl_hit, tp_hit, cancelled_reason } = body;
+      const {
+        order_ticket,
+        exit_price,
+        profit_loss,
+        actual_result,
+        closed_at,
+        hold_duration_minutes,
+        sl_hit,
+        tp_hit,
+        cancelled_reason,
+        // エントリー方式の後追い更新にも対応
+        entry_method,
+        entry_params,
+        method_selected_by,
+        method_confidence,
+        method_reason,
+      } = body;
 
       if (!order_ticket) {
         return new Response(
@@ -107,7 +134,12 @@ serve(async (req) => {
       if (hold_duration_minutes !== undefined) updateData.hold_duration_minutes = hold_duration_minutes;
       if (sl_hit !== undefined) updateData.sl_hit = sl_hit;
       if (tp_hit !== undefined) updateData.tp_hit = tp_hit;
-      if (cancelled_reason) updateData.cancelled_reason = cancelled_reason;
+  if (cancelled_reason) updateData.cancelled_reason = cancelled_reason;
+  if (entry_method !== undefined) updateData.entry_method = entry_method;
+  if (entry_params !== undefined) updateData.entry_params = entry_params;
+  if (method_selected_by !== undefined) updateData.method_selected_by = method_selected_by;
+  if (method_confidence !== undefined) updateData.method_confidence = method_confidence;
+  if (method_reason !== undefined) updateData.method_reason = method_reason;
 
       const { data, error } = await supabase
         .from("ai_signals")

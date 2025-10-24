@@ -64,6 +64,12 @@ export interface TradeResponse {
   expiry_minutes: number;
   confidence?: string;
   reasoning?: string;
+  // Hybrid entry selection
+  entry_method?: "pullback" | "breakout" | "mtf_confirm" | "none";
+  entry_params?: Record<string, unknown> | null;
+  method_selected_by?: "OpenAI" | "Fallback" | "Manual";
+  method_confidence?: number; // 0.0 - 1.0
+  method_reason?: string;
 }
 
 function corsHeaders() {
@@ -85,6 +91,9 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
   
   let offset_factor = 0.2;
   let expiry_minutes = 90;
+  // デフォルトのエントリー手法（簡易フォールバック）
+  let entry_method: "pullback" | "breakout" | "mtf_confirm" | "none" = "pullback";
+  const entry_params: Record<string, unknown> = {};
   
   // ATRによるリスク調整
   if (atr > 0) {
@@ -95,6 +104,36 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
       offset_factor = 0.15;
       expiry_minutes = 60; // 低ボラティリティは短めの有効期限
     }
+  }
+
+  // 簡易ルールでエントリー方式を選択
+  // 例: RSIが高め・ATR高→プルバック、レンジ気味→ブレイクアウト、矛盾あるが方向は出ている→MTFコンファーム
+  try {
+    const rsi = req.rsi;
+    if (rsi >= 65) {
+      entry_method = "pullback";
+      const k = atr > 0.001 ? 0.35 : atr > 0.0007 ? 0.3 : 0.25;
+      Object.assign(entry_params, { k, anchor_type: "ema25", expiry_bars: 2 });
+    } else if (rsi <= 35) {
+      entry_method = "pullback";
+      const k = atr > 0.001 ? 0.35 : 0.25;
+      Object.assign(entry_params, { k, anchor_type: "kijun", expiry_bars: 2 });
+    } else {
+      // 中立RSIの場合、MACDと価格vs雲で判断
+      const macdCross = req.macd.cross;
+      const priceVsCloud = req.ichimoku.price_vs_cloud;
+      if (Math.abs(macdCross) > 0 && priceVsCloud !== 0) {
+        entry_method = "breakout";
+        const o = atr > 0.001 ? 0.25 : 0.15;
+        Object.assign(entry_params, { o, confirm_tf: "M5", confirm_rule: "close_break", expiry_bars: 2 });
+      } else {
+        entry_method = "mtf_confirm";
+        Object.assign(entry_params, { m5_rules: ["swing", "rsi_back_50"], order_type: "market", expiry_bars: 3 });
+      }
+    }
+  } catch (_) {
+    // 失敗時は保守的にnone
+    entry_method = "none";
   }
   
   console.log(
@@ -109,6 +148,11 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
     expiry_minutes,
     confidence: analysis.confidence,
     reasoning: analysis.reasoning,
+    entry_method,
+    entry_params,
+    method_selected_by: "Fallback",
+    method_confidence: 0.5,
+    method_reason: "Rule-based selection using RSI/ATR/MACD/Ichimoku heuristics",
   };
 }
 
@@ -119,41 +163,54 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
   const reason = ea_suggestion.reason;
   const ichimoku_score = ea_suggestion.ichimoku_score;
   
-  // ⭐⭐⭐ Step 2 + Step 4: ML学習済みパターンと過去実績の詳細取得 ⭐⭐⭐
+  // ⭐⭐⭐ 学習データ収集フェーズ: ML参照をスキップ ⭐⭐⭐
+  // 十分な学習データが蓄積されるまで、テクニカル指標のみで判断
+  // TODO: ai_signalsが100件以上溜まったらML参照を再開する
   
-  // 1. ML学習済みパターンをTOP3まで取得
-  const { data: matchedPatterns } = await supabase
-    .from("ml_patterns")
-    .select("*")
-    .eq("symbol", symbol)
-    .eq("timeframe", timeframe)
-    .eq("direction", dir)
-    .eq("is_active", true)
-    .gte("rsi_max", rsi)
-    .lte("rsi_min", rsi)
-    .gte("total_trades", 5) // 最低サンプル数
-    .order("confidence_score", { ascending: false })
-    .limit(3);
+  const ENABLE_ML_LEARNING = false; // 学習データ収集フェーズ中はfalse
   
-  // 2. ML推奨事項を取得
-  const { data: recommendations } = await supabase
-    .from("ml_recommendations")
-    .select("*")
-    .eq("status", "active")
-    .order("priority", { ascending: true })
-    .limit(3);
+  let matchedPatterns: any[] = [];
+  let recommendations: any[] = [];
+  let historicalTrades: any[] = [];
   
-  // 3. 過去の類似トレードを取得（成功事例と失敗事例）
-  const { data: historicalTrades } = await supabase
-    .from("ai_signals")
-    .select("*")
-    .eq("symbol", symbol)
-    .eq("timeframe", timeframe)
-    .eq("dir", dir)
-    .not("actual_result", "is", null)
-    .in("actual_result", ["WIN", "LOSS"])
-    .order("created_at", { ascending: false })
-    .limit(30);
+  if (ENABLE_ML_LEARNING) {
+    // 1. ML学習済みパターンをTOP3まで取得
+    const { data: patterns } = await supabase
+      .from("ml_patterns")
+      .select("*")
+      .eq("symbol", symbol)
+      .eq("timeframe", timeframe)
+      .eq("direction", dir)
+      .eq("is_active", true)
+      .gte("rsi_max", rsi)
+      .lte("rsi_min", rsi)
+      .gte("total_trades", 5) // 最低サンプル数
+      .order("confidence_score", { ascending: false })
+      .limit(3);
+    matchedPatterns = patterns || [];
+    
+    // 2. ML推奨事項を取得
+    const { data: recs } = await supabase
+      .from("ml_recommendations")
+      .select("*")
+      .eq("status", "active")
+      .order("priority", { ascending: true })
+      .limit(3);
+    recommendations = recs || [];
+    
+    // 3. 過去の類似トレードを取得（成功事例と失敗事例）
+    const { data: trades } = await supabase
+      .from("ai_signals")
+      .select("*")
+      .eq("symbol", symbol)
+      .eq("timeframe", timeframe)
+      .eq("dir", dir)
+      .not("actual_result", "is", null)
+      .in("actual_result", ["WIN", "LOSS"])
+      .order("created_at", { ascending: false })
+      .limit(30);
+    historicalTrades = trades || [];
+  }
   
   let mlContext = "";
   let mlWinRateBoost = 0;
@@ -323,7 +380,18 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
     }
   }
   
-  const prompt = `あなたはプロの金融トレーダー兼AIアナリストです。複数のテクニカル指標を総合的に分析し、取引の成功確率（勝率）を0.0～1.0の範囲で予測してください。
+  // 学習データ収集フェーズ用の総合判断プロンプト
+  const prompt = ENABLE_ML_LEARNING ? 
+    // ML学習データがある場合の詳細プロンプト（将来用）
+    `あなたはプロの金融トレーダー兼AIアナリストです。ML学習結果と過去の実績データを最重視して勝率を予測してください。
+${mlContext}${successCases}${failureCases}${recommendationsText}
+テクニカル指標: RSI=${rsi.toFixed(2)}, ATR=${atr.toFixed(5)}
+${ichimokuContext}
+EA判断: ${reason}
+JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reasoning": "判断理由（40文字以内）", "entry_method": "pullback|breakout|mtf_confirm|none", "entry_params": { ... }, "method_confidence": 0.0-1.0, "method_reason": "方式選択理由（40文字以内）"}`
+    :
+    // 学習データ収集フェーズ: 全テクニカル指標を総合的に判断
+    `あなたはプロの金融トレーダー兼AIアナリストです。すべてのテクニカル指標とEA側の総合判断を総合的に分析し、取引の成功確率（勝率）を0.0～1.0の範囲で予測してください。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 市場情報
@@ -332,75 +400,106 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
 • 時間軸: ${timeframe}
 • エントリー方向: ${dir > 0 ? "買い（ロング）" : dir < 0 ? "売り（ショート）" : "中立"}
 • 現在価格: ${price}
+• Bid: ${req.bid}, Ask: ${req.ask}, Spread: ${((req.ask - req.bid) / price * 10000).toFixed(1)} pips
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📈 テクニカル指標
+📈 テクニカル指標（全データ）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• RSI: ${rsi.toFixed(2)} ${rsi > 70 ? "⚠️ 買われすぎ（70超）→ 売りシグナル強化" : rsi < 30 ? "⚠️ 売られすぎ（30未満）→ 買いシグナル強化" : "✓ 中立圏（30-70）"}
-• ATR: ${atr.toFixed(5)} ${atr > 0.001 ? "（高ボラティリティ→トレンド明確）" : atr < 0.0005 ? "（低ボラティリティ→レンジ相場）" : "（通常ボラティリティ）"}
-• 総合判定: ${reason}
-${ichimokuContext}
-${mlContext}
-${successCases}
-${failureCases}
-${recommendationsText}
+
+【移動平均線】
+• EMA25: ${req.ema_25.toFixed(2)}
+• SMA100: ${req.sma_100.toFixed(2)}
+• MAクロス: ${req.ma_cross > 0 ? "ゴールデンクロス（上昇トレンド）" : "デッドクロス（下降トレンド）"}
+
+【MACD】
+• Main: ${req.macd.main.toFixed(5)}
+• Signal: ${req.macd.signal.toFixed(5)}
+• Histogram: ${req.macd.histogram.toFixed(5)}
+• クロス: ${req.macd.cross > 0 ? "上昇クロス（買いシグナル）" : "下降クロス（売りシグナル）"}
+
+【モメンタム】
+• RSI: ${rsi.toFixed(2)} ${rsi > 70 ? "⚠️ 買われすぎ（反転リスク高）" : rsi < 30 ? "⚠️ 売られすぎ（反転チャンス）" : rsi > 50 && rsi <= 70 ? "✓ 健全な上昇" : rsi >= 30 && rsi < 50 ? "✓ 健全な下降" : "✓ 中立"}
+• ATR: ${atr.toFixed(5)} ${atr > 0.001 ? "（高ボラティリティ→大きな値動き、利益チャンス大）" : atr < 0.0005 ? "（低ボラティリティ→小さな値動き、レンジ相場）" : "（通常ボラティリティ）"}
+
+【一目均衡表】
+• 転換線: ${req.ichimoku.tenkan.toFixed(2)}
+• 基準線: ${req.ichimoku.kijun.toFixed(2)}
+• 先行スパンA: ${req.ichimoku.senkou_a.toFixed(2)}
+• 先行スパンB: ${req.ichimoku.senkou_b.toFixed(2)}
+• 遅行スパン: ${req.ichimoku.chikou.toFixed(2)}
+• TK_Cross: ${req.ichimoku.tk_cross > 0 ? "転換線 > 基準線（短期上昇）" : "転換線 < 基準線（短期下降）"}
+• 雲の色: ${req.ichimoku.cloud_color > 0 ? "陽転（青雲、上昇トレンド）" : "陰転（赤雲、下降トレンド）"}
+• 価格 vs 雲: ${req.ichimoku.price_vs_cloud > 0 ? "雲の上（強気相場）" : req.ichimoku.price_vs_cloud < 0 ? "雲の下（弱気相場）" : "雲の中（不確実、レンジ）"}
+
+【EA総合判断】
+• 判定: ${reason}
+• 一目スコア: ${ichimoku_score?.toFixed(2) || "N/A"} ${ichimokuContext}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 勝率予測ガイドライン（重要度順）
+🎯 勝率予測ガイドライン（総合判断）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. **ML学習パターンを最優先** ⭐⭐⭐
-   - ML学習パターンが検出された場合、その過去勝率を最重視
-   - サンプル数が多く信頼度スコアが高いほど信頼性UP
-   - プロフィットファクター > 2.0 なら更に信頼度UP
-   
-2. **過去の成功/失敗事例を分析** ⭐⭐⭐
-   - 成功事例と類似条件 → 勝率を上げる (+5～15%)
-   - 失敗事例と類似条件 → 勝率を下げる (-10～20%)
-   - RSI、ATR、理由(reason)の類似性を確認
-   - 直近の失敗が多い場合は慎重に判断
 
-3. **ML推奨事項に従う** ⭐⭐
-   - favor_pattern → 積極的に勝率を上げる
-   - avoid_pattern → 慎重に、勝率を下げる
-   - 優先度が高いほど強く反映
+**基準となる判断要素:**
 
-4. **一目均衡表スコアを考慮** ⭐⭐
-   - excellent (0.9+): 基準勝率 75%～85%
-   - good (0.6-0.9): 基準勝率 65%～75%
-   - moderate (0.4-0.6): 基準勝率 55%～65%
-   - weak (0.0-0.4): 基準勝率 50%～60%
-   - conflicting (0.0): 基準勝率 40%～50% ⚠️ エントリー非推奨
+1. **トレンドの一致度** ⭐⭐⭐
+   - MA、MACD、一目均衡表が同一方向 → 70-85%（強いトレンド）
+   - 2つが一致、1つが中立 → 60-70%（中程度のトレンド）
+   - 指標が分散 → 50-60%（弱いトレンド）
+   - 指標が矛盾 → 30-45%（不確実、リスク高）
 
-5. **RSIとの相乗効果** ⭐
-   - RSI 70超 + 売り方向 → +3～7%
-   - RSI 30未満 + 買い方向 → +3～7%
-   - RSI逆行（RSI高で買い等） → -5～10%
+2. **一目均衡表の状態** ⭐⭐⭐
+   - 価格が雲の上 + 陽転 + TK上昇クロス → +10-15%
+   - 価格が雲の下 + 陰転 + TK下降クロス → +10-15%（売りの場合）
+   - 価格が雲の中 → -10-15%（不確実性ペナルティ）
 
-6. **ATRによる調整** ⭐
-   - 高ボラティリティ（0.001超）→ +2～5%
-   - 低ボラティリティ（0.0005未満）→ -3～5%
+3. **RSIの状態** ⭐⭐
+   - RSI 50-70 + 買い方向 → +5-10%（健全な上昇）
+   - RSI 30-50 + 売り方向 → +5-10%（健全な下降）
+   - RSI 70超 + 買い方向 → -10-20%（反転リスク）
+   - RSI 30未満 + 売り方向 → -10-20%（反転リスク）
+   - RSI 30未満 + 買い方向 → +5-10%（逆張りチャンス）
+   - RSI 70超 + 売り方向 → +5-10%（逆張りチャンス）
 
-7. **最終調整**
-   - 複数のポジティブ要因 → confidence: "high"
-   - 混在 → confidence: "medium"
-   - ネガティブ要因が多い → confidence: "low"
-   - **勝率範囲: 0.40～0.90**（過信を防ぐため上限引き下げ）
+4. **MACDの状態** ⭐⭐
+   - MACD上昇クロス + 買い方向 → +5-8%
+   - MACD下降クロス + 売り方向 → +5-8%
+   - Histogram拡大 → +3-5%（モメンタム増加）
+   - MACDとエントリー方向が逆 → -8-12%
+
+5. **ボラティリティ（ATR）** ⭐
+   - 高ボラティリティ → +3-5%（利益チャンス大）
+   - 低ボラティリティ → -5-10%（レンジ相場リスク）
+
+6. **EA側の一目スコア** ⭐⭐⭐
+   - excellent (0.9+) → 基準勝率 75-85%
+   - good (0.6-0.9) → 基準勝率 65-75%
+   - moderate (0.4-0.6) → 基準勝率 55-65%
+   - weak (0.0-0.4) → 基準勝率 45-55%
+   - conflicting (<0.0) → 基準勝率 30-45%
+
+**勝率範囲: 0%～90%**
+- 最悪のシナリオ（全指標矛盾、高リスク）→ 0-20%
+- 不確実性が高い（指標分散）→ 30-45%
+- 中程度の確信（一部一致）→ 50-65%
+- 高い確信（多数一致）→ 70-80%
+- 最高のシナリオ（全指標完全一致、理想的条件）→ 85-90%
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📋 回答形式（JSON）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 以下のJSON形式で回答してください:
 {
-  "win_prob": 0.XX,  // 0.40～0.90の範囲で設定（過去の実績を重視、楽観的予測は禁止）
-  "confidence": "high" | "medium" | "low",  // 不確実性が高い場合は必ず "low"
-  "reasoning": "ML学習結果と過去の成功/失敗事例を踏まえた判断理由（1行、40文字以内）"
+  "win_prob": 0.XX,  // 0.00～0.90の範囲で動的に設定（全指標を総合判断）
+  "confidence": "high" | "medium" | "low",
+  "reasoning": "総合的な判断理由（40文字以内、主要な根拠を明記）"
 }
 
-重要な注意事項:
-• 過去の失敗事例と類似する状況では勝率を40-50%に抑える
-• MLパターンの勝率が60%未満なら楽観的予測は避ける
-• 成功事例が少ない場合は confidence を "low" に設定
-• reasoning には必ず「ML: XX%」または「過去: 成功3件/失敗2件」等の実績データを含める`;
+重要: 
+• すべてのテクニカル指標を総合的に評価してください
+• 指標間の一致度が最も重要です
+• EA側の一目スコアも重要な判断材料です
+• 矛盾が多い場合は低勝率、一致が多い場合は高勝率を設定してください
+• 0%～90%の幅広い範囲で動的に算出してください`;
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -414,20 +513,41 @@ ${recommendationsText}
         messages: [
           { 
             role: "system", 
-            content: `あなたはプロの金融トレーダーです。以下の優先順位で分析してください:
+            content: ENABLE_ML_LEARNING 
+              ? `あなたはプロの金融トレーダーです。以下の優先順位で分析してください:
 
 ⭐⭐⭐ 最優先: ML学習済みパターンの実績データ（勝率、利益率、サンプル数）
 ⭐⭐⭐ 最優先: 過去の成功・失敗事例から学ぶ（同じ失敗を繰り返さない）
 ⭐⭐ 重要: ML推奨事項（favor/avoid）に従う
 ⭐ 参考: テクニカル指標（一目均衡表、RSI、ATR）
 
-重要な判断基準:
-• 過去の失敗事例と類似する場合は勝率を大幅に下げる（-20%以上）
-• ML学習済みパターンの勝率が50%未満の場合は慎重に（40-50%範囲で予測）
-• 成功事例が多く、MLパターンも良好な場合のみ高勝率（70-85%）
-• 不確実性が高い場合は必ず "low" confidence を設定
+JSON形式で簡潔に回答してください。過度に楽観的な予測は避け、実績データを最重視してください。`
+              : `あなたはプロの金融トレーダーです。すべてのテクニカル指標を総合的に分析して勝率を予測してください。
 
-JSON形式で簡潔に回答してください。過度に楽観的な予測は避け、実績データを最重視してください。` 
+🎯 分析の重要ポイント:
+⭐⭐⭐ 最重視: 指標間の一致度（MA、MACD、一目均衡表が同一方向か？）
+⭐⭐⭐ 最重視: 一目均衡表の状態（価格vs雲、雲の色、TKクロス）
+⭐⭐ 重要: RSIの状態（買われすぎ/売られすぎ、エントリー方向との整合性）
+⭐⭐ 重要: MACDの方向性（エントリー方向との一致度）
+⭐ 参考: ATR（ボラティリティ、利益チャンスの大きさ）
+⭐ 参考: EA側の一目スコア（総合判定の信頼度）
+
+💡 判断基準:
+• 全指標が一致 → 高勝率（70-90%）
+• 大半が一致 → 中高勝率（60-75%）
+• 指標が分散 → 中勝率（50-65%）
+• 指標が矛盾 → 低勝率（30-45%）
+• 最悪の条件 → 極低勝率（0-20%）
+
+0%～90%の幅広い範囲で動的に算出し、JSON形式で簡潔に回答してください。指標間の矛盾が多いほど低勝率、一致が多いほど高勝率を設定してください。
+
+さらに、以下のエントリー方式から最適を1つ選び、パラメータも返してください。
+- pullback: 押し目/戻り待ち。例パラメータ: { k: 0.2-0.5, anchor_type: "ema25|tenkan|kijun", expiry_bars: 2|3 }
+- breakout: 直近高値/安値のブレイク確認。例: { o: 0.1-0.3, confirm_tf: "M5", confirm_rule: "close_break|macd_flip", expiry_bars: 2|3 }
+- mtf_confirm: M5でのミニ条件一致後に発注。例: { m5_rules: ["swing", "rsi_back_50"], order_type: "market|limit", expiry_bars: 2|3 }
+- none: 今は発注を見送り
+
+JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reasoning": "…", "entry_method": "pullback|breakout|mtf_confirm|none", "entry_params": { … }, "method_confidence": 0.0-1.0, "method_reason": "…"}`
           },
           { role: "user", content: prompt }
         ],
@@ -454,7 +574,7 @@ JSON形式で簡潔に回答してください。過度に楽観的な予測は�
       return calculateSignalFallback(req);
     }
     
-    const aiResult = JSON.parse(jsonMatch[0]);
+  const aiResult = JSON.parse(jsonMatch[0]);
     let win_prob = parseFloat(aiResult.win_prob);
     
     // 安全性チェック
@@ -464,33 +584,50 @@ JSON形式で簡潔に回答してください。過度に楽観的な予測は�
       return calculateSignalFallback(req);
     }
     
-    // ⭐ ML学習結果に基づく勝率調整を適用
-    if (mlWinRateBoost !== 0) {
+    // ⭐ 学習データ収集フェーズではML調整をスキップ
+    if (ENABLE_ML_LEARNING && mlWinRateBoost !== 0) {
       const originalProb = win_prob;
       win_prob = win_prob + mlWinRateBoost;
       console.log(`[AI] ML adjustment applied: ${originalProb.toFixed(3)} → ${win_prob.toFixed(3)} (boost: ${mlWinRateBoost.toFixed(3)})`);
     }
     
-    // 一目スコアに基づく範囲調整
-    let minProb = 0.40;
-    let maxProb = 0.95;
-    if (ichimoku_score !== undefined && ichimoku_score !== null) {
-      if (ichimoku_score >= 0.9) {
-        minProb = 0.70;  // 最強シグナルは70%から
-      } else if (ichimoku_score <= 0.1) {
-        maxProb = 0.65;  // シグナル矛盾は65%まで
-      }
-    }
+    // 勝率範囲を0%～90%に設定（幅広く動的に算出）
+    let minProb = 0.00;  // 最悪のシナリオ: 0%
+    let maxProb = 0.90;  // 最高のシナリオ: 90%
     
+    // 極端に制限はせず、AIの判断を尊重
     win_prob = Math.max(minProb, Math.min(maxProb, win_prob));
     
     const confidence = aiResult.confidence || "unknown";
     const reasoning = aiResult.reasoning || "N/A";
+    let entry_method: "pullback" | "breakout" | "mtf_confirm" | "none" = "none";
+    let entry_params: Record<string, unknown> | null = null;
+    let method_confidence = typeof aiResult.method_confidence === 'number' ? aiResult.method_confidence : 0.5;
+    const method_reason = aiResult.method_reason || "N/A";
+
+    // AIが方式を返していれば採用
+    if (typeof aiResult.entry_method === 'string') {
+      const allowed = ["pullback", "breakout", "mtf_confirm", "none"] as const;
+      if ((allowed as readonly string[]).includes(aiResult.entry_method)) {
+        entry_method = aiResult.entry_method as any;
+      }
+    }
+    if (aiResult.entry_params && typeof aiResult.entry_params === 'object') {
+      entry_params = aiResult.entry_params as any;
+    }
+
+    // 方式が不十分な場合はフォールバックで埋める
+    if (!entry_params || entry_method === "none") {
+      const fb = calculateSignalFallback(req);
+      if (entry_method === "none") entry_method = fb.entry_method as any;
+      if (!entry_params) entry_params = (fb.entry_params || {}) as any;
+      if (!method_confidence) method_confidence = fb.method_confidence || 0.5;
+    }
     
     // 詳細ログ出力
     console.log(
       `[AI] OpenAI GPT-4 prediction: ${(win_prob * 100).toFixed(1)}% (${confidence}) - ${reasoning} | ` +
-      `ichimoku=${ichimoku_score?.toFixed(2) || "N/A"} quality=${signalQuality}`
+      `ichimoku=${ichimoku_score?.toFixed(2) || "N/A"} quality=${signalQuality} | entry_method=${entry_method}`
     );
     
     return {
@@ -500,6 +637,11 @@ JSON形式で簡潔に回答してください。過度に楽観的な予測は�
       expiry_minutes: 90,
       confidence: confidence,
       reasoning: reasoning,
+      entry_method,
+      entry_params,
+      method_selected_by: "OpenAI",
+      method_confidence,
+      method_reason,
     } as any;
     
   } catch (error) {
@@ -525,12 +667,26 @@ serve(async (req: Request) => {
     return new Response(
       JSON.stringify({ 
         ok: true, 
-        service: "ai-trader with OpenAI + Ichimoku", 
-        version: "2.2.0",
+        service: "ai-trader with OpenAI + Comprehensive Technical Analysis", 
+        version: "2.4.0-learning-phase",
+        mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
+        ml_learning_enabled: false,
         openai_key_status: keyStatus,
         fallback_available: true,
-        features: ["ichimoku_score", "openai_gpt", "ml_learning", "detailed_logging"]
+        win_prob_range: "0% - 90%",
+        features: [
+          "comprehensive_technical_analysis",
+          "all_indicators_integrated",
+          "openai_gpt",
+          "ma_cross",
+          "macd",
+          "rsi",
+          "atr",
+          "ichimoku_full",
+          "hybrid_entry_selection"
+        ],
+        note: "Learning phase: AI comprehensively analyzes all technical indicators (MA, MACD, RSI, ATR, Ichimoku). Win probability: 0%-90% dynamic range. ML will be enabled after 100+ trades."
       }),
       { status: 200, headers: corsHeaders() }
     );
@@ -602,11 +758,11 @@ serve(async (req: Request) => {
     let predictionMethod = "UNKNOWN";
     
     if (hasOpenAIKey) {
-      console.log(`[ai-trader] 🤖 Attempting OpenAI GPT prediction...`);
+      console.log(`[ai-trader] 🤖 Attempting OpenAI GPT prediction... (Mode: TECHNICAL_ONLY - Learning Phase)`);
       try {
         response = await calculateSignalWithAI(tradeReq);
-        predictionMethod = "OpenAI-GPT";
-        console.log(`[ai-trader] ✓ OpenAI prediction successful`);
+        predictionMethod = "OpenAI-GPT-Technical";
+        console.log(`[ai-trader] ✓ OpenAI prediction successful (technical indicators only)`);
       } catch (aiError) {
         console.error(`[ai-trader] ❌ OpenAI prediction failed:`, aiError);
         console.warn(`[ai-trader] Switching to fallback calculation...`);
@@ -627,7 +783,8 @@ serve(async (req: Request) => {
     console.log(
       `[ai-trader] 📊 RESULT: ${tradeReq.symbol} ${tradeReq.timeframe} ` +
       `dir=${tradeReq.ea_suggestion.dir} win=${response.win_prob.toFixed(3)}${ichimokuInfo} ` +
-      `reason="${tradeReq.ea_suggestion.reason}" method=${predictionMethod}`
+      `reason="${tradeReq.ea_suggestion.reason}" method=${predictionMethod}` +
+      (response.entry_method ? ` | entry_method=${response.entry_method} sel_by=${response.method_selected_by || 'N/A'} conf=${typeof response.method_confidence==='number'?response.method_confidence.toFixed(2):'N/A'}` : ``)
     );
     
     // ⚠️ フォールバックの場合は警告

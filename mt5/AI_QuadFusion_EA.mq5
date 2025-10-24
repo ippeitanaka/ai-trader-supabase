@@ -332,7 +332,21 @@ TechSignal Evaluate(ENUM_TIMEFRAMES tf)
 }
 
 // ===== AI連携 =====
-struct AIOut{double win_prob;int action;double offset_factor;int expiry_min;string reasoning;string confidence;};
+struct AIOut{
+   double win_prob;int action;double offset_factor;int expiry_min;string reasoning;string confidence;
+   // Hybrid entry
+   string entry_method;          // pullback|breakout|mtf_confirm|none
+   string method_selected_by;    // OpenAI|Fallback
+   double method_confidence;     // 0.0-1.0
+   string method_reason;
+   // entry_params (flattened minimal subset)
+   double k;                     // pullback: ATR係数
+   double o;                     // breakout: ATRオフセット
+   int    expiry_bars;           // 2|3
+   string confirm_tf;            // e.g. M5
+   string confirm_rule;          // close_break|macd_flip
+   string order_type;            // market|limit
+};
 bool ExtractJsonNumber(const string json,const string key,double &out){
    string pat="\""+key+"\":";int pos=StringFind(json,pat);if(pos<0)return false;
    pos+=StringLen(pat);int end=pos;while(end<StringLen(json)){
@@ -350,6 +364,41 @@ bool ExtractJsonString(const string json,const string key,string &out){
    StringReplace(out,"\\\"","\"");StringReplace(out,"\\\\","\\");
    StringReplace(out,"\\n","\n");StringReplace(out,"\\r","\r");
    return true;}
+
+// entry_params のセクションを取り出す（簡易）
+bool ExtractJsonObjectSection(const string json,const string objKey,string &section){
+   string pat="\""+objKey+"\":"; int pos=StringFind(json,pat); if(pos<0) return false;
+   // 最初の '{' を探す
+   int bracePos=StringFind(json,"{",pos);
+   if(bracePos<0) return false;
+   int depth=0; int i=bracePos; int n=StringLen(json);
+   for(; i<n; i++){
+      ushort c=StringGetCharacter(json,i);
+      if(c=='{') depth++;
+      else if(c=='}'){
+         depth--; if(depth==0){ i++; break; }
+      }
+   }
+   if(depth!=0) return false;
+   section=StringSubstr(json,bracePos,i-bracePos);
+   return true;
+}
+
+bool ExtractJsonInSectionNumber(const string section,const string key,double &out){
+   string pat="\""+key+"\":"; int pos=StringFind(section,pat); if(pos<0) return false;
+   pos+=StringLen(pat); int end=pos; while(end<StringLen(section)){
+      ushort c=StringGetCharacter(section,end);
+      if((c>='0'&&c<='9')||c=='-'||c=='+'||c=='.'||c=='e'||c=='E') end++; else break; }
+   string num=StringSubstr(section,pos,end-pos); out=StringToDouble(num); return true;
+}
+
+bool ExtractJsonInSectionString(const string section,const string key,string &out){
+   string pat="\""+key+"\":\""; int pos=StringFind(section,pat); if(pos<0) return false;
+   pos+=StringLen(pat); int end=pos; while(end<StringLen(section)){
+      ushort c=StringGetCharacter(section,end);
+      if(c=='\"'&&(end==pos||StringGetCharacter(section,end-1)!='\\')) break; end++; }
+   out=StringSubstr(section,pos,end-pos); StringReplace(out,"\\\"","\""); StringReplace(out,"\\\\","\\"); return true;
+}
 
 bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,const string reason,double ichimoku_score,AIOut &out_ai)
 {
@@ -429,7 +478,23 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    ExtractJsonNumber(resp,"offset_factor",out_ai.offset_factor);
    double tmp; if(ExtractJsonNumber(resp,"expiry_minutes",tmp)) out_ai.expiry_min=(int)MathRound(tmp);
    ExtractJsonString(resp,"reasoning",out_ai.reasoning);
+   ExtractJsonString(resp,"reasoning",out_ai.reasoning);
    ExtractJsonString(resp,"confidence",out_ai.confidence);
+   // Hybrid entry fields
+   ExtractJsonString(resp,"entry_method",out_ai.entry_method);
+   ExtractJsonString(resp,"method_selected_by",out_ai.method_selected_by);
+   double mc; if(ExtractJsonNumber(resp,"method_confidence",mc)) out_ai.method_confidence=mc; else out_ai.method_confidence=0.0;
+   ExtractJsonString(resp,"method_reason",out_ai.method_reason);
+   string paramsSec; if(ExtractJsonObjectSection(resp,"entry_params",paramsSec)){
+      double val;
+      if(ExtractJsonInSectionNumber(paramsSec,"k",val)) out_ai.k=val;
+      if(ExtractJsonInSectionNumber(paramsSec,"o",val)) out_ai.o=val;
+      if(ExtractJsonInSectionNumber(paramsSec,"expiry_bars",val)) out_ai.expiry_bars=(int)MathRound(val);
+      string s;
+      if(ExtractJsonInSectionString(paramsSec,"confirm_tf",s)) out_ai.confirm_tf=s;
+      if(ExtractJsonInSectionString(paramsSec,"confirm_rule",s)) out_ai.confirm_rule=s;
+      if(ExtractJsonInSectionString(paramsSec,"order_type",s)) out_ai.order_type=s;
+   }
 
    return true;
 }
@@ -448,6 +513,10 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
    "\"win_prob\":"+DoubleToString(ai.win_prob,3)+","+
    "\"ai_confidence\":\""+(ai.confidence!=""?JsonEscape(ai.confidence):"unknown")+"\","+
    "\"ai_reasoning\":\""+(ai.reasoning!=""?JsonEscape(ai.reasoning):"N/A")+"\","+
+   "\"entry_method\":\""+JsonEscape(ai.entry_method)+"\","+
+   "\"method_selected_by\":\""+JsonEscape(ai.method_selected_by)+"\","+
+   "\"method_confidence\":"+DoubleToString(ai.method_confidence,3)+","+
+   "\"method_reason\":\""+JsonEscape(ai.method_reason)+"\","+
    "\"trade_decision\":\""+JsonEscape(trade_decision)+"\","+
    "\"threshold_met\":"+(threshold_met?"true":"false")+","+
    "\"current_positions\":"+IntegerToString(current_pos)+","+
@@ -462,8 +531,17 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
 }
 
 // ===== AI Signals記録（ML学習用） =====
-void RecordSignal(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,ulong ticket=0,double entry_price=0)
+void RecordSignal(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,ulong ticket=0,double entry_price=0,bool mark_filled=false)
 {
+   string params="{"+
+                "\"k\":"+DoubleToString(ai.k,3)+","+
+                "\"o\":"+DoubleToString(ai.o,3)+","+
+                "\"expiry_bars\":"+IntegerToString(ai.expiry_bars)+","+
+                "\"confirm_tf\":\""+JsonEscape(ai.confirm_tf)+"\","+
+                "\"confirm_rule\":\""+JsonEscape(ai.confirm_rule)+"\","+
+                "\"order_type\":\""+JsonEscape(ai.order_type)+"\""+
+                "}";
+
    string payload="{"+
    "\"symbol\":\""+JsonEscape(_Symbol)+"\","+
    "\"timeframe\":\""+JsonEscape(tf_label)+"\","+
@@ -474,14 +552,20 @@ void RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"price\":"+DoubleToString(price,_Digits)+","+
    "\"reason\":\""+JsonEscape(reason)+"\","+
    "\"instance\":\""+JsonEscape(AI_EA_Instance)+"\","+
-   "\"model_version\":\""+JsonEscape(AI_EA_Version)+"\"";
-   
+   "\"model_version\":\""+JsonEscape(AI_EA_Version)+"\","+
+   "\"entry_method\":\""+JsonEscape(ai.entry_method)+"\","+
+   "\"entry_params\":"+params+","+
+   "\"method_selected_by\":\""+JsonEscape(ai.method_selected_by)+"\","+
+   "\"method_confidence\":"+DoubleToString(ai.method_confidence,3)+","+
+   "\"method_reason\":\""+JsonEscape(ai.method_reason)+"\"";
+
    if(ticket>0){
       payload+=",\"order_ticket\":"+IntegerToString(ticket);
       if(entry_price>0) payload+=",\"entry_price\":"+DoubleToString(entry_price,_Digits);
    }
+   if(mark_filled){ payload+=",\"actual_result\":\"FILLED\""; }
    payload+="}";
-   
+
    string resp;
    if(!HttpPostJson(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000)){
       SafePrint("[AI_SIGNALS] Failed to record signal");
@@ -544,8 +628,38 @@ PendingPlan BuildPending(int dir,double atr,double ai_offset){
    return p;
 }
 
+// Breakout pending plan using recent swing with ATR offset
+PendingPlan BuildBreakout(int dir,double atr,double o){
+   PendingPlan p; p.type=0; if(atr<=0) return p;
+   int lookback=20; 
+   double slDist=atr*RiskATRmult, tpDist=slDist*RewardRR;
+   double off=atr*(o>0?o:0.2);
+   if(dir>0){
+      int idx=iHighest(_Symbol,TF_Entry,MODE_HIGH,lookback,1);
+      double swing=iHigh(_Symbol,TF_Entry,idx);
+      p.type=ORDER_TYPE_BUY_STOP; p.price=swing+off; p.sl=p.price-slDist; p.tp=p.price+tpDist;
+   }else if(dir<0){
+      int idx=iLowest(_Symbol,TF_Entry,MODE_LOW,lookback,1);
+      double swing=iLow(_Symbol,TF_Entry,idx);
+      p.type=ORDER_TYPE_SELL_STOP; p.price=swing-off; p.sl=p.price+slDist; p.tp=p.price-tpDist;
+   }
+   return p;
+}
+
+// Parse timeframe string to ENUM_TIMEFRAMES
+ENUM_TIMEFRAMES ParseTF(const string s){
+   if(s=="M1") return PERIOD_M1;
+   if(s=="M5") return PERIOD_M5;
+   if(s=="M15") return PERIOD_M15;
+   if(s=="M30") return PERIOD_M30;
+   if(s=="H1") return PERIOD_H1;
+   if(s=="H4") return PERIOD_H4;
+   if(s=="D1") return PERIOD_D1;
+   return PERIOD_M5;
+}
+
 bool OrderAlive(ulong t){if(t==0)return false;if(!OrderSelect(t))return false;long ty;OrderGetInteger(ORDER_TYPE,ty);
-   return(ty==ORDER_TYPE_BUY_LIMIT||ty==ORDER_TYPE_SELL_LIMIT);}
+   return(ty==ORDER_TYPE_BUY_LIMIT||ty==ORDER_TYPE_SELL_LIMIT||ty==ORDER_TYPE_BUY_STOP||ty==ORDER_TYPE_SELL_STOP);} 
 bool Expired(){return g_pendingTicket>0&&(TimeCurrent()-g_pendingAt)>(g_dynamicExpiryMin*60);}
 void Cancel(string why){if(g_pendingTicket==0)return;if(OrderSelect(g_pendingTicket)){
    trade.OrderDelete(g_pendingTicket);SafePrint("[ORDER] canceled: "+why);}
@@ -593,19 +707,63 @@ void OnM15NewBar()
          CancelSignal(g_pendingTicket,"replace");
          Cancel("replace");
       }
-      PendingPlan p=BuildPending(t.dir,t.atr,ai.offset_factor);
+      // expiry preference: minutes from AI or from bars*15
+      if(ai.expiry_min>0) g_dynamicExpiryMin=ai.expiry_min; else if(ai.expiry_bars>0) g_dynamicExpiryMin=ai.expiry_bars*15;
+
       trade.SetExpertMagicNumber(Magic);trade.SetDeviationInPoints(SlippagePoints);
-      if(p.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(Lots,p.price,_Symbol,p.sl,p.tp);
-      else trade.SellLimit(Lots,p.price,_Symbol,p.sl,p.tp);
-      g_pendingTicket=trade.ResultOrder();g_pendingAt=TimeCurrent();g_pendingDir=t.dir;
-      if(ai.expiry_min>0) g_dynamicExpiryMin=ai.expiry_min;
-      
-      // AI Signalを記録（ML学習用）
-      RecordSignal("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,g_pendingTicket,0);
-      
-      // ea-logに詳細記録
-      LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"EXECUTED",threshold_met,posCount,g_pendingTicket);
-      SafePrint(StringFormat("[M15] set dir=%d prob=%.0f%%",t.dir,ai.win_prob*100));
+
+   string method=ai.entry_method;
+      ulong placed_ticket=0; bool executed=false;
+      if(method=="breakout"){
+         PendingPlan pbo=BuildBreakout(t.dir,t.atr,(ai.o>0?ai.o:ai.offset_factor));
+         if(pbo.type==ORDER_TYPE_BUY_STOP) trade.BuyStop(Lots,pbo.price,_Symbol,pbo.sl,pbo.tp);
+         else if(pbo.type==ORDER_TYPE_SELL_STOP) trade.SellStop(Lots,pbo.price,_Symbol,pbo.sl,pbo.tp);
+         placed_ticket=trade.ResultOrder(); executed=(placed_ticket>0);
+      }else if(method=="mtf_confirm"){
+         ENUM_TIMEFRAMES ctf=ParseTF(ai.confirm_tf);
+         bool confirmed=true;
+         if(ai.confirm_rule=="macd_flip"){
+            double mm,ms,mh; if(GetMACD(ctf,mm,ms,mh,0)) confirmed=(t.dir>0? (mm>ms):(mm<ms));
+         }else if(ai.confirm_rule=="close_break"){
+            double ma20=MA(ctf,20,MODE_SMA,PRICE_CLOSE,0); double close0=iClose(_Symbol,ctf,0);
+            confirmed=(t.dir>0? (close0>ma20):(close0<ma20));
+         }
+         if(!confirmed){
+            LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_MTF_WAIT",threshold_met,posCount,0);
+            SafePrint("[M15] mtf_confirm: waiting for confirmation");
+            return;
+         }
+         if(ai.order_type=="market"){
+            double slDist=t.atr*RiskATRmult, tpDist=slDist*RewardRR; bool ok=false; double entry=0.0; ulong posTicket=0;
+            double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID), ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+            if(t.dir>0){ ok=trade.Buy(Lots,_Symbol,0,ask-slDist,ask+tpDist); if(ok && PositionSelect(_Symbol)){posTicket=(ulong)PositionGetInteger(POSITION_TICKET); entry=PositionGetDouble(POSITION_PRICE_OPEN);} }
+            else{ ok=trade.Sell(Lots,_Symbol,0,bid+slDist,bid-tpDist); if(ok && PositionSelect(_Symbol)){posTicket=(ulong)PositionGetInteger(POSITION_TICKET); entry=PositionGetDouble(POSITION_PRICE_OPEN);} }
+            if(ok && posTicket>0){
+               RecordSignal("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,posTicket,entry,true);
+               LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"EXECUTED_MARKET",threshold_met,posCount,posTicket);
+               SafePrint(StringFormat("[M15] market executed dir=%d prob=%.0f%%",t.dir,ai.win_prob*100));
+               return;
+            }else{
+               SafePrint("[M15] market execution failed, fallback to pullback limit");
+            }
+         }
+         double k=(ai.k>0?ai.k:ai.offset_factor); PendingPlan pcf=BuildPending(t.dir,t.atr,k);
+         if(pcf.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(Lots,pcf.price,_Symbol,pcf.sl,pcf.tp); else trade.SellLimit(Lots,pcf.price,_Symbol,pcf.sl,pcf.tp);
+         placed_ticket=trade.ResultOrder(); executed=(placed_ticket>0);
+      }else{ // pullback or default
+         double k=(ai.k>0?ai.k:ai.offset_factor); PendingPlan p=BuildPending(t.dir,t.atr,k);
+         if(p.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(Lots,p.price,_Symbol,p.sl,p.tp); else trade.SellLimit(Lots,p.price,_Symbol,p.sl,p.tp);
+         placed_ticket=trade.ResultOrder(); executed=(placed_ticket>0);
+      }
+
+      if(executed){
+         g_pendingTicket=placed_ticket; g_pendingAt=TimeCurrent(); g_pendingDir=t.dir;
+         RecordSignal("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,g_pendingTicket,0);
+         LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"EXECUTED",threshold_met,posCount,g_pendingTicket);
+         SafePrint(StringFormat("[M15] set dir=%d prob=%.0f%%",t.dir,ai.win_prob*100));
+      }else{
+         SafePrint("[M15] order placement failed");
+      }
    }else{
       LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_LOW_PROB",threshold_met,posCount,0);
       SafePrint(StringFormat("[M15] skip prob=%.0f%% < thr=%.0f%%",ai.win_prob*100,MinWinProb*100));

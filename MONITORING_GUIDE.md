@@ -83,6 +83,39 @@ LIMIT 10;
 
 ---
 
+## entry_method の可視化（ハイブリッドエントリー）
+
+ハイブリッドエントリー導入により、AI が選択したエントリー手法が `ai_signals` に保存され、モニタリングにも表示されます。
+
+- 追加カラム（ai_signals）
+  - `entry_method`: pullback | breakout | mtf_confirm | none
+  - `entry_params` (jsonb): 例 `{ "k": 0.3, "o": 0.2, "expiry_bars": 2, "confirm_tf": "M5", "confirm_rule": "macd_flip", "order_type": "market" }`
+  - `method_selected_by`: OpenAI | Fallback
+  - `method_confidence`: 0.0–1.0
+  - `method_reason`: AI の説明
+
+- `monitor_trades.sh` の表示
+  - アクティブな注文/ポジションに対し `entry_method` が表示されます
+  - 直近24時間のメソッド別サマリー（件数・勝率など）を併記します
+
+運用の観点では、以下を定期確認してください。
+
+1) メソッド別の約定率（pullback で未約定が多すぎないか、breakout のダマシが多くないか）
+2) メソッド別の勝率と平均損益（相対的に突出したメソッドがあるか）
+3) `mtf_confirm` の確認ルール（macd_flip / close_break）で市場環境に合うほうに偏っていないか
+
+改善のヒント:
+
+- pullback の `k`（ATR 係数）や breakout の `o` は、銘柄やボラティリティに合わせて微調整するとフィル率/期待値が改善しやすいです
+- `mtf_confirm` の `order_type: market` はスリッページ影響が出やすいため、勝率/損益を見ながら LIMIT とのバランスを調整してください
+
+備考:
+
+- サーバログ（`ea-log`）にも `entry_method` と `method_*` が記録されるため、異常時の原因究明が容易です
+- `ai_signals` は学習用にも利用できるため、メソッド別の特徴量や結果を抽出して将来的な最適化に活用できます
+
+---
+
 ## 📈 統計クエリ
 
 ### 勝率分析（シンボル別）

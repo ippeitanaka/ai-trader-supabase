@@ -75,10 +75,14 @@ const ICHIMOKU_RANGES = [
 async function extractPatterns(): Promise<Pattern[]> {
   console.log("[ML] Starting pattern extraction...");
   
-  // 完結した取引データを取得
+  // 完結した取引データを取得（ビューではなく直接テーブルをクエリ）
   const { data: completeTrades, error } = await supabase
-    .from("ai_signals_training_complete")
+    .from("ai_signals")
     .select("*")
+    .in("actual_result", ["WIN", "LOSS"])
+    .not("exit_price", "is", null)
+    .not("profit_loss", "is", null)
+    .not("closed_at", "is", null)
     .order("created_at", { ascending: false });
   
   if (error || !completeTrades || completeTrades.length === 0) {

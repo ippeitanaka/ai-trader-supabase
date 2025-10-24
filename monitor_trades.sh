@@ -88,6 +88,7 @@ while true; do
       RPAD(symbol, 10) as sym,
       CASE WHEN dir = 1 THEN 'BUY' ELSE 'SELL' END as direction,
       LPAD(ROUND(win_prob * 100)::text || '%', 5) as prob,
+      COALESCE(entry_method, 'N/A') as method,
       order_ticket
     FROM ai_signals
     WHERE closed_at IS NULL
@@ -95,6 +96,26 @@ while true; do
     ORDER BY created_at DESC
     LIMIT 3;
   " 2>/dev/null || echo "  アクティブポジションなし"
+
+  echo ""
+  # 🧠 方式別統計 (24時間)
+  echo -e "${YELLOW}━━━ 🧠 方式別統計 (24時間) ━━━${NC}"
+  docker exec supabase_db_ai-trader-supabase psql -U postgres -t -c "
+    SELECT 
+      COALESCE(entry_method, 'N/A') as method,
+      COUNT(*) as signals,
+      SUM(CASE WHEN actual_result = 'WIN' THEN 1 ELSE 0 END) as wins,
+      ROUND(
+        SUM(CASE WHEN actual_result = 'WIN' THEN 1 ELSE 0 END)::DECIMAL / 
+        NULLIF(SUM(CASE WHEN actual_result IN ('WIN','LOSS') THEN 1 ELSE 0 END), 0) * 100,
+        1
+      ) as win_rate
+    FROM ai_signals
+    WHERE created_at >= NOW() - INTERVAL '24 hours'
+    GROUP BY COALESCE(entry_method, 'N/A')
+    ORDER BY signals DESC
+    LIMIT 6;
+  " 2>/dev/null || echo "  方式別統計なし"
   
   echo ""
   echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
