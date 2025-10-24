@@ -167,14 +167,14 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
   // 十分な学習データが蓄積されるまで、テクニカル指標のみで判断
   // TODO: ai_signalsが100件以上溜まったらML参照を再開する
   
-  const ENABLE_ML_LEARNING = false; // 学習データ収集フェーズ中はfalse
+  const ENABLE_ML_LEARNING = true; // ✅ ML学習を有効化（慎重な設定）
   
   let matchedPatterns: any[] = [];
   let recommendations: any[] = [];
   let historicalTrades: any[] = [];
   
   if (ENABLE_ML_LEARNING) {
-    // 1. ML学習済みパターンをTOP3まで取得
+    // 1. ML学習済みパターンをTOP3まで取得（厳格な条件）
     const { data: patterns } = await supabase
       .from("ml_patterns")
       .select("*")
@@ -184,7 +184,8 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
       .eq("is_active", true)
       .gte("rsi_max", rsi)
       .lte("rsi_min", rsi)
-      .gte("total_trades", 5) // 最低サンプル数
+      .gte("total_trades", 10) // 最低サンプル数を10に厳格化
+      .gte("confidence_score", 0.5) // 信頼度50%以上のみ
       .order("confidence_score", { ascending: false })
       .limit(3);
     matchedPatterns = patterns || [];
@@ -230,16 +231,16 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
       mlContext += `\n• 信頼度スコア: ${(pattern.confidence_score * 100).toFixed(1)}%`;
       mlContext += `\n• サンプル数: ${pattern.sample_size_adequate ? "✅ 十分" : "⚠️ 不足"}`;
       
-      // 最も信頼できるパターンで勝率調整
+      // 最も信頼できるパターンで勝率調整（控えめ設定）
       if (index === 0) {
         if (pattern.win_rate >= 0.75 && pattern.sample_size_adequate) {
-          mlWinRateBoost = +0.08; // 高勝率パターン（強化）
+          mlWinRateBoost = +0.05; // 高勝率パターン（+5%に抑える）
         } else if (pattern.win_rate >= 0.65 && pattern.sample_size_adequate) {
-          mlWinRateBoost = +0.03; // 中程度の勝率
+          mlWinRateBoost = +0.02; // 中程度の勝率（+2%）
         } else if (pattern.win_rate < 0.50 && pattern.sample_size_adequate) {
-          mlWinRateBoost = -0.12; // 低勝率パターン（強く抑制）
+          mlWinRateBoost = -0.08; // 低勝率パターン（-8%に抑える）
         } else if (pattern.win_rate < 0.45) {
-          mlWinRateBoost = -0.18; // 極めて低い勝率（非常に強く抑制）
+          mlWinRateBoost = -0.12; // 極めて低い勝率（-12%に抑える）
         }
       }
     });
