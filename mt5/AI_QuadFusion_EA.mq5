@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
-//| AI_QuadFusion_EA.mq5  (ver 1.4.0)                                |
-//| - Supabase: ai-config / ai-signals(AI側) / ea-log                |
+//| AI_QuadFusion_EA.mq5  (ver 1.5.1)                                |
+//| - Supabase: ai-signals(AI側) / ea-log                            |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
 //| - Fix: ポジション約定後の重複ログ出力を修正                      |
@@ -10,6 +10,10 @@
 //| - v1.4.0: 全テクニカル指標の生データをAIに送信、真のQuadFusion実装|
 //|          MACD追加、AI側で独自に4指標評価（トレンド・モメンタム    |
 //|          ・ボラティリティ・一目）、EA判断は参考情報に             |
+//| - v1.5.0: 動的ロット倍率システム実装 (ML学習データに基づく1-3倍) |
+//|          Level 1-4の4段階評価で高勝率パターンは自動的にロット増加|
+//| - v1.5.1: 🔧 重複ポジション完全防止パッチ（レースコンディション対策）|
+//|          ペンディングオーダーもカウント、追跡中ポジション二重チェック|
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -26,6 +30,7 @@ input double RewardRR            = 1.2;
 input double PendingOffsetATR    = 0.2;
 input int    PendingExpiryMin    = 90;
 input double Lots                = 0.10;
+input double MaxLots             = 0.30;  // ロット倍率適用時の最大値（リスク管理）
 input int    SlippagePoints      = 1000;
 input long   Magic               = 26091501;
 input int    MaxPositions        = 1;      // 同一銘柄の最大ポジション数
@@ -37,13 +42,12 @@ input int    CooldownAfterCloseMin = 30; // TP/SL後のクールダウン（分�
 // ★ URLは自分のプロジェクトに合わせて設定
 input string AI_Endpoint_URL     = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-trader";
 input string EA_Log_URL          = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ea-log";
-input string AI_Config_URL       = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-config";
 input string AI_Signals_URL      = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals";
 input string AI_Signals_Update_URL = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals-update";
 input string AI_Bearer_Token     = "YOUR_SERVICE_ROLE_KEY_HERE";
 
 input string AI_EA_Instance      = "main";
-input string AI_EA_Version       = "1.4.0";
+input string AI_EA_Version       = "1.5.1";
 input int    AI_Timeout_ms       = 5000;
 
 // ===== 一目均衡表設定 =====
@@ -346,6 +350,15 @@ struct AIOut{
    string confirm_tf;            // e.g. M5
    string confirm_rule;          // close_break|macd_flip
    string order_type;            // market|limit
+   // 動的ロット倍率（ML学習データに基づく）
+   double lot_multiplier;        // 1.0-3.0x (Level 1-4)
+   string lot_level;             // Level説明
+   string lot_reason;            // 倍率の理由
+   // ML pattern tracking
+   bool   ml_pattern_used;       // MLパターンが使用されたか
+   long   ml_pattern_id;         // パターンID
+   string ml_pattern_name;       // パターン名
+   double ml_pattern_confidence; // パターン信頼度 (%)
 };
 bool ExtractJsonNumber(const string json,const string key,double &out){
    string pat="\""+key+"\":";int pos=StringFind(json,pat);if(pos<0)return false;
@@ -354,6 +367,15 @@ bool ExtractJsonNumber(const string json,const string key,double &out){
       if((c>='0'&&c<='9')||c=='-'||c=='+'||c=='.'||c=='e'||c=='E') end++; else break;}
    string num=StringSubstr(json,pos,end-pos);out=StringToDouble(num);return true;}
 bool ExtractJsonInt(const string json,const string key,int &out){double d;if(!ExtractJsonNumber(json,key,d))return false;out=(int)MathRound(d);return true;}
+bool ExtractJsonBool(const string json,const string key,bool &out){
+   string pat="\""+key+"\":";int pos=StringFind(json,pat);if(pos<0)return false;
+   pos+=StringLen(pat);
+   // Skip whitespace
+   while(pos<StringLen(json) && (StringGetCharacter(json,pos)==' '||StringGetCharacter(json,pos)=='\t')) pos++;
+   // Check for "true" or "false"
+   if(StringSubstr(json,pos,4)=="true"){out=true;return true;}
+   if(StringSubstr(json,pos,5)=="false"){out=false;return true;}
+   return false;}
 bool ExtractJsonString(const string json,const string key,string &out){
    string pat="\""+key+"\":\"";int pos=StringFind(json,pat);if(pos<0)return false;
    pos+=StringLen(pat);int end=pos;while(end<StringLen(json)){
@@ -406,6 +428,8 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    ENUM_TIMEFRAMES tf=(tf_label=="M15")?TF_Entry:TF_Recheck;
    double ema_25=MA(tf,25,MODE_EMA,PRICE_CLOSE,0);
    double sma_100=MA(tf,100,MODE_SMA,PRICE_CLOSE,0);
+   double sma_200=MA(tf,200,MODE_SMA,PRICE_CLOSE,0);
+   double sma_800=MA(tf,800,MODE_SMA,PRICE_CLOSE,0);
    
    // MACD取得
    double macd_main,macd_signal,macd_hist;
@@ -432,6 +456,8 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    // 移動平均線（生データ）
    "\"ema_25\":"+DoubleToString(ema_25,_Digits)+","+
    "\"sma_100\":"+DoubleToString(sma_100,_Digits)+","+
+   "\"sma_200\":"+DoubleToString(sma_200,_Digits)+","+
+   "\"sma_800\":"+DoubleToString(sma_800,_Digits)+","+
    "\"ma_cross\":"+(ema_25>sma_100?"1":"-1")+","+
    
    // RSI & ATR
@@ -495,6 +521,17 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
       if(ExtractJsonInSectionString(paramsSec,"confirm_rule",s)) out_ai.confirm_rule=s;
       if(ExtractJsonInSectionString(paramsSec,"order_type",s)) out_ai.order_type=s;
    }
+   
+   // ロット倍率（ML学習データに基づく）
+   double lm; if(ExtractJsonNumber(resp,"lot_multiplier",lm)) out_ai.lot_multiplier=lm; else out_ai.lot_multiplier=1.0;
+   ExtractJsonString(resp,"lot_level",out_ai.lot_level);
+   ExtractJsonString(resp,"lot_reason",out_ai.lot_reason);
+   
+   // ML pattern tracking
+   if(!ExtractJsonBool(resp,"ml_pattern_used",out_ai.ml_pattern_used)) out_ai.ml_pattern_used=false;
+   int mlId=0; if(ExtractJsonInt(resp,"ml_pattern_id",mlId)) out_ai.ml_pattern_id=(long)mlId; else out_ai.ml_pattern_id=0;
+   ExtractJsonString(resp,"ml_pattern_name",out_ai.ml_pattern_name);
+   double mlConf; if(ExtractJsonNumber(resp,"ml_pattern_confidence",mlConf)) out_ai.ml_pattern_confidence=mlConf; else out_ai.ml_pattern_confidence=0.0;
 
    return true;
 }
@@ -557,7 +594,11 @@ void RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"entry_params\":"+params+","+
    "\"method_selected_by\":\""+JsonEscape(ai.method_selected_by)+"\","+
    "\"method_confidence\":"+DoubleToString(ai.method_confidence,3)+","+
-   "\"method_reason\":\""+JsonEscape(ai.method_reason)+"\"";
+   "\"method_reason\":\""+JsonEscape(ai.method_reason)+"\","+
+   "\"ml_pattern_used\":"+(ai.ml_pattern_used?"true":"false")+","+
+   "\"ml_pattern_id\":"+(ai.ml_pattern_id>0?IntegerToString(ai.ml_pattern_id):"null")+","+
+   "\"ml_pattern_name\":\""+(ai.ml_pattern_name!=""?JsonEscape(ai.ml_pattern_name):"null")+"\","+
+   "\"ml_pattern_confidence\":"+(ai.ml_pattern_confidence>0?DoubleToString(ai.ml_pattern_confidence,2):"null")+"";
 
    if(ticket>0){
       payload+=",\"order_ticket\":"+IntegerToString(ticket);
@@ -605,15 +646,6 @@ void CancelSignal(ulong ticket,const string reason)
    
    string resp;
    HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000);
-}
-
-// ===== 設定同期（無効化：すべてEAプロパティから取得） =====
-void SyncConfig()
-{
-   // ai_configテーブルの使用を中止
-   // すべてのパラメータはEAのinputプロパティから取得します
-   SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Offset=%.2f, Expiry=%d, Lots=%.2f, Slip=%d, MaxPos=%d",
-      MinWinProb*100,RiskATRmult,RewardRR,PendingOffsetATR,PendingExpiryMin,Lots,SlippagePoints,MaxPositions));
 }
 
 // ===== 注文関連 =====
@@ -665,10 +697,12 @@ void Cancel(string why){if(g_pendingTicket==0)return;if(OrderSelect(g_pendingTic
    trade.OrderDelete(g_pendingTicket);SafePrint("[ORDER] canceled: "+why);}
    g_pendingTicket=0;g_pendingDir=0;g_pendingAt=0;}
 
-// ポジション数チェック
+// ポジション数チェック（アクティブポジション + ペンディングオーダー）
 int CountPositions()
 {
    int count=0;
+   
+   // アクティブポジションをカウント
    for(int i=PositionsTotal()-1;i>=0;i--)
    {
       ulong ticket=PositionGetTicket(i);
@@ -677,6 +711,26 @@ int CountPositions()
       if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
       count++;
    }
+   
+   // ペンディングオーダーもカウント（約定待ちも含める）
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      ulong ticket=OrderGetTicket(i);
+      if(ticket<=0) continue;
+      if(OrderGetString(ORDER_SYMBOL)!=_Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC)!=Magic) continue;
+      
+      // ペンディングオーダーのみ（約定待ち）
+      long order_type=OrderGetInteger(ORDER_TYPE);
+      if(order_type==ORDER_TYPE_BUY_LIMIT || 
+         order_type==ORDER_TYPE_SELL_LIMIT ||
+         order_type==ORDER_TYPE_BUY_STOP || 
+         order_type==ORDER_TYPE_SELL_STOP)
+      {
+         count++;
+      }
+   }
+   
    return count;
 }
 
@@ -696,10 +750,17 @@ void OnM15NewBar()
    bool threshold_met=(ai.win_prob>=MinWinProb);
    
    if(threshold_met){
-      // ポジション数チェック
+      // ポジション数チェック（ペンディングオーダー含む）
       if(posCount>=MaxPositions){
          LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_MAX_POS",threshold_met,posCount,0);
-         SafePrint(StringFormat("[M15] skip: already %d position(s)",posCount));
+         SafePrint(StringFormat("[M15] skip: already %d position(s) or pending order(s)",posCount));
+         return;
+      }
+      
+      // 追跡中のポジションがある場合も新規注文しない（約定直後の重複防止）
+      if(g_trackedPositionTicket>0 && PositionSelectByTicket(g_trackedPositionTicket)){
+         LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_TRACKED_POS",threshold_met,1,g_trackedPositionTicket);
+         SafePrint(StringFormat("[M15] skip: tracked position active (ticket=%d)",g_trackedPositionTicket));
          return;
       }
       
@@ -733,26 +794,45 @@ void OnM15NewBar()
             SafePrint("[M15] mtf_confirm: waiting for confirmation");
             return;
          }
+         // ⭐ ML学習データに基づくロット倍率を適用（最大値制限あり）
+         double finalLots = MathMin(Lots * ai.lot_multiplier, MaxLots);
+         if(ai.lot_multiplier > 1.0){
+            SafePrint(StringFormat("[M15] Dynamic Lot Sizing: %.2fx (%.2f → %.2f) - %s",
+                      ai.lot_multiplier, Lots, finalLots, ai.lot_level));
+         }
+         
          if(ai.order_type=="market"){
             double slDist=t.atr*RiskATRmult, tpDist=slDist*RewardRR; bool ok=false; double entry=0.0; ulong posTicket=0;
             double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID), ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-            if(t.dir>0){ ok=trade.Buy(Lots,_Symbol,0,ask-slDist,ask+tpDist); if(ok && PositionSelect(_Symbol)){posTicket=(ulong)PositionGetInteger(POSITION_TICKET); entry=PositionGetDouble(POSITION_PRICE_OPEN);} }
-            else{ ok=trade.Sell(Lots,_Symbol,0,bid+slDist,bid-tpDist); if(ok && PositionSelect(_Symbol)){posTicket=(ulong)PositionGetInteger(POSITION_TICKET); entry=PositionGetDouble(POSITION_PRICE_OPEN);} }
+            if(t.dir>0){ ok=trade.Buy(finalLots,_Symbol,0,ask-slDist,ask+tpDist); if(ok && PositionSelect(_Symbol)){posTicket=(ulong)PositionGetInteger(POSITION_TICKET); entry=PositionGetDouble(POSITION_PRICE_OPEN);} }
+            else{ ok=trade.Sell(finalLots,_Symbol,0,bid+slDist,bid-tpDist); if(ok && PositionSelect(_Symbol)){posTicket=(ulong)PositionGetInteger(POSITION_TICKET); entry=PositionGetDouble(POSITION_PRICE_OPEN);} }
             if(ok && posTicket>0){
+               // Market注文が成功したら即座に追跡開始（重複防止）
+               g_trackedPositionTicket=posTicket;
+               g_trackedPositionOpenTime=(datetime)PositionGetInteger(POSITION_TIME);
+               g_trackedPositionEntryPrice=entry;
+               
                RecordSignal("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,posTicket,entry,true);
                LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"EXECUTED_MARKET",threshold_met,posCount,posTicket);
-               SafePrint(StringFormat("[M15] market executed dir=%d prob=%.0f%%",t.dir,ai.win_prob*100));
+               SafePrint(StringFormat("[M15] market executed dir=%d prob=%.0f%% lot=%.2f",t.dir,ai.win_prob*100,finalLots));
                return;
             }else{
                SafePrint("[M15] market execution failed, fallback to pullback limit");
             }
          }
          double k=(ai.k>0?ai.k:ai.offset_factor); PendingPlan pcf=BuildPending(t.dir,t.atr,k);
-         if(pcf.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(Lots,pcf.price,_Symbol,pcf.sl,pcf.tp); else trade.SellLimit(Lots,pcf.price,_Symbol,pcf.sl,pcf.tp);
+         if(pcf.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(finalLots,pcf.price,_Symbol,pcf.sl,pcf.tp); else trade.SellLimit(finalLots,pcf.price,_Symbol,pcf.sl,pcf.tp);
          placed_ticket=trade.ResultOrder(); executed=(placed_ticket>0);
       }else{ // pullback or default
+         // ⭐ ML学習データに基づくロット倍率を適用（最大値制限あり）
+         double finalLots = MathMin(Lots * ai.lot_multiplier, MaxLots);
+         if(ai.lot_multiplier > 1.0){
+            SafePrint(StringFormat("[M15] Dynamic Lot Sizing: %.2fx (%.2f → %.2f) - %s",
+                      ai.lot_multiplier, Lots, finalLots, ai.lot_level));
+         }
+         
          double k=(ai.k>0?ai.k:ai.offset_factor); PendingPlan p=BuildPending(t.dir,t.atr,k);
-         if(p.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(Lots,p.price,_Symbol,p.sl,p.tp); else trade.SellLimit(Lots,p.price,_Symbol,p.sl,p.tp);
+         if(p.type==ORDER_TYPE_BUY_LIMIT) trade.BuyLimit(finalLots,p.price,_Symbol,p.sl,p.tp); else trade.SellLimit(finalLots,p.price,_Symbol,p.sl,p.tp);
          placed_ticket=trade.ResultOrder(); executed=(placed_ticket>0);
       }
 
@@ -777,7 +857,7 @@ void OnH1NewBar()
       SafePrint(StringFormat("[H1] cooldown active for %d sec",(int)(g_cooldownUntil-TimeCurrent())));
       return;
    }
-   // SyncConfig()は無効化：すべてEAプロパティを使用
+   
    if(g_pendingTicket==0)return;
    if(!OrderAlive(g_pendingTicket)){Cancel("filled");return;}
    if(Expired()){
@@ -838,7 +918,7 @@ void CheckPositionStatus()
             int total=HistoryDealsTotal();
             for(int i=total-1;i>=0;i--){
                ulong dealTicket=HistoryDealGetTicket(i);
-               if(dealTicket>0 && HistoryDealGetInteger(dealTicket,DEAL_POSITION_ID)==g_trackedPositionTicket){
+               if(dealTicket>0 && (ulong)HistoryDealGetInteger(dealTicket,DEAL_POSITION_ID)==g_trackedPositionTicket){
                   if(HistoryDealGetInteger(dealTicket,DEAL_ENTRY)==DEAL_ENTRY_OUT){
                      double exit_price=HistoryDealGetDouble(dealTicket,DEAL_PRICE);
                      double profit=HistoryDealGetDouble(dealTicket,DEAL_PROFIT);
@@ -875,10 +955,11 @@ void CheckPositionStatus()
 // ===== メイン =====
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
-   SafePrint("[INIT] EA 1.4.0 start (Quad Fusion with full technical data to AI)");
+   SafePrint("[INIT] EA 1.5.1 start (Quad Fusion with full technical data to AI + Race Condition Fix)");
    SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",
       MinWinProb*100,RiskATRmult,RewardRR,Lots,MaxPositions));
-   SafePrint("[INFO] Sending EMA25, SMA100, MACD, RSI, ATR, Ichimoku (all lines) to AI");
+   SafePrint("[INFO] Sending EMA25, SMA100, SMA200, SMA800, MACD, RSI, ATR, Ichimoku (all lines) to AI");
+   SafePrint("[FIX] v1.5.1: Enhanced duplicate position prevention (pending orders + tracked positions)");
    return(INIT_SUCCEEDED);
 }
 void OnTick()
