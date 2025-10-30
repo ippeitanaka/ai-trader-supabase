@@ -63,13 +63,28 @@ const RSI_RANGES = [
   { name: "overbought", min: 70, max: 100 },
 ];
 
-// 一目均衡表スコアレンジ
-const ICHIMOKU_RANGES = [
-  { name: "conflicting", min: -1, max: 0.1 },
-  { name: "weak", min: 0.1, max: 0.4 },
-  { name: "moderate", min: 0.4, max: 0.6 },
-  { name: "good", min: 0.6, max: 0.9 },
-  { name: "excellent", min: 0.9, max: 1.1 },
+// MACDクロス状態
+const MACD_CROSS_STATES = [
+  { name: "bullish", value: 1 },
+  { name: "bearish", value: -1 },
+];
+
+// 一目均衡表TKクロス状態
+const ICHIMOKU_TK_CROSS_STATES = [
+  { name: "bullish_tk", value: 1 },
+  { name: "bearish_tk", value: -1 },
+];
+
+// 一目均衡表雲の状態
+const ICHIMOKU_CLOUD_STATES = [
+  { name: "bullish_cloud", value: 1 },
+  { name: "bearish_cloud", value: -1 },
+];
+
+// 移動平均クロス状態
+const MA_CROSS_STATES = [
+  { name: "bullish_ma", value: 1 },
+  { name: "bearish_ma", value: -1 },
 ];
 
 async function extractPatterns(): Promise<Pattern[]> {
@@ -231,8 +246,219 @@ async function extractPatterns(): Promise<Pattern[]> {
     }
   }
   
-  console.log(`[ML] Extracted ${patterns.length} patterns`);
+  console.log(`[ML] Extracted ${patterns.length} basic patterns`);
+  
+  // 複合パターン発見（MACD x RSI, 一目 x RSI, MA x RSI など）
+  const compositePatterns = await extractCompositePatterns(completeTrades);
+  patterns.push(...compositePatterns);
+  
+  console.log(`[ML] Total patterns (including composite): ${patterns.length}`);
   return patterns;
+}
+
+// 複合パターン発見関数
+async function extractCompositePatterns(completeTrades: any[]): Promise<Pattern[]> {
+  const patterns: Pattern[] = [];
+  
+  console.log(`[ML] Extracting composite patterns from ${completeTrades.length} trades...`);
+  
+  // 銘柄・時間軸・方向ごとにグループ化
+  const groupedTrades = new Map<string, any[]>();
+  
+  for (const trade of completeTrades) {
+    const key = `${trade.symbol}_${trade.timeframe}_${trade.dir}`;
+    if (!groupedTrades.has(key)) {
+      groupedTrades.set(key, []);
+    }
+    groupedTrades.get(key)!.push(trade);
+  }
+  
+  for (const [groupKey, trades] of groupedTrades.entries()) {
+    const [symbol, timeframe, dirStr] = groupKey.split("_");
+    const direction = parseInt(dirStr);
+    
+    if (trades.length < 5) continue; // 複合パターンは最低5件必要
+    
+    // 1. MACDクロス x RSI パターン
+    for (const macdState of MACD_CROSS_STATES) {
+      for (const rsiRange of RSI_RANGES) {
+        const matchingTrades = trades.filter(
+          (t) => t.macd_cross === macdState.value &&
+                 t.rsi >= rsiRange.min && t.rsi < rsiRange.max
+        );
+        
+        if (matchingTrades.length >= 3) {
+          const pattern = calculatePatternStats(
+            matchingTrades,
+            `${symbol}_${timeframe}_${direction > 0 ? "BUY" : "SELL"}_MACD_${macdState.name}_RSI_${rsiRange.name}`,
+            "composite_macd_rsi",
+            symbol,
+            timeframe,
+            direction,
+            rsiRange.min,
+            rsiRange.max
+          );
+          if (pattern) patterns.push(pattern);
+        }
+      }
+    }
+    
+    // 2. 一目TKクロス x RSI パターン
+    for (const ichimokuTK of ICHIMOKU_TK_CROSS_STATES) {
+      for (const rsiRange of RSI_RANGES) {
+        const matchingTrades = trades.filter(
+          (t) => t.ichimoku_tk_cross === ichimokuTK.value &&
+                 t.rsi >= rsiRange.min && t.rsi < rsiRange.max
+        );
+        
+        if (matchingTrades.length >= 3) {
+          const pattern = calculatePatternStats(
+            matchingTrades,
+            `${symbol}_${timeframe}_${direction > 0 ? "BUY" : "SELL"}_ICHIMOKU_TK_${ichimokuTK.name}_RSI_${rsiRange.name}`,
+            "composite_ichimoku_rsi",
+            symbol,
+            timeframe,
+            direction,
+            rsiRange.min,
+            rsiRange.max
+          );
+          if (pattern) patterns.push(pattern);
+        }
+      }
+    }
+    
+    // 3. 一目雲 x MACDクロス パターン
+    for (const cloudState of ICHIMOKU_CLOUD_STATES) {
+      for (const macdState of MACD_CROSS_STATES) {
+        const matchingTrades = trades.filter(
+          (t) => t.ichimoku_cloud_color === cloudState.value &&
+                 t.macd_cross === macdState.value
+        );
+        
+        if (matchingTrades.length >= 3) {
+          const pattern = calculatePatternStats(
+            matchingTrades,
+            `${symbol}_${timeframe}_${direction > 0 ? "BUY" : "SELL"}_CLOUD_${cloudState.name}_MACD_${macdState.name}`,
+            "composite_ichimoku_macd",
+            symbol,
+            timeframe,
+            direction,
+            0,
+            100
+          );
+          if (pattern) patterns.push(pattern);
+        }
+      }
+    }
+    
+    // 4. 移動平均クロス x RSI パターン
+    for (const maState of MA_CROSS_STATES) {
+      for (const rsiRange of RSI_RANGES) {
+        const matchingTrades = trades.filter(
+          (t) => t.ma_cross === maState.value &&
+                 t.rsi >= rsiRange.min && t.rsi < rsiRange.max
+        );
+        
+        if (matchingTrades.length >= 3) {
+          const pattern = calculatePatternStats(
+            matchingTrades,
+            `${symbol}_${timeframe}_${direction > 0 ? "BUY" : "SELL"}_MA_${maState.name}_RSI_${rsiRange.name}`,
+            "composite_ma_rsi",
+            symbol,
+            timeframe,
+            direction,
+            rsiRange.min,
+            rsiRange.max
+          );
+          if (pattern) patterns.push(pattern);
+        }
+      }
+    }
+    
+    // 5. トリプル確認パターン（MACD + 一目 + MA）
+    for (const macdState of MACD_CROSS_STATES) {
+      for (const ichimokuTK of ICHIMOKU_TK_CROSS_STATES) {
+        for (const maState of MA_CROSS_STATES) {
+          const matchingTrades = trades.filter(
+            (t) => t.macd_cross === macdState.value &&
+                   t.ichimoku_tk_cross === ichimokuTK.value &&
+                   t.ma_cross === maState.value
+          );
+          
+          if (matchingTrades.length >= 3) {
+            const pattern = calculatePatternStats(
+              matchingTrades,
+              `${symbol}_${timeframe}_${direction > 0 ? "BUY" : "SELL"}_TRIPLE_${macdState.name}_${ichimokuTK.name}_${maState.name}`,
+              "composite_triple_confirm",
+              symbol,
+              timeframe,
+              direction,
+              0,
+              100
+            );
+            if (pattern) patterns.push(pattern);
+          }
+        }
+      }
+    }
+  }
+  
+  console.log(`[ML] Extracted ${patterns.length} composite patterns`);
+  return patterns;
+}
+
+// パターン統計計算ヘルパー関数
+function calculatePatternStats(
+  matchingTrades: any[],
+  patternName: string,
+  patternType: string,
+  symbol: string,
+  timeframe: string,
+  direction: number,
+  rsiMin: number,
+  rsiMax: number
+): Pattern | null {
+  if (matchingTrades.length < 3) return null;
+  
+  const winCount = matchingTrades.filter((t) => t.actual_result === "WIN").length;
+  const lossCount = matchingTrades.filter((t) => t.actual_result === "LOSS").length;
+  const winRate = winCount / matchingTrades.length;
+  
+  const profits = matchingTrades
+    .filter((t) => t.actual_result === "WIN")
+    .map((t) => t.profit_loss || 0);
+  const losses = matchingTrades
+    .filter((t) => t.actual_result === "LOSS")
+    .map((t) => Math.abs(t.profit_loss || 0));
+  
+  const avgProfit = profits.length > 0 ? profits.reduce((a, b) => a + b, 0) / profits.length : 0;
+  const avgLoss = losses.length > 0 ? losses.reduce((a, b) => a + b, 0) / losses.length : 0;
+  const profitFactor = avgLoss > 0 ? avgProfit / avgLoss : 0;
+  
+  // 信頼度スコア計算（複合パターンは要求基準を高める）
+  const sampleSizeScore = Math.min(matchingTrades.length / 15, 1); // 15件以上で満点
+  const winRateScore = winRate;
+  const profitFactorScore = Math.min(profitFactor / 2.5, 1); // 2.5以上で満点
+  const confidenceScore = (sampleSizeScore * 0.3 + winRateScore * 0.5 + profitFactorScore * 0.2);
+  
+  return {
+    pattern_name: patternName,
+    pattern_type: patternType,
+    symbol,
+    timeframe,
+    direction,
+    rsi_min: rsiMin,
+    rsi_max: rsiMax,
+    total_trades: matchingTrades.length,
+    win_count: winCount,
+    loss_count: lossCount,
+    win_rate: Math.round(winRate * 1000) / 1000,
+    avg_profit: Math.round(avgProfit * 100) / 100,
+    avg_loss: Math.round(avgLoss * 100) / 100,
+    profit_factor: Math.round(profitFactor * 100) / 100,
+    confidence_score: Math.round(confidenceScore * 1000) / 1000,
+    sample_size_adequate: matchingTrades.length >= 5,
+  };
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

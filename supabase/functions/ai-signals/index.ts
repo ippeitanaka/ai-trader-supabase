@@ -17,12 +17,44 @@ interface AISignalEntry {
   reason?: string;
   instance?: string;
   model_version?: string;
+  
+  // 価格情報
+  bid?: number;
+  ask?: number;
+  
+  // 移動平均線
+  ema_25?: number;
+  sma_100?: number;
+  ma_cross?: number; // 1=bullish, -1=bearish
+  
+  // MACD指標
+  macd_main?: number;
+  macd_signal?: number;
+  macd_histogram?: number;
+  macd_cross?: number; // 1=bullish, -1=bearish
+  
+  // 一目均衡表
+  ichimoku_tenkan?: number;
+  ichimoku_kijun?: number;
+  ichimoku_senkou_a?: number;
+  ichimoku_senkou_b?: number;
+  ichimoku_chikou?: number;
+  ichimoku_tk_cross?: number; // 1=tenkan>kijun, -1=tenkan<kijun
+  ichimoku_cloud_color?: number; // 1=bullish, -1=bearish
+  ichimoku_price_vs_cloud?: number; // 1=above, -1=below, 0=in
+  
   // エントリー手法情報（任意）
   entry_method?: string | null; // 'pullback' | 'breakout' | 'mtf_confirm' | 'none'
   entry_params?: any | null;    // JSON パラメータ（k, o, expiry_bars など）
   method_selected_by?: string | null; // 'OpenAI' | 'Fallback' | 'Manual'
   method_confidence?: number | null;  // 0.0 - 1.0
   method_reason?: string | null;
+  
+  // ML pattern tracking
+  ml_pattern_used?: boolean | null;
+  ml_pattern_id?: number | null;
+  ml_pattern_name?: string | null;
+  ml_pattern_confidence?: number | null;
   
   // 注文情報
   order_ticket?: number;
@@ -69,6 +101,33 @@ serve(async (req: Request) => {
         reason: body.reason,
         instance: body.instance,
         model_version: body.model_version,
+        
+        // 価格情報
+        bid: body.bid,
+        ask: body.ask,
+        
+        // 移動平均線
+        ema_25: body.ema_25,
+        sma_100: body.sma_100,
+        ma_cross: body.ma_cross,
+        
+        // MACD指標（ネストされたオブジェクトから抽出）
+        macd_main: body.macd?.main,
+        macd_signal: body.macd?.signal,
+        macd_histogram: body.macd?.histogram,
+        macd_cross: body.macd?.cross,
+        
+        // 一目均衡表（ネストされたオブジェクトから抽出）
+        ichimoku_tenkan: body.ichimoku?.tenkan,
+        ichimoku_kijun: body.ichimoku?.kijun,
+        ichimoku_senkou_a: body.ichimoku?.senkou_a,
+        ichimoku_senkou_b: body.ichimoku?.senkou_b,
+        ichimoku_chikou: body.ichimoku?.chikou,
+        ichimoku_tk_cross: body.ichimoku?.tk_cross,
+        ichimoku_cloud_color: body.ichimoku?.cloud_color,
+        ichimoku_price_vs_cloud: body.ichimoku?.price_vs_cloud,
+        
+        // エントリー手法
         order_ticket: body.order_ticket,
         entry_price: body.entry_price,
         entry_method: body.entry_method ?? null,
@@ -76,6 +135,13 @@ serve(async (req: Request) => {
         method_selected_by: body.method_selected_by ?? null,
         method_confidence: body.method_confidence ?? null,
         method_reason: body.method_reason ?? null,
+        
+        // MLパターントラッキング
+        ml_pattern_used: body.ml_pattern_used ?? false,
+        ml_pattern_id: body.ml_pattern_id ?? null,
+        ml_pattern_name: body.ml_pattern_name ?? null,
+        ml_pattern_confidence: body.ml_pattern_confidence ?? null,
+        
         actual_result: body.actual_result || 'PENDING',
       };
 
