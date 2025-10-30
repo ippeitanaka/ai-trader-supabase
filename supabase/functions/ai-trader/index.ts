@@ -4,7 +4,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
-const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") || "gpt-4o-mini"; // デフォルト: gpt-4o-mini (推奨)
+const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") || "gpt-4o"; // デフォルト: gpt-4o (高精度)
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -20,6 +20,8 @@ export interface TradeRequest {
   // 移動平均線
   ema_25: number;
   sma_100: number;
+  sma_200: number;
+  sma_800: number;
   ma_cross: number;  // 1=golden cross, -1=dead cross
   
   // モメンタム指標
@@ -70,6 +72,11 @@ export interface TradeResponse {
   method_selected_by?: "OpenAI" | "Fallback" | "Manual";
   method_confidence?: number; // 0.0 - 1.0
   method_reason?: string;
+  // ML pattern tracking
+  ml_pattern_used?: boolean;
+  ml_pattern_id?: number | null;
+  ml_pattern_name?: string | null;
+  ml_pattern_confidence?: number | null;
 }
 
 function corsHeaders() {
@@ -153,6 +160,94 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
     method_selected_by: "Fallback",
     method_confidence: 0.5,
     method_reason: "Rule-based selection using RSI/ATR/MACD/Ichimoku heuristics",
+    ml_pattern_used: false,
+    ml_pattern_id: null,
+    ml_pattern_name: null,
+    ml_pattern_confidence: null,
+  };
+}
+
+/**
+ * ML学習データに基づいてロット倍率を計算
+ * レベル1: 通常 (1.0倍) - ML未学習 or 勝率60-70%
+ * レベル2: やや自信あり (1.5倍) - 勝率70-80% + サンプル15件以上 + 過去5件中4勝以上
+ * レベル3: 非常に自信あり (2.0倍) - 勝率80%以上 + サンプル20件以上 + 過去10件中8勝以上 + PF1.5以上
+ * レベル4: 極めて自信あり (3.0倍) - 勝率85%以上 + サンプル30件以上 + 過去10件中9勝以上 + PF2.0以上
+ */
+function calculateLotMultiplier(
+  matchedPattern: any | null,
+  historicalTrades: any[]
+): { multiplier: number; level: string; reason: string } {
+  // ML学習データなし → レベル1（通常）
+  if (!matchedPattern || !matchedPattern.win_rate || matchedPattern.total_trades < 10) {
+    return {
+      multiplier: 1.0,
+      level: "Level 1 (通常)",
+      reason: "ML学習データ不足またはサンプル数10件未満"
+    };
+  }
+
+  const winRate = matchedPattern.win_rate;
+  const totalTrades = matchedPattern.total_trades;
+  const profitFactor = matchedPattern.profit_factor || 1.0;
+
+  // 直近のパフォーマンスを分析（最新10件）
+  const recentTrades = historicalTrades
+    .filter((t: any) => t.actual_result === "WIN" || t.actual_result === "LOSS")
+    .slice(0, 10);
+  const recent10Wins = recentTrades.filter((t: any) => t.actual_result === "WIN").length;
+  
+  const recent5Trades = recentTrades.slice(0, 5);
+  const recent5Wins = recent5Trades.filter((t: any) => t.actual_result === "WIN").length;
+
+  // レベル4: 極めて自信あり (3.0倍)
+  if (
+    winRate >= 0.85 &&
+    totalTrades >= 30 &&
+    profitFactor >= 2.0 &&
+    recent10Wins >= 9
+  ) {
+    return {
+      multiplier: 3.0,
+      level: "Level 4 (極めて自信あり)",
+      reason: `勝率${(winRate * 100).toFixed(1)}% (${totalTrades}件), PF=${profitFactor.toFixed(2)}, 直近10件中${recent10Wins}勝`
+    };
+  }
+
+  // レベル3: 非常に自信あり (2.0倍)
+  if (
+    winRate >= 0.80 &&
+    totalTrades >= 20 &&
+    profitFactor >= 1.5 &&
+    recent10Wins >= 8
+  ) {
+    return {
+      multiplier: 2.0,
+      level: "Level 3 (非常に自信あり)",
+      reason: `勝率${(winRate * 100).toFixed(1)}% (${totalTrades}件), PF=${profitFactor.toFixed(2)}, 直近10件中${recent10Wins}勝`
+    };
+  }
+
+  // レベル2: やや自信あり (1.5倍)
+  if (
+    winRate >= 0.70 &&
+    totalTrades >= 15 &&
+    recent5Wins >= 4
+  ) {
+    return {
+      multiplier: 1.5,
+      level: "Level 2 (やや自信あり)",
+      reason: `勝率${(winRate * 100).toFixed(1)}% (${totalTrades}件), 直近5件中${recent5Wins}勝`
+    };
+  }
+
+  // レベル1: 通常 (1.0倍) - デフォルト
+  return {
+    multiplier: 1.0,
+    level: "Level 1 (通常)",
+    reason: winRate >= 0.60 ? 
+      `勝率${(winRate * 100).toFixed(1)}% (${totalTrades}件) - 基準未達` :
+      `勝率${(winRate * 100).toFixed(1)}% (${totalTrades}件) - 低勝率パターン`
   };
 }
 
@@ -163,18 +258,49 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
   const reason = ea_suggestion.reason;
   const ichimoku_score = ea_suggestion.ichimoku_score;
   
-  // ⭐⭐⭐ 学習データ収集フェーズ: ML参照をスキップ ⭐⭐⭐
-  // 十分な学習データが蓄積されるまで、テクニカル指標のみで判断
-  // TODO: ai_signalsが100件以上溜まったらML参照を再開する
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 🔄 ハイブリッド学習システム（3段階）
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // フェーズ1 (0-79件):    テクニカル判定のみ
+  // フェーズ2 (80-999件):  ハイブリッド（高品質パターンのみML使用）
+  // フェーズ3 (1000件+):   完全ML移行
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   
-  const ENABLE_ML_LEARNING = true; // ✅ ML学習を有効化（慎重な設定）
+  // ステップ1: 完結した取引件数をカウント
+  const { count: completedTradesCount } = await supabase
+    .from("ai_signals")
+    .select("*", { count: "exact", head: true })
+    .in("actual_result", ["WIN", "LOSS"]);
+  
+  const totalCompletedTrades = completedTradesCount || 0;
+  console.log(`[AI] 📊 Total completed trades: ${totalCompletedTrades}`);
+  
+  // ステップ2: フェーズ判定
+  let learningPhase: "PHASE1_TECHNICAL" | "PHASE2_HYBRID" | "PHASE3_FULL_ML";
+  let mlThresholds = { minSamples: 10, minConfidence: 0.5 }; // デフォルト閾値
+  
+  if (totalCompletedTrades < 80) {
+    learningPhase = "PHASE1_TECHNICAL";
+    console.log(`[AI] ⚙️  PHASE 1: テクニカル判定モード (${totalCompletedTrades}/80件)`);
+  } else if (totalCompletedTrades < 1000) {
+    learningPhase = "PHASE2_HYBRID";
+    mlThresholds = { minSamples: 15, minConfidence: 0.7 }; // ハイブリッド時は厳格化
+    console.log(`[AI] 🔄 PHASE 2: ハイブリッドモード (${totalCompletedTrades}/1000件) - サンプル${mlThresholds.minSamples}件以上 & 信頼度${mlThresholds.minConfidence * 100}%以上のみML使用`);
+  } else {
+    learningPhase = "PHASE3_FULL_ML";
+    mlThresholds = { minSamples: 10, minConfidence: 0.5 }; // 完全ML時は標準設定
+    console.log(`[AI] 🚀 PHASE 3: 完全MLモード (${totalCompletedTrades}件達成)`);
+  }
+  
+  // ステップ3: ML学習データを取得（PHASE1以外）
+  const ENABLE_ML_LEARNING = learningPhase !== "PHASE1_TECHNICAL";
   
   let matchedPatterns: any[] = [];
   let recommendations: any[] = [];
   let historicalTrades: any[] = [];
   
   if (ENABLE_ML_LEARNING) {
-    // 1. ML学習済みパターンをTOP3まで取得（厳格な条件）
+    // 1. ML学習済みパターンをTOP3まで取得（フェーズに応じた閾値）
     const { data: patterns } = await supabase
       .from("ml_patterns")
       .select("*")
@@ -184,8 +310,8 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
       .eq("is_active", true)
       .gte("rsi_max", rsi)
       .lte("rsi_min", rsi)
-      .gte("total_trades", 10) // 最低サンプル数を10に厳格化
-      .gte("confidence_score", 0.5) // 信頼度50%以上のみ
+      .gte("total_trades", mlThresholds.minSamples) // フェーズ別閾値
+      .gte("confidence_score", mlThresholds.minConfidence) // フェーズ別閾値
       .order("confidence_score", { ascending: false })
       .limit(3);
     matchedPatterns = patterns || [];
@@ -219,9 +345,17 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
   let failureCases = "";
   let recommendationsText = "";
   
-  // パターンマッチング結果を整形
+  // パターンマッチング結果を整形（フェーズ情報付き）
   if (matchedPatterns && matchedPatterns.length > 0) {
-    mlContext = `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📚 ML学習済みパターン検出 (TOP ${matchedPatterns.length})\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+    // フェーズ別のヘッダー
+    let phaseInfo = "";
+    if (learningPhase === "PHASE2_HYBRID") {
+      phaseInfo = `\n🔄 ハイブリッドモード (${totalCompletedTrades}/1000件) - 高品質パターンのみML使用`;
+    } else if (learningPhase === "PHASE3_FULL_ML") {
+      phaseInfo = `\n🚀 完全MLモード (${totalCompletedTrades}件達成) - 全パターン活用`;
+    }
+    
+    mlContext = `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📚 ML学習済みパターン検出 (TOP ${matchedPatterns.length})${phaseInfo}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
     
     matchedPatterns.forEach((pattern: any, index: number) => {
       mlContext += `\n\n【パターン${index + 1}】${pattern.pattern_name}`;
@@ -245,10 +379,26 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
       }
     });
     
-    mlContext += `\n\n⚡ ML学習の重要性: このパターンは実際の取引データに基づいています。過去勝率を最重視してください。`;
+    // フェーズ別の指示
+    if (learningPhase === "PHASE2_HYBRID") {
+      mlContext += `\n\n⚡ ハイブリッド判定: このパターンはサンプル${mlThresholds.minSamples}件以上 & 信頼度${mlThresholds.minConfidence * 100}%以上の高品質データです。過去勝率を重視しつつ、テクニカル指標と総合判断してください。`;
+    } else if (learningPhase === "PHASE3_FULL_ML") {
+      mlContext += `\n\n⚡ ML学習の重要性: このパターンは実際の取引データに基づいています。過去勝率を最重視してください。`;
+    }
     
-    console.log(`[AI] ML Pattern matched: ${matchedPatterns[0].pattern_name}, win_rate=${matchedPatterns[0].win_rate}, boost=${mlWinRateBoost}`);
+    console.log(`[AI] ML Pattern matched: ${matchedPatterns[0].pattern_name}, win_rate=${matchedPatterns[0].win_rate}, boost=${mlWinRateBoost}, phase=${learningPhase}`);
+  } else if (ENABLE_ML_LEARNING) {
+    // ML有効だがパターンマッチなし → テクニカル判定にフォールバック
+    console.log(`[AI] ⚠️ No ML pattern matched (phase=${learningPhase}) - Fallback to technical analysis`);
+    mlContext = `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚙️  該当する学習パターンなし - テクニカル判定モード\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n条件に合う過去データが不足しているため、テクニカル指標のみで判断します。`;
   }
+  
+  // 📊 ロット倍率を計算（ML学習データ + 直近パフォーマンスに基づく）
+  const lotMultiplierResult = calculateLotMultiplier(
+    matchedPatterns.length > 0 ? matchedPatterns[0] : null,
+    historicalTrades
+  );
+  console.log(`[AI] Lot Multiplier: ${lotMultiplierResult.multiplier}x (${lotMultiplierResult.level}) - ${lotMultiplierResult.reason}`);
   
   // 過去の成功事例を抽出
   if (historicalTrades && historicalTrades.length > 0) {
@@ -381,18 +531,66 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
     }
   }
   
-  // 学習データ収集フェーズ用の総合判断プロンプト
-  const prompt = ENABLE_ML_LEARNING ? 
-    // ML学習データがある場合の詳細プロンプト（将来用）
-    `あなたはプロの金融トレーダー兼AIアナリストです。ML学習結果と過去の実績データを最重視して勝率を予測してください。
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // 🎯 フェーズ別システムプロンプト生成
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  
+  let systemPrompt = "";
+  let priorityGuideline = "";
+  
+  if (learningPhase === "PHASE3_FULL_ML" && matchedPatterns.length > 0) {
+    // ━━━ PHASE 3: 完全MLモード（1000件以上） ━━━
+    priorityGuideline = `
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚀 優先順位（完全MLモード）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. ML学習データ（過去勝率） ⭐⭐⭐⭐⭐ 最重視
+2. 過去の成功/失敗事例 ⭐⭐⭐⭐
+3. テクニカル指標（補助情報） ⭐⭐
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+    
+    systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。1000件以上の実績データに基づくML学習結果を最重視して勝率を予測してください。
+${priorityGuideline}
 ${mlContext}${successCases}${failureCases}${recommendationsText}
+補助情報: RSI=${rsi.toFixed(2)}, ATR=${atr.toFixed(5)}
+${ichimokuContext}
+EA判断: ${reason}`;
+    
+  } else if (learningPhase === "PHASE2_HYBRID" && matchedPatterns.length > 0) {
+    // ━━━ PHASE 2: ハイブリッドモード（80-999件、パターンあり） ━━━
+    priorityGuideline = `
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔄 優先順位（ハイブリッドモード - ML使用）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. ML学習データ（高品質パターン） ⭐⭐⭐⭐
+2. テクニカル指標（総合判断） ⭐⭐⭐
+3. 過去の成功/失敗事例 ⭐⭐
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+※ サンプル${mlThresholds.minSamples}件以上 & 信頼度${mlThresholds.minConfidence * 100}%以上の高品質パターンを検出しました。
+※ ML学習データとテクニカル指標をバランス良く総合判断してください。`;
+    
+    systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。高品質なML学習結果とテクニカル指標を総合的に判断し、勝率を予測してください。
+${priorityGuideline}
+${mlContext}${successCases}${failureCases}
 テクニカル指標: RSI=${rsi.toFixed(2)}, ATR=${atr.toFixed(5)}
 ${ichimokuContext}
-EA判断: ${reason}
-JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reasoning": "判断理由（40文字以内）", "entry_method": "pullback|breakout|mtf_confirm|none", "entry_params": { ... }, "method_confidence": 0.0-1.0, "method_reason": "方式選択理由（40文字以内）"}`
-    :
-    // 学習データ収集フェーズ: 全テクニカル指標を総合的に判断
-    `あなたはプロの金融トレーダー兼AIアナリストです。すべてのテクニカル指標とEA側の総合判断を総合的に分析し、取引の成功確率（勝率）を0.0～1.0の範囲で予測してください。
+EA判断: ${reason}`;
+    
+  } else {
+    // ━━━ PHASE 1 or PHASE 2（パターンなし）: テクニカル判定モード ━━━
+    priorityGuideline = `
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚙️  優先順位（テクニカル判定モード）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. トレンドの一致度 ⭐⭐⭐
+2. 一目均衡表の状態 ⭐⭐⭐
+3. EA側の一目スコア ⭐⭐⭐
+4. RSI/MACDの状態 ⭐⭐
+5. ボラティリティ（ATR） ⭐
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
+    
+    systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。すべてのテクニカル指標とEA側の総合判断を総合的に分析し、取引の成功確率（勝率）を0.0～1.0の範囲で予測してください。
+${priorityGuideline}${mlContext}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 市場情報
@@ -410,7 +608,52 @@ JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reason
 【移動平均線】
 • EMA25: ${req.ema_25.toFixed(2)}
 • SMA100: ${req.sma_100.toFixed(2)}
+• SMA200: ${req.sma_200.toFixed(2)}
+• SMA800: ${req.sma_800.toFixed(2)}
 • MAクロス: ${req.ma_cross > 0 ? "ゴールデンクロス（上昇トレンド）" : "デッドクロス（下降トレンド）"}
+
+【MA配置とトレンド強度】
+${(() => {
+  const price = req.price;
+  const ema25 = req.ema_25;
+  const sma100 = req.sma_100;
+  const sma200 = req.sma_200;
+  const sma800 = req.sma_800;
+  
+  // パーフェクトオーダーチェック
+  const isPerfectBull = price > ema25 && ema25 > sma100 && sma100 > sma200 && sma200 > sma800;
+  const isPerfectBear = price < ema25 && ema25 < sma100 && sma100 < sma200 && sma200 < sma800;
+  
+  // 200日線との位置関係
+  const diff200 = ((price - sma200) / sma200 * 100);
+  const pos200 = price > sma200 ? "上" : price < sma200 ? "下" : "同水準";
+  
+  // 800日線との位置関係
+  const diff800 = ((price - sma800) / sma800 * 100);
+  const pos800 = price > sma800 ? "上" : price < sma800 ? "下" : "同水準";
+  
+  let analysis = "";
+  
+  if (isPerfectBull) {
+    analysis = "🔥 パーフェクトオーダー（上昇）達成！全MAが順番に並び最強の上昇トレンド";
+  } else if (isPerfectBear) {
+    analysis = "🔥 パーフェクトオーダー（下降）達成！全MAが順番に並び最強の下降トレンド";
+  } else {
+    analysis = `価格は200日線の${pos200}（${diff200.toFixed(1)}%）、800日線の${pos800}（${diff800.toFixed(1)}%）`;
+  }
+  
+  // 長期トレンドの判定
+  let longTrend = "";
+  if (price > sma200 && price > sma800) {
+    longTrend = "✅ 長期上昇トレンド（200日線・800日線の両方を上回る）";
+  } else if (price < sma200 && price < sma800) {
+    longTrend = "⚠️ 長期下降トレンド（200日線・800日線の両方を下回る）";
+  } else {
+    longTrend = "⚡ 長期トレンド転換期（200日線と800日線の間で攻防中）";
+  }
+  
+  return `• ${analysis}\n• ${longTrend}`;
+})()}
 
 【MACD】
 • Main: ${req.macd.main.toFixed(5)}
@@ -442,18 +685,29 @@ JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reason
 
 **基準となる判断要素:**
 
-1. **トレンドの一致度** ⭐⭐⭐
+1. **パーフェクトオーダー** ⭐⭐⭐⭐⭐
+   - 全MA順列（価格>EMA25>SMA100>SMA200>SMA800）→ 80-90%（最強トレンド）
+   - 逆パーフェクトオーダー → 80-90%（最強下降、売りの場合）
+   - パーフェクトオーダー達成時は勝率を大幅に上げる
+
+2. **長期トレンド（200日線・800日線）** ⭐⭐⭐⭐
+   - 価格が200日線・800日線の両方の上 → +10-15%（長期上昇相場）
+   - 価格が200日線・800日線の両方の下 → +10-15%（長期下降、売りの場合）
+   - 200日線と800日線の間で攻防 → -5-10%（トレンド転換期、不確実性）
+   - 200日線からの乖離率が大きい（±5%以上）→ -5-10%（過熱/冷え込み）
+
+3. **トレンドの一致度** ⭐⭐⭐
    - MA、MACD、一目均衡表が同一方向 → 70-85%（強いトレンド）
    - 2つが一致、1つが中立 → 60-70%（中程度のトレンド）
    - 指標が分散 → 50-60%（弱いトレンド）
    - 指標が矛盾 → 30-45%（不確実、リスク高）
 
-2. **一目均衡表の状態** ⭐⭐⭐
+4. **一目均衡表の状態** ⭐⭐⭐
    - 価格が雲の上 + 陽転 + TK上昇クロス → +10-15%
    - 価格が雲の下 + 陰転 + TK下降クロス → +10-15%（売りの場合）
    - 価格が雲の中 → -10-15%（不確実性ペナルティ）
 
-3. **RSIの状態** ⭐⭐
+5. **RSIの状態** ⭐⭐
    - RSI 50-70 + 買い方向 → +5-10%（健全な上昇）
    - RSI 30-50 + 売り方向 → +5-10%（健全な下降）
    - RSI 70超 + 買い方向 → -10-20%（反転リスク）
@@ -461,17 +715,17 @@ JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reason
    - RSI 30未満 + 買い方向 → +5-10%（逆張りチャンス）
    - RSI 70超 + 売り方向 → +5-10%（逆張りチャンス）
 
-4. **MACDの状態** ⭐⭐
+6. **MACDの状態** ⭐⭐
    - MACD上昇クロス + 買い方向 → +5-8%
    - MACD下降クロス + 売り方向 → +5-8%
    - Histogram拡大 → +3-5%（モメンタム増加）
    - MACDとエントリー方向が逆 → -8-12%
 
-5. **ボラティリティ（ATR）** ⭐
+7. **ボラティリティ（ATR）** ⭐
    - 高ボラティリティ → +3-5%（利益チャンス大）
    - 低ボラティリティ → -5-10%（レンジ相場リスク）
 
-6. **EA側の一目スコア** ⭐⭐⭐
+8. **EA側の一目スコア** ⭐⭐⭐
    - excellent (0.9+) → 基準勝率 75-85%
    - good (0.6-0.9) → 基準勝率 65-75%
    - moderate (0.4-0.6) → 基準勝率 55-65%
@@ -483,24 +737,29 @@ JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reason
 - 不確実性が高い（指標分散）→ 30-45%
 - 中程度の確信（一部一致）→ 50-65%
 - 高い確信（多数一致）→ 70-80%
-- 最高のシナリオ（全指標完全一致、理想的条件）→ 85-90%
+- 最高のシナリオ（パーフェクトオーダー、全指標完全一致）→ 85-90%`;
+  }
+  
+  // 共通の回答形式指示
+  systemPrompt += `
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📋 回答形式（JSON）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 以下のJSON形式で回答してください:
 {
-  "win_prob": 0.XX,  // 0.00～0.90の範囲で動的に設定（全指標を総合判断）
+  "win_prob": 0.XX,  // 0.00～0.90の範囲で動的に設定
   "confidence": "high" | "medium" | "low",
-  "reasoning": "総合的な判断理由（40文字以内、主要な根拠を明記）"
+  "reasoning": "判断理由（40文字以内、主要な根拠を明記）"
 }
 
 重要: 
-• すべてのテクニカル指標を総合的に評価してください
-• 指標間の一致度が最も重要です
-• EA側の一目スコアも重要な判断材料です
-• 矛盾が多い場合は低勝率、一致が多い場合は高勝率を設定してください
+• 上記の優先順位に従って判断してください
+• ${learningPhase === "PHASE3_FULL_ML" ? "ML学習データの過去勝率を最重視" : learningPhase === "PHASE2_HYBRID" && matchedPatterns.length > 0 ? "ML学習データとテクニカル指標をバランス良く総合判断" : "すべてのテクニカル指標を総合的に評価"}してください
 • 0%～90%の幅広い範囲で動的に算出してください`;
+
+  // 学習データ収集フェーズ用の総合判断プロンプト（廃止：上記に統合）
+  const prompt = systemPrompt;
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -628,7 +887,8 @@ JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reason
     // 詳細ログ出力
     console.log(
       `[AI] OpenAI GPT-4 prediction: ${(win_prob * 100).toFixed(1)}% (${confidence}) - ${reasoning} | ` +
-      `ichimoku=${ichimoku_score?.toFixed(2) || "N/A"} quality=${signalQuality} | entry_method=${entry_method}`
+      `ichimoku=${ichimoku_score?.toFixed(2) || "N/A"} quality=${signalQuality} | entry_method=${entry_method} | ` +
+      `lot=${lotMultiplierResult.multiplier}x (${lotMultiplierResult.level})`
     );
     
     return {
@@ -643,6 +903,13 @@ JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reason
       method_selected_by: "OpenAI",
       method_confidence,
       method_reason,
+      lot_multiplier: lotMultiplierResult.multiplier,
+      lot_level: lotMultiplierResult.level,
+      lot_reason: lotMultiplierResult.reason,
+      ml_pattern_used: matchedPatterns && matchedPatterns.length > 0,
+      ml_pattern_id: matchedPatterns && matchedPatterns.length > 0 ? matchedPatterns[0].id : null,
+      ml_pattern_name: matchedPatterns && matchedPatterns.length > 0 ? matchedPatterns[0].pattern_name : null,
+      ml_pattern_confidence: matchedPatterns && matchedPatterns.length > 0 ? Math.round(matchedPatterns[0].win_rate * 100 * 100) / 100 : null,
     } as any;
     
   } catch (error) {
