@@ -87,6 +87,13 @@ const MA_CROSS_STATES = [
   { name: "bearish_ma", value: -1 },
 ];
 
+// 一目均衡表スコア範囲
+const ICHIMOKU_RANGES = [
+  { name: "excellent", min: 0.9, max: 1.0 },   // MA+一目の両方が一致
+  { name: "good", min: 0.6, max: 0.9 },        // 一目単独
+  { name: "moderate", min: 0.4, max: 0.6 },    // MA単独
+];
+
 async function extractPatterns(): Promise<Pattern[]> {
   console.log("[ML] Starting pattern extraction...");
   
