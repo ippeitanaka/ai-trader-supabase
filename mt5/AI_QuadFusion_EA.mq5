@@ -24,9 +24,9 @@ input bool   LockToChartSymbol = true;
 input ENUM_TIMEFRAMES TF_Entry   = PERIOD_M15;
 input ENUM_TIMEFRAMES TF_Recheck = PERIOD_H1;
 
-input double MinWinProb          = 0.70;  // 0.70 = 70%, 0.75 = 75% (小数形式)
-input double RiskATRmult         = 1.5;
-input double RewardRR            = 1.2;
+input double MinWinProb          = 0.85;  // 🚨 EMERGENCY: 0.85 = 85% (低品質シグナルをフィルタ)
+input double RiskATRmult         = 2.0;   // 🚨 EMERGENCY: ストップロス拡大（大損失防止）
+input double RewardRR            = 1.5;   // 🚨 EMERGENCY: リスクリワード比改善
 input double PendingOffsetATR    = 0.2;
 input int    PendingExpiryMin    = 90;
 input double Lots                = 0.10;
@@ -34,6 +34,9 @@ input double MaxLots             = 0.30;  // ロット倍率適用時の最大�
 input int    SlippagePoints      = 1000;
 input long   Magic               = 26091501;
 input int    MaxPositions        = 1;      // 同一銘柄の最大ポジション数
+
+// 🚨 EMERGENCY: エントリー制限
+input bool   DisableBreakout     = true;  // 🚨 breakoutエントリーを一時無効化（現在100%失敗中）
 
 input bool   DebugLogs           = true;
 input int    LogCooldownSec      = 30;  // 0=全出力, >0=間引き, -1=完全OFF
@@ -742,6 +745,7 @@ void OnM15NewBar()
       SafePrint(StringFormat("[M15] cooldown active for %d sec",(int)(g_cooldownUntil-TimeCurrent())));
       return;
    }
+   
    TechSignal t=Evaluate(TF_Entry); if(t.dir==0)return;
    double rsi=RSIv(PERIOD_M15,14,PRICE_CLOSE,0);
    AIOut ai; if(!QueryAI("M15",t.dir,rsi,t.atr,t.ref,t.reason,t.ichimoku_score,ai))return;
@@ -775,7 +779,14 @@ void OnM15NewBar()
 
    string method=ai.entry_method;
       ulong placed_ticket=0; bool executed=false;
+      
+      // 🚨 EMERGENCY: breakout エントリーを一時無効化（現在100%失敗中）
       if(method=="breakout"){
+         if(DisableBreakout){
+            LogAIDecision("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_BREAKOUT_DISABLED",threshold_met,posCount,0);
+            SafePrint("[M15] breakout disabled due to poor performance (see DisableBreakout parameter)");
+            return;
+         }
          PendingPlan pbo=BuildBreakout(t.dir,t.atr,(ai.o>0?ai.o:ai.offset_factor));
          if(pbo.type==ORDER_TYPE_BUY_STOP) trade.BuyStop(Lots,pbo.price,_Symbol,pbo.sl,pbo.tp);
          else if(pbo.type==ORDER_TYPE_SELL_STOP) trade.SellStop(Lots,pbo.price,_Symbol,pbo.sl,pbo.tp);

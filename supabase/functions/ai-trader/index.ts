@@ -168,6 +168,37 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
 }
 
 /**
+ * entry_params を検証して異常な数値を修正
+ * OpenAI が時折極端な数値（1e+40 など）を返すことがあるため
+ */
+function sanitizeEntryParams(params: Record<string, unknown>): Record<string, unknown> {
+  const MAX_REASONABLE_VALUE = 10.0;  // 通常 k, o は 0.1～1.0 程度
+  const sanitized: Record<string, unknown> = {};
+  
+  for (const [key, value] of Object.entries(params)) {
+    if (typeof value === 'number') {
+      // 異常値（NaN, Infinity, 極端に大きい値）を修正
+      if (isNaN(value) || !isFinite(value) || Math.abs(value) > MAX_REASONABLE_VALUE) {
+        console.warn(`[AI] Invalid entry_param detected: ${key}=${value}, using default`);
+        
+        // デフォルト値を設定
+        if (key === 'k') sanitized[key] = 0.35;  // pullback: 35%押し目
+        else if (key === 'o') sanitized[key] = 0.2;  // breakout: 20%超え
+        else if (key === 'expiry_bars') sanitized[key] = 3;
+        else sanitized[key] = 0.5;  // その他は中間値
+      } else {
+        sanitized[key] = value;
+      }
+    } else {
+      // 文字列等はそのまま
+      sanitized[key] = value;
+    }
+  }
+  
+  return sanitized;
+}
+
+/**
  * ML学習データに基づいてロット倍率を計算
  * レベル1: 通常 (1.0倍) - ML未学習 or 勝率60-70%
  * レベル2: やや自信あり (1.5倍) - 勝率70-80% + サンプル15件以上 + 過去5件中4勝以上
@@ -873,7 +904,7 @@ JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reason
       }
     }
     if (aiResult.entry_params && typeof aiResult.entry_params === 'object') {
-      entry_params = aiResult.entry_params as any;
+      entry_params = sanitizeEntryParams(aiResult.entry_params as any);
     }
 
     // 方式が不十分な場合はフォールバックで埋める
