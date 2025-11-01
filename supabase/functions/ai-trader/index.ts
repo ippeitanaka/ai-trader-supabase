@@ -868,6 +868,9 @@ JSON形式で回答: {"win_prob": 0.XX, "confidence": "high|medium|low", "reason
   const aiResult = JSON.parse(jsonMatch[0]);
     let win_prob = parseFloat(aiResult.win_prob);
     
+    // 🐛 デバッグ: OpenAIの生の勝率をログ出力
+    console.log(`[AI DEBUG] Raw OpenAI win_prob: ${win_prob} (type: ${typeof win_prob}) from response: ${JSON.stringify(aiResult).substring(0, 150)}`);
+    
     // 安全性チェック
     if (isNaN(win_prob) || win_prob < 0 || win_prob > 1) {
       console.error("[AI] Invalid win_prob:", win_prob, "from AI response:", JSON.stringify(aiResult));
