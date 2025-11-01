@@ -24,9 +24,9 @@ input bool   LockToChartSymbol = true;
 input ENUM_TIMEFRAMES TF_Entry   = PERIOD_M15;
 input ENUM_TIMEFRAMES TF_Recheck = PERIOD_H1;
 
-input double MinWinProb          = 0.85;  // 🚨 EMERGENCY: 0.85 = 85% (低品質シグナルをフィルタ)
-input double RiskATRmult         = 2.0;   // 🚨 EMERGENCY: ストップロス拡大（大損失防止）
-input double RewardRR            = 1.5;   // 🚨 EMERGENCY: リスクリワード比改善
+input double MinWinProb          = 0.75;  // 🚨 0.75 = 75% (品質重視だが取引頻度も維持)
+input double RiskATRmult         = 2.0;   // 🚨 ストップロス拡大（大損失防止）
+input double RewardRR            = 1.5;   // 🚨 リスクリワード比改善
 input double PendingOffsetATR    = 0.2;
 input int    PendingExpiryMin    = 90;
 input double Lots                = 0.10;
