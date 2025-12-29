@@ -150,7 +150,7 @@
 **挿入元**: 
 - Edge Function `ai-trader` → AI判断時にMLパターンマッチング結果を返す
 - Edge Function `ai-signals` → POSTリクエストでMLパターン情報を保存
-- MT5 EA `AI_QuadFusion_EA.mq5` → `RecordSignal()`でMLパターン情報を送信
+- MT5 EA `AwajiSamurai_AI_2.0.mq5` → `RecordSignal()`でMLパターン情報を送信
 
 **関連テーブル**: `ml_patterns` テーブルと `ml_pattern_id` で連携
 

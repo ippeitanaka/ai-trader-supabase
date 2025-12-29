@@ -29,7 +29,7 @@ AI駆動の自動トレーディングシステム（MT5 EA + Supabase Edge Func
 │   ├── functions/    # Edge Functions (ai-trader, ai-signals, ea-log, ml-training)
 │   └── migrations/   # DBマイグレーション
 ├── mt5/
-│   └── AI_QuadFusion_EA.mq5  # MT5 EA
+│   └── AwajiSamurai_AI_2.0.mq5  # MT5 EA
 └── *.sh              # 運用スクリプト
 ```
 

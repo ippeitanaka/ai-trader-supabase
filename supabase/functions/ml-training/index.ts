@@ -39,11 +39,17 @@ interface Pattern {
   direction: number;
   rsi_min: number;
   rsi_max: number;
+  adx_bucket?: string | null;
+  bb_width_bucket?: string | null;
+  atr_norm_bucket?: string | null;
   atr_min?: number;
   atr_max?: number;
   ichimoku_score_min?: number;
   ichimoku_score_max?: number;
   total_trades: number;
+  real_trades: number;
+  virtual_trades: number;
+  effective_trades: number;
   win_count: number;
   loss_count: number;
   win_rate: number;
@@ -53,6 +59,10 @@ interface Pattern {
   confidence_score: number;
   sample_size_adequate: boolean;
 }
+
+// Virtual (paper/shadow) trades contribute to learning but with lower weight.
+// This prevents ML from overfitting to simulated outcomes while still reducing blind spots.
+const VIRTUAL_TRADE_WEIGHT = 0.25;
 
 // RSIレンジを定義
 const RSI_RANGES = [
@@ -94,6 +104,27 @@ const ICHIMOKU_RANGES = [
   { name: "moderate", min: 0.4, max: 0.6 },    // MA単独
 ];
 
+function bucketAdx(v: number | null | undefined): string | null {
+  if (typeof v !== "number" || !isFinite(v)) return null;
+  if (v < 15) return "low";
+  if (v < 25) return "mid";
+  return "high";
+}
+
+function bucketBbWidth(v: number | null | undefined): string | null {
+  if (typeof v !== "number" || !isFinite(v)) return null;
+  if (v < 0.003) return "squeeze";
+  if (v < 0.008) return "normal";
+  return "wide";
+}
+
+function bucketAtrNorm(v: number | null | undefined): string | null {
+  if (typeof v !== "number" || !isFinite(v)) return null;
+  if (v < 0.0005) return "low";
+  if (v < 0.0012) return "mid";
+  return "high";
+}
+
 async function extractPatterns(): Promise<Pattern[]> {
   console.log("[ML] Starting pattern extraction...");
   
@@ -102,8 +133,6 @@ async function extractPatterns(): Promise<Pattern[]> {
     .from("ai_signals")
     .select("*")
     .in("actual_result", ["WIN", "LOSS"])
-    .not("exit_price", "is", null)
-    .not("profit_loss", "is", null)
     .not("closed_at", "is", null)
     .order("created_at", { ascending: false });
   
@@ -146,37 +175,74 @@ async function extractPatterns(): Promise<Pattern[]> {
       );
       
       if (matchingTrades.length < 3) continue;
+
+      // レジーム特徴量（ADX/BB幅/正規化ATR）で細分化
+      const bucketGroups = new Map<string, { adx: string | null; bb: string | null; atrn: string | null; rows: any[] }>();
+      for (const t of matchingTrades) {
+        const adxB = bucketAdx(t.adx);
+        const bbB = bucketBbWidth(t.bb_width);
+        const atrnB = bucketAtrNorm(t.atr_norm);
+        const key = `${adxB ?? "na"}|${bbB ?? "na"}|${atrnB ?? "na"}`;
+        if (!bucketGroups.has(key)) {
+          bucketGroups.set(key, { adx: adxB, bb: bbB, atrn: atrnB, rows: [] });
+        }
+        bucketGroups.get(key)!.rows.push(t);
+      }
+
+      for (const g of bucketGroups.values()) {
+        const rows = g.rows;
+        if (rows.length < 3) continue;
       
-      const winCount = matchingTrades.filter((t) => t.actual_result === "WIN").length;
-      const lossCount = matchingTrades.filter((t) => t.actual_result === "LOSS").length;
-      const winRate = winCount / matchingTrades.length;
-      
-      const profits = matchingTrades
-        .filter((t) => t.actual_result === "WIN")
-        .map((t) => t.profit_loss || 0);
-      const losses = matchingTrades
-        .filter((t) => t.actual_result === "LOSS")
-        .map((t) => Math.abs(t.profit_loss || 0));
-      
-      const avgProfit = profits.length > 0 ? profits.reduce((a, b) => a + b, 0) / profits.length : 0;
-      const avgLoss = losses.length > 0 ? losses.reduce((a, b) => a + b, 0) / losses.length : 0;
-      const profitFactor = avgLoss > 0 ? avgProfit / avgLoss : 0;
-      
-      // 信頼度スコア計算
-      const sampleSizeScore = Math.min(matchingTrades.length / 10, 1); // 10件以上で満点
-      const winRateScore = winRate;
-      const profitFactorScore = Math.min(profitFactor / 2, 1); // 2.0以上で満点
-      const confidenceScore = (sampleSizeScore * 0.3 + winRateScore * 0.5 + profitFactorScore * 0.2);
+        const realTrades = rows.filter((t) => !t.is_virtual);
+        const virtualTrades = rows.filter((t) => !!t.is_virtual);
+
+        const winCount = rows.filter((t) => t.actual_result === "WIN").length;
+        const lossCount = rows.filter((t) => t.actual_result === "LOSS").length;
+
+        const weightedWins = rows
+          .filter((t) => t.actual_result === "WIN")
+          .reduce((sum, t) => sum + (t.is_virtual ? VIRTUAL_TRADE_WEIGHT : 1), 0);
+        const weightedLosses = rows
+          .filter((t) => t.actual_result === "LOSS")
+          .reduce((sum, t) => sum + (t.is_virtual ? VIRTUAL_TRADE_WEIGHT : 1), 0);
+        const totalWeight = weightedWins + weightedLosses;
+        const winRate = totalWeight > 0 ? (weightedWins / totalWeight) : 0;
+        
+        // Profit/Loss statistics should be computed from REAL trades only.
+        // Virtual trades are useful for label coverage, but mixing scales (money vs normalized) harms PF.
+        const profits = realTrades
+          .filter((t) => t.actual_result === "WIN")
+          .map((t) => t.profit_loss || 0);
+        const losses = realTrades
+          .filter((t) => t.actual_result === "LOSS")
+          .map((t) => Math.abs(t.profit_loss || 0));
+        
+        const avgProfit = profits.length > 0 ? profits.reduce((a, b) => a + b, 0) / profits.length : 0;
+        const avgLoss = losses.length > 0 ? losses.reduce((a, b) => a + b, 0) / losses.length : 0;
+        const profitFactor = avgLoss > 0 ? avgProfit / avgLoss : 0;
+        
+        // 信頼度スコア計算
+        const effectiveTrades = realTrades.length + virtualTrades.length * VIRTUAL_TRADE_WEIGHT;
+        const sampleSizeScore = Math.min(effectiveTrades / 10, 1); // 10件相当で満点
+        const winRateScore = winRate;
+        const profitFactorScore = Math.min(profitFactor / 2, 1); // 2.0以上で満点
+        const confidenceScore = (sampleSizeScore * 0.3 + winRateScore * 0.5 + profitFactorScore * 0.2);
       
       patterns.push({
-        pattern_name: `${symbol}_${timeframe}_${direction > 0 ? "BUY" : "SELL"}_RSI_${rsiRange.name}`,
+        pattern_name: `${symbol}_${timeframe}_${direction > 0 ? "BUY" : "SELL"}_RSI_${rsiRange.name}_ADX_${g.adx ?? "na"}_BB_${g.bb ?? "na"}_ATRn_${g.atrn ?? "na"}`,
         pattern_type: "technical",
         symbol,
         timeframe,
         direction,
         rsi_min: rsiRange.min,
         rsi_max: rsiRange.max,
-        total_trades: matchingTrades.length,
+        adx_bucket: g.adx,
+        bb_width_bucket: g.bb,
+        atr_norm_bucket: g.atrn,
+        total_trades: rows.length,
+        real_trades: realTrades.length,
+        virtual_trades: virtualTrades.length,
+        effective_trades: Math.round(effectiveTrades * 100) / 100,
         win_count: winCount,
         loss_count: lossCount,
         win_rate: Math.round(winRate * 1000) / 1000,
@@ -184,8 +250,9 @@ async function extractPatterns(): Promise<Pattern[]> {
         avg_loss: Math.round(avgLoss * 100) / 100,
         profit_factor: Math.round(profitFactor * 100) / 100,
         confidence_score: Math.round(confidenceScore * 1000) / 1000,
-        sample_size_adequate: matchingTrades.length >= 5,
+        sample_size_adequate: realTrades.length >= 5,
       });
+      }
     }
     
     // 一目均衡表スコア範囲ごとにパターンを抽出（v1.3.0以降のデータ）
@@ -209,14 +276,25 @@ async function extractPatterns(): Promise<Pattern[]> {
         
         if (matchingTrades.length < 3) continue;
         
+        const realTrades = matchingTrades.filter((t) => !t.is_virtual);
+        const virtualTrades = matchingTrades.filter((t) => !!t.is_virtual);
+
         const winCount = matchingTrades.filter((t) => t.actual_result === "WIN").length;
         const lossCount = matchingTrades.filter((t) => t.actual_result === "LOSS").length;
-        const winRate = winCount / matchingTrades.length;
+
+        const weightedWins = matchingTrades
+          .filter((t) => t.actual_result === "WIN")
+          .reduce((sum, t) => sum + (t.is_virtual ? VIRTUAL_TRADE_WEIGHT : 1), 0);
+        const weightedLosses = matchingTrades
+          .filter((t) => t.actual_result === "LOSS")
+          .reduce((sum, t) => sum + (t.is_virtual ? VIRTUAL_TRADE_WEIGHT : 1), 0);
+        const totalWeight = weightedWins + weightedLosses;
+        const winRate = totalWeight > 0 ? (weightedWins / totalWeight) : 0;
         
-        const profits = matchingTrades
+        const profits = realTrades
           .filter((t) => t.actual_result === "WIN")
           .map((t) => t.profit_loss || 0);
-        const losses = matchingTrades
+        const losses = realTrades
           .filter((t) => t.actual_result === "LOSS")
           .map((t) => Math.abs(t.profit_loss || 0));
         
@@ -224,7 +302,8 @@ async function extractPatterns(): Promise<Pattern[]> {
         const avgLoss = losses.length > 0 ? losses.reduce((a, b) => a + b, 0) / losses.length : 0;
         const profitFactor = avgLoss > 0 ? avgProfit / avgLoss : 0;
         
-        const sampleSizeScore = Math.min(matchingTrades.length / 10, 1);
+        const effectiveTrades = realTrades.length + virtualTrades.length * VIRTUAL_TRADE_WEIGHT;
+        const sampleSizeScore = Math.min(effectiveTrades / 10, 1);
         const winRateScore = winRate;
         const profitFactorScore = Math.min(profitFactor / 2, 1);
         const confidenceScore = (sampleSizeScore * 0.3 + winRateScore * 0.5 + profitFactorScore * 0.2);
@@ -240,6 +319,9 @@ async function extractPatterns(): Promise<Pattern[]> {
           ichimoku_score_min: ichRange.min,
           ichimoku_score_max: ichRange.max,
           total_trades: matchingTrades.length,
+          real_trades: realTrades.length,
+          virtual_trades: virtualTrades.length,
+          effective_trades: Math.round(effectiveTrades * 100) / 100,
           win_count: winCount,
           loss_count: lossCount,
           win_rate: Math.round(winRate * 1000) / 1000,
@@ -247,7 +329,7 @@ async function extractPatterns(): Promise<Pattern[]> {
           avg_loss: Math.round(avgLoss * 100) / 100,
           profit_factor: Math.round(profitFactor * 100) / 100,
           confidence_score: Math.round(confidenceScore * 1000) / 1000,
-          sample_size_adequate: matchingTrades.length >= 5,
+          sample_size_adequate: realTrades.length >= 5,
         });
       }
     }
@@ -427,14 +509,25 @@ function calculatePatternStats(
 ): Pattern | null {
   if (matchingTrades.length < 3) return null;
   
+  const realTrades = matchingTrades.filter((t) => !t.is_virtual);
+  const virtualTrades = matchingTrades.filter((t) => !!t.is_virtual);
+
   const winCount = matchingTrades.filter((t) => t.actual_result === "WIN").length;
   const lossCount = matchingTrades.filter((t) => t.actual_result === "LOSS").length;
-  const winRate = winCount / matchingTrades.length;
+
+  const weightedWins = matchingTrades
+    .filter((t) => t.actual_result === "WIN")
+    .reduce((sum, t) => sum + (t.is_virtual ? VIRTUAL_TRADE_WEIGHT : 1), 0);
+  const weightedLosses = matchingTrades
+    .filter((t) => t.actual_result === "LOSS")
+    .reduce((sum, t) => sum + (t.is_virtual ? VIRTUAL_TRADE_WEIGHT : 1), 0);
+  const totalWeight = weightedWins + weightedLosses;
+  const winRate = totalWeight > 0 ? (weightedWins / totalWeight) : 0;
   
-  const profits = matchingTrades
+  const profits = realTrades
     .filter((t) => t.actual_result === "WIN")
     .map((t) => t.profit_loss || 0);
-  const losses = matchingTrades
+  const losses = realTrades
     .filter((t) => t.actual_result === "LOSS")
     .map((t) => Math.abs(t.profit_loss || 0));
   
@@ -443,7 +536,8 @@ function calculatePatternStats(
   const profitFactor = avgLoss > 0 ? avgProfit / avgLoss : 0;
   
   // 信頼度スコア計算（複合パターンは要求基準を高める）
-  const sampleSizeScore = Math.min(matchingTrades.length / 15, 1); // 15件以上で満点
+  const effectiveTrades = realTrades.length + virtualTrades.length * VIRTUAL_TRADE_WEIGHT;
+  const sampleSizeScore = Math.min(effectiveTrades / 15, 1); // 15件相当で満点
   const winRateScore = winRate;
   const profitFactorScore = Math.min(profitFactor / 2.5, 1); // 2.5以上で満点
   const confidenceScore = (sampleSizeScore * 0.3 + winRateScore * 0.5 + profitFactorScore * 0.2);
@@ -457,6 +551,9 @@ function calculatePatternStats(
     rsi_min: rsiMin,
     rsi_max: rsiMax,
     total_trades: matchingTrades.length,
+    real_trades: realTrades.length,
+    virtual_trades: virtualTrades.length,
+    effective_trades: Math.round(effectiveTrades * 100) / 100,
     win_count: winCount,
     loss_count: lossCount,
     win_rate: Math.round(winRate * 1000) / 1000,
@@ -464,7 +561,7 @@ function calculatePatternStats(
     avg_loss: Math.round(avgLoss * 100) / 100,
     profit_factor: Math.round(profitFactor * 100) / 100,
     confidence_score: Math.round(confidenceScore * 1000) / 1000,
-    sample_size_adequate: matchingTrades.length >= 5,
+    sample_size_adequate: realTrades.length >= 5,
   };
 }
 
@@ -647,8 +744,6 @@ async function runTraining(triggeredBy: string = "manual"): Promise<TrainingResu
     .from("ai_signals")
     .select("*", { count: "exact", head: true })
     .in("actual_result", ["WIN", "LOSS"])
-    .not("exit_price", "is", null)
-    .not("profit_loss", "is", null)
     .not("closed_at", "is", null);
   
   console.log(`[ML] Total signals: ${totalSignals}, Complete trades: ${completeTrades}`);
@@ -682,8 +777,6 @@ async function runTraining(triggeredBy: string = "manual"): Promise<TrainingResu
     .from("ai_signals")
     .select("actual_result")
     .in("actual_result", ["WIN", "LOSS"])
-    .not("exit_price", "is", null)
-    .not("profit_loss", "is", null)
     .not("closed_at", "is", null);
   
   const overallWinRate = allTrades
