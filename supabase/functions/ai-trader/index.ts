@@ -58,6 +58,8 @@ export interface TradeRequest {
   // EA側の判断（参考情報として）
   ea_suggestion: {
     dir: number;
+    // EAが推奨する方向（AIが方向を決めるモードでは dir=0 を送る想定）
+    tech_dir?: number;
     reason: string;
     ichimoku_score: number;
   };
@@ -69,6 +71,8 @@ export interface TradeRequest {
 export interface TradeResponse {
   win_prob: number;
   action: number;
+  // action=0 の場合でも「AIがより良いと見た方向」を返す（検証/学習用）
+  suggested_dir?: number;
   offset_factor: number;
   expiry_minutes: number;
   confidence?: string;
@@ -88,6 +92,13 @@ export interface TradeResponse {
   ml_pattern_id?: number | null;
   ml_pattern_name?: string | null;
   ml_pattern_confidence?: number | null;
+
+  // Optional debug payload for dual-direction evaluation
+  direction_eval?: {
+    selected_dir: number;
+    buy?: { win_prob: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
+    sell?: { win_prob: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
+  };
 }
 
 function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): TradeResponse {
@@ -200,6 +211,7 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
   return {
     win_prob: Math.round(analysis.win_prob * 1000) / 1000,
     action: analysis.direction,
+    suggested_dir: analysis.direction,
     offset_factor: Math.round(offset_factor * 1000) / 1000,
     expiry_minutes,
     confidence: analysis.confidence,
@@ -419,11 +431,13 @@ function calculateLotMultiplier(
 }
 
 // OpenAI APIを使用したAI予測
-async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> {
+async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<TradeResponse> {
   const { symbol, timeframe, rsi, atr, price, ea_suggestion } = req;
   const dir = ea_suggestion.dir;
   const reason = ea_suggestion.reason;
   const ichimoku_score = ea_suggestion.ichimoku_score;
+
+  const techDir = typeof ea_suggestion.tech_dir === "number" ? ea_suggestion.tech_dir : undefined;
 
   const atrNorm = typeof req.atr_norm === "number" ? req.atr_norm : undefined;
   const adx = typeof req.adx === "number" ? req.adx : undefined;
@@ -1113,6 +1127,7 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     return {
       win_prob: Math.round(win_prob * 1000) / 1000,
       action: win_prob >= (recommended_min_win_prob ?? 0.70) ? dir : 0,
+      suggested_dir: dir,
       offset_factor: atr > 0.001 ? 0.25 : 0.2,
       expiry_minutes: 90,
       confidence: confidence,
@@ -1140,6 +1155,91 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     console.warn("[AI] Falling back to rule-based calculation");
     return calculateSignalFallback(req);
   }
+}
+
+function pickBetterDirection(
+  buy: TradeResponse,
+  sell: TradeResponse,
+): { selectedDir: 1 | -1; selected: TradeResponse } {
+  // Primary: higher win_prob. Secondary: higher expected_value_r.
+  const buyWin = typeof buy.win_prob === "number" ? buy.win_prob : -Infinity;
+  const sellWin = typeof sell.win_prob === "number" ? sell.win_prob : -Infinity;
+
+  if (buyWin > sellWin) return { selectedDir: 1, selected: buy };
+  if (sellWin > buyWin) return { selectedDir: -1, selected: sell };
+
+  const buyEv = typeof buy.expected_value_r === "number" ? buy.expected_value_r : -Infinity;
+  const sellEv = typeof sell.expected_value_r === "number" ? sell.expected_value_r : -Infinity;
+  if (buyEv >= sellEv) return { selectedDir: 1, selected: buy };
+  return { selectedDir: -1, selected: sell };
+}
+
+// OpenAI APIを使用したAI予測（dir=0 の場合は BUY/SELL を両方評価して比較）
+async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> {
+  const requestedDir = req?.ea_suggestion?.dir;
+  if (requestedDir === 0) {
+    const baseSuggestion = req.ea_suggestion;
+
+    const buyReq: TradeRequest = {
+      ...req,
+      ea_suggestion: {
+        ...baseSuggestion,
+        dir: 1,
+        tech_dir:
+          typeof baseSuggestion.tech_dir === "number" ? baseSuggestion.tech_dir : undefined,
+      },
+    };
+    const sellReq: TradeRequest = {
+      ...req,
+      ea_suggestion: {
+        ...baseSuggestion,
+        dir: -1,
+        tech_dir:
+          typeof baseSuggestion.tech_dir === "number" ? baseSuggestion.tech_dir : undefined,
+      },
+    };
+
+    const [buyRes, sellRes] = await Promise.all([
+      calculateSignalWithAIForFixedDir(buyReq),
+      calculateSignalWithAIForFixedDir(sellReq),
+    ]);
+
+    const picked = pickBetterDirection(buyRes, sellRes);
+    const selected = picked.selected;
+
+    // Ensure suggested_dir is always the chosen direction even if action=0.
+    const mergedReasoning = [
+      selected.reasoning,
+      `DUAL_DIR: selected=${picked.selectedDir} buy=${buyRes.win_prob?.toFixed?.(3) ?? buyRes.win_prob} sell=${sellRes.win_prob?.toFixed?.(3) ?? sellRes.win_prob}`,
+    ]
+      .filter(Boolean)
+      .join(" | ");
+
+    return {
+      ...selected,
+      suggested_dir: picked.selectedDir,
+      reasoning: mergedReasoning,
+      direction_eval: {
+        selected_dir: picked.selectedDir,
+        buy: {
+          win_prob: buyRes.win_prob,
+          action: buyRes.action,
+          expected_value_r: buyRes.expected_value_r,
+          entry_method: buyRes.entry_method,
+          skip_reason: buyRes.skip_reason,
+        },
+        sell: {
+          win_prob: sellRes.win_prob,
+          action: sellRes.action,
+          expected_value_r: sellRes.expected_value_r,
+          entry_method: sellRes.entry_method,
+          skip_reason: sellRes.skip_reason,
+        },
+      },
+    };
+  }
+
+  return calculateSignalWithAIForFixedDir(req);
 }
 
 serve(async (req: Request) => {
@@ -1272,10 +1372,17 @@ serve(async (req: Request) => {
     const ichimokuInfo = tradeReq.ea_suggestion.ichimoku_score !== undefined 
       ? ` ichimoku=${tradeReq.ea_suggestion.ichimoku_score.toFixed(2)}` 
       : "";
+
+    const techDirInfo = typeof tradeReq.ea_suggestion.tech_dir === "number"
+      ? ` tech_dir=${tradeReq.ea_suggestion.tech_dir}`
+      : "";
+    const suggestedDirInfo = typeof (response as any).suggested_dir === "number"
+      ? ` suggested_dir=${(response as any).suggested_dir}`
+      : "";
     
     console.log(
       `[ai-trader] 📊 RESULT: ${tradeReq.symbol} ${tradeReq.timeframe} ` +
-      `dir=${tradeReq.ea_suggestion.dir} win=${response.win_prob.toFixed(3)}${ichimokuInfo} ` +
+      `req_dir=${tradeReq.ea_suggestion.dir}${techDirInfo} action=${response.action}${suggestedDirInfo} win=${response.win_prob.toFixed(3)}${ichimokuInfo} ` +
       `reason="${tradeReq.ea_suggestion.reason}" method=${predictionMethod}` +
       (response.entry_method ? ` | entry_method=${response.entry_method} sel_by=${response.method_selected_by || 'N/A'} conf=${typeof response.method_confidence==='number'?response.method_confidence.toFixed(2):'N/A'}` : ``)
     );
