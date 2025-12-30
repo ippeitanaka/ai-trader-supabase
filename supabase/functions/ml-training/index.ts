@@ -132,6 +132,8 @@ async function extractPatterns(): Promise<Pattern[]> {
   const { data: completeTrades, error } = await supabase
     .from("ai_signals")
     .select("*")
+    // 手動トレードは学習に含めない（EA/AIのみ学習）
+    .or("is_manual_trade.is.null,is_manual_trade.eq.false")
     .in("actual_result", ["WIN", "LOSS"])
     .not("closed_at", "is", null)
     .order("created_at", { ascending: false });
@@ -738,22 +740,29 @@ async function runTraining(triggeredBy: string = "manual"): Promise<TrainingResu
   const { count: totalSignals } = await supabase
     .from("ai_signals")
     .select("*", { count: "exact", head: true });
+  // 注: totalSignals は監視用の目安。学習に使うのはEA/AIのみ。
+  // ここでは手動トレードを除外した数を採用する。
+  const { count: totalSignalsEaOnly } = await supabase
+    .from("ai_signals")
+    .select("*", { count: "exact", head: true })
+    .or("is_manual_trade.is.null,is_manual_trade.eq.false");
   
   // 2. 完結した取引数を取得（ビューではなく直接クエリ）
   const { count: completeTrades } = await supabase
     .from("ai_signals")
     .select("*", { count: "exact", head: true })
+    .or("is_manual_trade.is.null,is_manual_trade.eq.false")
     .in("actual_result", ["WIN", "LOSS"])
     .not("closed_at", "is", null);
   
-  console.log(`[ML] Total signals: ${totalSignals}, Complete trades: ${completeTrades}`);
+  console.log(`[ML] Total signals (all): ${totalSignals}, Total signals (EA-only): ${totalSignalsEaOnly}, Complete trades (EA-only): ${completeTrades}`);
   
   if (!completeTrades || completeTrades < 5) {
     console.warn(`[ML] Insufficient complete trades (${completeTrades}). Need at least 5.`);
     return {
       status: "insufficient_data",
       duration_ms: Date.now() - startTime,
-      total_signals: totalSignals || 0,
+      total_signals: totalSignalsEaOnly || 0,
       complete_trades: completeTrades || 0,
       patterns_discovered: 0,
       patterns_updated: 0,
@@ -776,6 +785,7 @@ async function runTraining(triggeredBy: string = "manual"): Promise<TrainingResu
   const { data: allTrades } = await supabase
     .from("ai_signals")
     .select("actual_result")
+    .or("is_manual_trade.is.null,is_manual_trade.eq.false")
     .in("actual_result", ["WIN", "LOSS"])
     .not("closed_at", "is", null);
   
@@ -797,7 +807,7 @@ async function runTraining(triggeredBy: string = "manual"): Promise<TrainingResu
     .insert({
       training_type: "pattern_extraction",
       duration_ms: Date.now() - startTime,
-      total_signals_analyzed: totalSignals || 0,
+      total_signals_analyzed: totalSignalsEaOnly || 0,
       complete_trades_count: completeTrades || 0,
       patterns_discovered: discovered,
       patterns_updated: updated,
