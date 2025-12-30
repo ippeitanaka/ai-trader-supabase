@@ -73,6 +73,11 @@ export interface TradeResponse {
   action: number;
   // action=0 の場合でも「AIがより良いと見た方向」を返す（検証/学習用）
   suggested_dir?: number;
+  // dir=0（両方向評価）のとき、EAが簡単に表示/保存できるように top-level で返す
+  buy_win_prob?: number;
+  sell_win_prob?: number;
+  buy_action?: number;
+  sell_action?: number;
   offset_factor: number;
   expiry_minutes: number;
   confidence?: string;
@@ -1218,6 +1223,10 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
     return {
       ...selected,
       suggested_dir: picked.selectedDir,
+      buy_win_prob: buyRes.win_prob,
+      sell_win_prob: sellRes.win_prob,
+      buy_action: buyRes.action,
+      sell_action: sellRes.action,
       reasoning: mergedReasoning,
       direction_eval: {
         selected_dir: picked.selectedDir,

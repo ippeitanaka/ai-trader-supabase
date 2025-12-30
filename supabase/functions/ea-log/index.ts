@@ -11,6 +11,11 @@ interface EALogEntry {
   sym: string;                   // 銘柄
   tf?: string;                   // タイムフレーム（補足情報）
   action?: string;               // 売買の判断 (BUY/SELL/HOLD)
+  tech_action?: string;          // テクニカル起点の方向（検証用）
+  suggested_action?: string;     // AIがより良いと見た方向（検証用）
+  suggested_dir?: number;        // suggested_actionの数値版（1/-1）
+  buy_win_prob?: number;         // dir=0両方向評価のBUY勝率（0-1）
+  sell_win_prob?: number;        // dir=0両方向評価のSELL勝率（0-1）
   trade_decision?: string;       // 実際の取引状況
   win_prob?: number;             // AIの算出した勝率
   ai_reasoning?: string;         // AIの判断根拠
@@ -28,6 +33,11 @@ interface EALogInput {
   bid?: number;
   ask?: number;
   action?: string;
+  tech_action?: string;
+  suggested_action?: string;
+  suggested_dir?: number;
+  buy_win_prob?: number;
+  sell_win_prob?: number;
   win_prob?: number;
   offset_factor?: number;
   expiry_minutes?: number;
@@ -128,20 +138,52 @@ serve(async (req: Request) => {
       sym: body.sym || "UNKNOWN",
       tf: body.tf || undefined,
       action: body.action || undefined,
+      tech_action: body.tech_action || undefined,
+      suggested_action: body.suggested_action || undefined,
+      suggested_dir: body.suggested_dir !== undefined ? Number(body.suggested_dir) : undefined,
+      buy_win_prob: body.buy_win_prob !== undefined ? Number(body.buy_win_prob) : undefined,
+      sell_win_prob: body.sell_win_prob !== undefined ? Number(body.sell_win_prob) : undefined,
       trade_decision: body.trade_decision || undefined,
       win_prob: body.win_prob !== undefined ? Number(body.win_prob) : undefined,
       ai_reasoning: body.ai_reasoning || undefined,
       order_ticket: body.order_ticket !== undefined ? Number(body.order_ticket) : undefined,
     };
-    
-    const { error } = await supabase.from("ea-log").insert(logEntry);
-    
-    if (error) {
-      console.error("[ea-log] DB error:", error);
-      return new Response(
-        JSON.stringify({ error: "DB insert failed", details: error.message }),
-        { status: 500, headers: corsHeaders() }
-      );
+
+    // Prefer extended schema insert; fall back to the legacy minimal columns if remote DB
+    // has not yet been migrated (e.g., missing tech_action/suggested_action/buy_win_prob columns).
+    const { error: insertError } = await supabase.from("ea-log").insert(logEntry);
+    if (insertError) {
+      const msg = String(insertError.message || "");
+      const isMissingColumn = /column .* does not exist/i.test(msg) || /42703/.test(msg);
+      if (!isMissingColumn) {
+        console.error("[ea-log] DB error:", insertError);
+        return new Response(
+          JSON.stringify({ error: "DB insert failed", details: insertError.message }),
+          { status: 500, headers: corsHeaders() }
+        );
+      }
+
+      const legacyEntry: Pick<EALogEntry, "at" | "sym" | "tf" | "action" | "trade_decision" | "win_prob" | "ai_reasoning" | "order_ticket"> = {
+        at: logEntry.at,
+        sym: logEntry.sym,
+        tf: logEntry.tf,
+        action: logEntry.action,
+        trade_decision: logEntry.trade_decision,
+        win_prob: logEntry.win_prob,
+        ai_reasoning: logEntry.ai_reasoning,
+        order_ticket: logEntry.order_ticket,
+      };
+
+      const { error: legacyError } = await supabase.from("ea-log").insert(legacyEntry);
+      if (legacyError) {
+        console.error("[ea-log] DB legacy insert error:", legacyError);
+        return new Response(
+          JSON.stringify({ error: "DB insert failed", details: legacyError.message }),
+          { status: 500, headers: corsHeaders() }
+        );
+      }
+
+      console.warn("[ea-log] Inserted legacy entry (remote schema not migrated yet)");
     }
     
     console.log(`[ea-log] ${logEntry.sym} ${logEntry.tf || "?"} ${body.caller || "-"} ${logEntry.action || "?"}`);

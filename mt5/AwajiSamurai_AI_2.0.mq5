@@ -534,6 +534,8 @@ TechSignal Evaluate(ENUM_TIMEFRAMES tf)
 struct AIOut{
    double win_prob;int action;double offset_factor;int expiry_min;string reasoning;string confidence;
    int suggested_dir;            // action=0でも、AIがより良いと見た方向（1/-1）
+   double buy_win_prob;          // dir=0（両方向評価）でのBUY勝率（0-1）。未提供時は-1
+   double sell_win_prob;         // dir=0（両方向評価）でのSELL勝率（0-1）。未提供時は-1
    // Dynamic gating / EV
    double recommended_min_win_prob; // 0.60-0.75 (server may suggest lower)
    double expected_value_r;         // EV in R-multiples (loss=-1R, win=+1.5R)
@@ -722,6 +724,8 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    ExtractJsonNumber(resp,"win_prob",out_ai.win_prob);
    ExtractJsonInt(resp,"action",out_ai.action);
    int sdir; if(ExtractJsonInt(resp,"suggested_dir",sdir)) out_ai.suggested_dir=sdir; else out_ai.suggested_dir=0;
+   double bwp; if(ExtractJsonNumber(resp,"buy_win_prob",bwp)) out_ai.buy_win_prob=bwp; else out_ai.buy_win_prob=-1.0;
+   double swp; if(ExtractJsonNumber(resp,"sell_win_prob",swp)) out_ai.sell_win_prob=swp; else out_ai.sell_win_prob=-1.0;
    ExtractJsonNumber(resp,"offset_factor",out_ai.offset_factor);
    double tmp; if(ExtractJsonNumber(resp,"expiry_minutes",tmp)) out_ai.expiry_min=(int)MathRound(tmp);
    ExtractJsonString(resp,"reasoning",out_ai.reasoning);
@@ -777,6 +781,9 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
    "\"action\":\""+(dir>0?"BUY":(dir<0?"SELL":"HOLD"))+"\","+
    (tech_dir!=0?"\"tech_action\":\""+(tech_dir>0?"BUY":(tech_dir<0?"SELL":"HOLD"))+"\",":"")+
    (ai.suggested_dir!=0?"\"suggested_action\":\""+(ai.suggested_dir>0?"BUY":(ai.suggested_dir<0?"SELL":"HOLD"))+"\",":"")+
+   (ai.suggested_dir!=0?"\"suggested_dir\":"+IntegerToString(ai.suggested_dir)+",":"")+
+   (ai.buy_win_prob>=0?"\"buy_win_prob\":"+DoubleToString(ai.buy_win_prob,3)+",":"")+
+   (ai.sell_win_prob>=0?"\"sell_win_prob\":"+DoubleToString(ai.sell_win_prob,3)+",":"")+
    "\"win_prob\":"+DoubleToString(ai.win_prob,3)+","+
    "\"recommended_min_win_prob\":"+DoubleToString(ai.recommended_min_win_prob,3)+","+
    "\"expected_value_r\":"+DoubleToString(ai.expected_value_r,3)+","+
