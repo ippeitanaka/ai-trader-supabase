@@ -17,6 +17,43 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+function roundTo(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function toFiniteNumberOrNull(value: unknown): number | null {
+  return isFiniteNumber(value) ? value : null;
+}
+
+// Guard helpers for Postgres numeric(p,s) columns
+function pgNumeric20_5(value: unknown): number | null {
+  const n = toFiniteNumberOrNull(value);
+  if (n === null) return null;
+  // numeric(20,5) -> up to 15 digits before decimal
+  const capped = clamp(n, -9e14, 9e14);
+  return roundTo(capped, 5);
+}
+
+function pgNumeric10_2(value: unknown): number | null {
+  const n = toFiniteNumberOrNull(value);
+  if (n === null) return null;
+  // numeric(10,2) -> up to 8 digits before decimal
+  const capped = clamp(n, -9.9e7, 9.9e7);
+  return roundTo(capped, 2);
+}
+
+function pgNumeric5_2(value: unknown): number | null {
+  const n = toFiniteNumberOrNull(value);
+  if (n === null) return null;
+  const capped = clamp(n, -999.99, 999.99);
+  return roundTo(capped, 2);
+}
+
 function allowEntryMiscalculationTag(row: any): boolean {
   const planned = row?.planned_entry_price;
   const actual = row?.entry_price;
@@ -286,6 +323,35 @@ serve(async (req: Request) => {
     
     // POST: 新規シグナル記録
     if (req.method === "POST") {
+      // Minimal validation to avoid writing unusable rows
+      if (!body?.symbol || typeof body.symbol !== "string" || body.symbol.trim() === "") {
+        return new Response(
+          JSON.stringify({ error: "symbol is required" }),
+          { status: 400, headers: corsHeaders() },
+        );
+      }
+
+      if (!body?.timeframe || typeof body.timeframe !== "string" || body.timeframe.trim() === "") {
+        return new Response(
+          JSON.stringify({ error: "timeframe is required" }),
+          { status: 400, headers: corsHeaders() },
+        );
+      }
+
+      if (typeof body.dir !== "number" || ![1, -1].includes(body.dir)) {
+        return new Response(
+          JSON.stringify({ error: "dir must be 1 or -1" }),
+          { status: 400, headers: corsHeaders() },
+        );
+      }
+
+      if (typeof body.win_prob !== "number" || Number.isNaN(body.win_prob)) {
+        return new Response(
+          JSON.stringify({ error: "win_prob is required" }),
+          { status: 400, headers: corsHeaders() },
+        );
+      }
+
       const entry: AISignalEntry = {
         symbol: body.symbol,
         timeframe: body.timeframe,
@@ -304,26 +370,26 @@ serve(async (req: Request) => {
         model_version: body.model_version,
         
         // 価格情報
-        bid: body.bid,
-        ask: body.ask,
+        bid: pgNumeric20_5(body.bid) ?? undefined,
+        ask: pgNumeric20_5(body.ask) ?? undefined,
         
         // 移動平均線
-        ema_25: body.ema_25,
-        sma_100: body.sma_100,
+        ema_25: pgNumeric20_5(body.ema_25) ?? undefined,
+        sma_100: pgNumeric20_5(body.sma_100) ?? undefined,
         ma_cross: body.ma_cross,
         
         // MACD指標（ネストされたオブジェクトから抽出）
-        macd_main: body.macd?.main,
-        macd_signal: body.macd?.signal,
-        macd_histogram: body.macd?.histogram,
+        macd_main: pgNumeric20_5(body.macd?.main) ?? undefined,
+        macd_signal: pgNumeric20_5(body.macd?.signal) ?? undefined,
+        macd_histogram: pgNumeric20_5(body.macd?.histogram) ?? undefined,
         macd_cross: body.macd?.cross,
         
         // 一目均衡表（ネストされたオブジェクトから抽出）
-        ichimoku_tenkan: body.ichimoku?.tenkan,
-        ichimoku_kijun: body.ichimoku?.kijun,
-        ichimoku_senkou_a: body.ichimoku?.senkou_a,
-        ichimoku_senkou_b: body.ichimoku?.senkou_b,
-        ichimoku_chikou: body.ichimoku?.chikou,
+        ichimoku_tenkan: pgNumeric20_5(body.ichimoku?.tenkan) ?? undefined,
+        ichimoku_kijun: pgNumeric20_5(body.ichimoku?.kijun) ?? undefined,
+        ichimoku_senkou_a: pgNumeric20_5(body.ichimoku?.senkou_a) ?? undefined,
+        ichimoku_senkou_b: pgNumeric20_5(body.ichimoku?.senkou_b) ?? undefined,
+        ichimoku_chikou: pgNumeric20_5(body.ichimoku?.chikou) ?? undefined,
         ichimoku_tk_cross: body.ichimoku?.tk_cross,
         ichimoku_cloud_color: body.ichimoku?.cloud_color,
         ichimoku_price_vs_cloud: body.ichimoku?.price_vs_cloud,
@@ -334,14 +400,18 @@ serve(async (req: Request) => {
         entry_method: body.entry_method ?? null,
         entry_params: body.entry_params ?? null,
         method_selected_by: body.method_selected_by ?? null,
-        method_confidence: body.method_confidence ?? null,
+        method_confidence: isFiniteNumber(body.method_confidence) ? body.method_confidence : null,
         method_reason: body.method_reason ?? null,
         
         // MLパターントラッキング
         ml_pattern_used: body.ml_pattern_used ?? false,
         ml_pattern_id: body.ml_pattern_id ?? null,
         ml_pattern_name: body.ml_pattern_name ?? null,
-        ml_pattern_confidence: body.ml_pattern_confidence ?? null,
+        ml_pattern_confidence: pgNumeric5_2(body.ml_pattern_confidence) ?? null,
+
+        // manual trade
+        // NOTE: lot_size is numeric(10,2) in some schemas
+        lot_size: pgNumeric10_2(body.lot_size) ?? undefined,
 
         // Virtual (paper/shadow) trade support
         is_virtual: body.is_virtual ?? false,
@@ -363,7 +433,12 @@ serve(async (req: Request) => {
       if (error) {
         console.error("[ai-signals] Insert error:", error);
         return new Response(
-          JSON.stringify({ error: error.message }),
+          JSON.stringify({
+            error: error.message,
+            code: (error as any).code ?? null,
+            details: (error as any).details ?? null,
+            hint: (error as any).hint ?? null,
+          }),
           { status: 500, headers: corsHeaders() }
         );
       }

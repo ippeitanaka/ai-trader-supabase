@@ -11,6 +11,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 export interface TradeRequest {
   symbol: string;
   timeframe: string;
+
+  // EA側の実行閾値（例: 0.60）。サーバの action 判定がこれより厳しくならないようにする。
+  min_win_prob?: number;
   
   // 価格情報
   price: number;
@@ -112,13 +115,41 @@ function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): 
 
   const reasons: string[] = [];
 
+  // Range-like regime: make breakout harder to pass.
+  // Rationale: breakouts are more likely to fail in low-trend + low-volatility squeeze.
+  // Uses the same thresholds as signal tagging (weak_trend + bb_squeeze).
+  const RANGE_ADX_MAX = 15;
+  const RANGE_BB_WIDTH_MAX = 0.003;
+  const BREAKOUT_RANGE_EXTRA_MIN_WIN_PROB = 0.05;
+
+  const adx = tradeReq.adx;
+  const bbWidth = tradeReq.bb_width;
+  const isRangeLike =
+    typeof adx === "number" &&
+    isFinite(adx) &&
+    typeof bbWidth === "number" &&
+    isFinite(bbWidth) &&
+    adx < RANGE_ADX_MAX &&
+    bbWidth < RANGE_BB_WIDTH_MAX;
+
+  if (isRangeLike && response.entry_method === "breakout" && typeof response.win_prob === "number") {
+    const baseMinWinProb = typeof tradeReq.min_win_prob === "number" ? tradeReq.min_win_prob : 0.7;
+    const required = Math.min(baseMinWinProb + BREAKOUT_RANGE_EXTRA_MIN_WIN_PROB, 0.8);
+    if (response.win_prob < required) {
+      reasons.push(
+        `breakout suppressed in range (adx<${RANGE_ADX_MAX}, bb_width<${RANGE_BB_WIDTH_MAX}, need>=${required.toFixed(2)})`,
+      );
+    }
+  }
+
   // BTCUSD: avoid observed loss cluster at UTC19
   if (symbol === "BTCUSD" && utcHour === 19) {
     reasons.push("BTCUSD disabled at UTC19");
   }
 
   // BTCUSD: pullback underperforms unless probability is very high
-  const BTC_PULLBACK_MIN_WIN_PROB = 0.8;
+  // NOTE: Keep this guard lenient; overly strict values can lead to 100% SKIPPED.
+  const BTC_PULLBACK_MIN_WIN_PROB = 0.75;
   if (
     symbol === "BTCUSD" &&
     response.entry_method === "pullback" &&
@@ -1086,8 +1117,18 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     win_prob = Math.max(minProb, Math.min(maxProb, win_prob));
     
     const confidence = aiResult.confidence || "unknown";
-    const reasoning = aiResult.reasoning || "N/A";
+    const clientMinWinProbProvided = typeof req.min_win_prob === "number";
+    const client_min_win_prob = sanitizeRecommendedMinWinProb(
+      clientMinWinProbProvided ? req.min_win_prob : undefined,
+    ) ?? 0.70;
+    const reasoningBase = aiResult.reasoning || "N/A";
+    const reasoning = clientMinWinProbProvided
+      ? reasoningBase
+      : `${reasoningBase} | WARN: min_win_prob not provided by client; default gate=0.70`;
     const recommended_min_win_prob = sanitizeRecommendedMinWinProb(aiResult.recommended_min_win_prob);
+    // Guard: never execute below EA-configured minimum.
+    // recommended_min_win_prob はログ/参考用（実行ゲートとしては使用しない）。
+    const action_gate_min_win_prob = client_min_win_prob;
     // EV is deterministic from win_prob. Do NOT trust model-provided EV (often templates a constant).
     const expected_value_r = computeExpectedValueR(win_prob);
     const skip_reason = typeof aiResult.skip_reason === "string" ? aiResult.skip_reason : "";
@@ -1131,7 +1172,7 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     
     return {
       win_prob: Math.round(win_prob * 1000) / 1000,
-      action: win_prob >= (recommended_min_win_prob ?? 0.70) ? dir : 0,
+      action: win_prob >= action_gate_min_win_prob ? dir : 0,
       suggested_dir: dir,
       offset_factor: atr > 0.001 ? 0.25 : 0.2,
       expiry_minutes: 90,

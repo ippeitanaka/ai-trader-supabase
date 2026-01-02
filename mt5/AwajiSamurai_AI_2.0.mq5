@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| AwajiSamurai_AI_2.0.mq5  (ver 1.5.2)                            |
+//| AwajiSamurai_AI_2.0.mq5  (ver 1.5.4)                            |
 //| - Supabase: ai-signals(AI側) / ea-log                            |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
@@ -36,12 +36,7 @@ input long   Magic               = 26091501;
 input int    MaxPositions        = 1;      // 同一銘柄の最大ポジション数
 
 // 🚨 EMERGENCY: エントリー制限
-input bool   DisableBreakout     = true;  // 🚨 breakoutエントリーを一時無効化（現在100%失敗中）
-
-// 二重ガード（Functions側のガードに加えてEA側でも確実に止める）
-input bool   DisableBTC_UTC19    = true;  // 🚨 BTCUSDのUTC19を停止
-input bool   DisableBTC_Pullback = true;  // 🚨 BTCUSDのpullbackを抑制
-input double BTC_Pullback_MinWinProb = 0.80; // pullbackを許可する最低勝率（BTCUSDのみ）
+input bool   DisableBreakout     = true;  // 🚨 breakoutエントリーを一時無効化
 
 input bool   DebugLogs           = true;
 input int    LogCooldownSec      = 30;  // 0=全出力, >0=間引き, -1=完全OFF
@@ -55,11 +50,10 @@ input bool   EnableVirtualLearning = true;
 input bool   VirtualTrack_SkippedMaxPos = true;
 input bool   VirtualTrack_SkippedTrackedPos = true;
 input bool   VirtualTrack_BreakoutDisabled = true;
-input bool   VirtualTrack_BTC_UTC19Disabled = true;
-input bool   VirtualTrack_BTC_PullbackDisabled = true;
 // 60-69%帯は実行しないが、検証材料として仮想トレードを記録
 input bool   VirtualTrack_LowBand = true;
 input double VirtualLowBandMinProb = 0.60;
+input double VirtualLowBandMaxProb = 0.69;
 
 // ★ URLは自分のプロジェクトに合わせて設定
 input string AI_Endpoint_URL     = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-trader";
@@ -69,7 +63,7 @@ input string AI_Signals_Update_URL = "https://nebphrnnpmuqbkymwefs.supabase.co/f
 input string AI_Bearer_Token     = "YOUR_SERVICE_ROLE_KEY_HERE";
 
 input string AI_EA_Instance      = "main";
-input string AI_EA_Version       = "1.5.3";
+input string AI_EA_Version       = "1.5.4";
 input int    AI_Timeout_ms       = 5000;
 
 // ===== 一目均衡表設定 =====
@@ -258,9 +252,8 @@ bool ShouldVirtualTrack(const string decision_code)
    if(decision_code=="SKIPPED_MAX_POS") return VirtualTrack_SkippedMaxPos;
    if(decision_code=="SKIPPED_TRACKED_POS") return VirtualTrack_SkippedTrackedPos;
    if(decision_code=="SKIPPED_BREAKOUT_DISABLED") return VirtualTrack_BreakoutDisabled;
-   if(decision_code=="SKIPPED_BTC_UTC19") return VirtualTrack_BTC_UTC19Disabled;
-   if(decision_code=="SKIPPED_BTC_PULLBACK") return VirtualTrack_BTC_PullbackDisabled;
    if(decision_code=="SKIPPED_LOW_BAND") return VirtualTrack_LowBand;
+   if(decision_code=="SKIPPED_ACTION_0") return VirtualTrack_LowBand;
    return false;
 }
 
@@ -396,7 +389,7 @@ bool GetIchimoku(ENUM_TIMEFRAMES tf,IchimokuValues &ich,int shift=0)
       return false;
    }
    
-   double tenkan_buf[],kijun_buf[],senkou_a_buf[],senkou_b_buf[],chikou_buf[];
+   double tenkan_buf[],kijun_buf[],senkou_a_buf[],senkou_b_buf[];
    
    // 各バッファからデータを取得
    // 0:Tenkan, 1:Kijun, 2:SpanA, 3:SpanB, 4:Chikou
@@ -405,7 +398,6 @@ bool GetIchimoku(ENUM_TIMEFRAMES tf,IchimokuValues &ich,int shift=0)
    ok=ok&&CopyBuffer(h,1,shift,1,kijun_buf)>0;
    ok=ok&&CopyBuffer(h,2,shift,1,senkou_a_buf)>0;
    ok=ok&&CopyBuffer(h,3,shift,1,senkou_b_buf)>0;
-   ok=ok&&CopyBuffer(h,4,shift,1,chikou_buf)>0;
    
    if(!ok){
       IndicatorRelease(h);
@@ -417,7 +409,14 @@ bool GetIchimoku(ENUM_TIMEFRAMES tf,IchimokuValues &ich,int shift=0)
    ich.kijun=kijun_buf[0];
    ich.senkou_a=senkou_a_buf[0];
    ich.senkou_b=senkou_b_buf[0];
-   ich.chikou=chikou_buf[0];
+
+   // Chikou(遅行スパン)は「終値を Ichimoku_Kijun 期間だけ過去にシフト」して描画されるため、
+   // shift=0 のバッファ値が EMPTY_VALUE になり得る。
+   // 学習/検証用スナップショットでは「shift+Ichimoku_Kijun の終値」を保存して異常値を避ける。
+   int need=shift+Ichimoku_Kijun;
+   int bars=Bars(_Symbol,tf);
+   if(bars>need) ich.chikou=iClose(_Symbol,tf,need);
+   else ich.chikou=0;
    
    IndicatorRelease(h);
    return true;
@@ -632,14 +631,51 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    double sma_100=MA(tf,100,MODE_SMA,PRICE_CLOSE,0);
    double sma_200=MA(tf,200,MODE_SMA,PRICE_CLOSE,0);
    double sma_800=MA(tf,800,MODE_SMA,PRICE_CLOSE,0);
+
+   // クロス系は「状態(常時±1)」ではなく「発生イベント(±1/0)」として送る
+   // QuadFusion側がクロス時に加点するため、常時±1だと常にバイアスが乗る
+   double ema_25_prev=MA(tf,25,MODE_EMA,PRICE_CLOSE,1);
+   double sma_100_prev=MA(tf,100,MODE_SMA,PRICE_CLOSE,1);
+   int ma_cross=0;
+   if(ema_25> sma_100 && ema_25_prev<=sma_100_prev) ma_cross=1;
+   else if(ema_25< sma_100 && ema_25_prev>=sma_100_prev) ma_cross=-1;
    
    // MACD取得
-   double macd_main,macd_signal,macd_hist;
+   double macd_main=0,macd_signal=0,macd_hist=0;
    bool has_macd=GetMACD(tf,macd_main,macd_signal,macd_hist,0);
+
+   double macd_main_prev=0,macd_signal_prev=0,macd_hist_prev=0;
+   bool has_macd_prev=GetMACD(tf,macd_main_prev,macd_signal_prev,macd_hist_prev,1);
+   int macd_cross=0;
+   if(has_macd && has_macd_prev){
+      if(macd_main>macd_signal && macd_main_prev<=macd_signal_prev) macd_cross=1;
+      else if(macd_main<macd_signal && macd_main_prev>=macd_signal_prev) macd_cross=-1;
+   }
    
    // 一目均衡表取得
    IchimokuValues ich;
+   ich.tenkan=0; ich.kijun=0; ich.senkou_a=0; ich.senkou_b=0; ich.chikou=0;
    bool has_ichimoku=GetIchimoku(tf,ich,0);
+
+   IchimokuValues ich_prev;
+   ich_prev.tenkan=0; ich_prev.kijun=0; ich_prev.senkou_a=0; ich_prev.senkou_b=0; ich_prev.chikou=0;
+   bool has_ichimoku_prev=GetIchimoku(tf,ich_prev,1);
+
+   int tk_cross=0;
+   if(has_ichimoku && has_ichimoku_prev){
+      if(ich.tenkan>ich.kijun && ich_prev.tenkan<=ich_prev.kijun) tk_cross=1;
+      else if(ich.tenkan<ich.kijun && ich_prev.tenkan>=ich_prev.kijun) tk_cross=-1;
+   }
+
+   // 雲の色は「ほぼ同値(薄い雲)」のときは 0 に落としてノイズを減らす
+   int cloud_color=0;
+   if(has_ichimoku){
+      double atr_for_eps = (atr>0?atr:ATRv(tf,14,0));
+      double kumo_thickness = MathAbs(ich.senkou_a-ich.senkou_b);
+      double eps = (atr_for_eps>0 ? atr_for_eps*0.10 : 0);
+      if(eps>0 && kumo_thickness<=eps) cloud_color=0;
+      else cloud_color = (ich.senkou_a>ich.senkou_b ? 1 : (ich.senkou_a<ich.senkou_b ? -1 : 0));
+   }
 
    // ADX取得
    double adx_main=0, di_plus=0, di_minus=0;
@@ -661,6 +697,9 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    string payload="{"+
    "\"symbol\":\""+JsonEscape(_Symbol)+"\","+
    "\"timeframe\":\""+JsonEscape(tf_label)+"\","+
+
+   // EA設定（サーバ側の action 判定がEAの最小勝率より厳しくならないように共有）
+   "\"min_win_prob\":"+DoubleToString(MinWinProb,3)+","+
    
    // 価格情報
    "\"price\":"+DoubleToString(price,_Digits)+","+
@@ -672,7 +711,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    "\"sma_100\":"+DoubleToString(sma_100,_Digits)+","+
    "\"sma_200\":"+DoubleToString(sma_200,_Digits)+","+
    "\"sma_800\":"+DoubleToString(sma_800,_Digits)+","+
-   "\"ma_cross\":"+(ema_25>sma_100?"1":"-1")+","+
+   "\"ma_cross\":"+IntegerToString(ma_cross)+","+
    
    // RSI & ATR
    "\"rsi\":"+DoubleToString(rsi,2)+","+
@@ -690,7 +729,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
       "\"main\":"+DoubleToString(macd_main,5)+","+
       "\"signal\":"+DoubleToString(macd_signal,5)+","+
       "\"histogram\":"+DoubleToString(macd_hist,5)+","+
-      "\"cross\":"+(macd_main>macd_signal?"1":"-1")+
+      "\"cross\":"+IntegerToString(macd_cross)+
    "},"+
    
    // 一目均衡表（全ライン）
@@ -700,8 +739,8 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
       "\"senkou_a\":"+DoubleToString(ich.senkou_a,_Digits)+","+
       "\"senkou_b\":"+DoubleToString(ich.senkou_b,_Digits)+","+
       "\"chikou\":"+DoubleToString(ich.chikou,_Digits)+","+
-      "\"tk_cross\":"+(ich.tenkan>ich.kijun?"1":"-1")+","+
-      "\"cloud_color\":"+(ich.senkou_a>ich.senkou_b?"1":"-1")+","+
+      "\"tk_cross\":"+IntegerToString(tk_cross)+","+
+      "\"cloud_color\":"+IntegerToString(cloud_color)+","+
       "\"price_vs_cloud\":"+
          (price>MathMax(ich.senkou_a,ich.senkou_b)?"1":
           (price<MathMin(ich.senkou_a,ich.senkou_b)?"-1":"0"))+
@@ -812,6 +851,61 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
 {
    // レジーム判定用の追加特徴量（QueryAIと同様にEA側で計算して保存する）
    ENUM_TIMEFRAMES tf=(tf_label=="M15")?TF_Entry:TF_Recheck;
+
+   // 価格情報
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   // 移動平均（QueryAIと同一）
+   double ema_25=MA(tf,25,MODE_EMA,PRICE_CLOSE,0);
+   double sma_100=MA(tf,100,MODE_SMA,PRICE_CLOSE,0);
+   double ema_25_prev=MA(tf,25,MODE_EMA,PRICE_CLOSE,1);
+   double sma_100_prev=MA(tf,100,MODE_SMA,PRICE_CLOSE,1);
+   int ma_cross=0;
+   if(ema_25> sma_100 && ema_25_prev<=sma_100_prev) ma_cross=1;
+   else if(ema_25< sma_100 && ema_25_prev>=sma_100_prev) ma_cross=-1;
+
+   // MACD（生データ + クロス）
+   double macd_main=0,macd_signal=0,macd_hist=0;
+   bool has_macd=GetMACD(tf,macd_main,macd_signal,macd_hist,0);
+   double macd_main_prev=0,macd_signal_prev=0,macd_hist_prev=0;
+   bool has_macd_prev=GetMACD(tf,macd_main_prev,macd_signal_prev,macd_hist_prev,1);
+   int macd_cross=0;
+   if(has_macd && has_macd_prev){
+      if(macd_main>macd_signal && macd_main_prev<=macd_signal_prev) macd_cross=1;
+      else if(macd_main<macd_signal && macd_main_prev>=macd_signal_prev) macd_cross=-1;
+   }
+
+   // 一目均衡表（全ライン + クロス/雲色/雲位置）
+   IchimokuValues ich;
+   ich.tenkan=0; ich.kijun=0; ich.senkou_a=0; ich.senkou_b=0; ich.chikou=0;
+   bool has_ichimoku=GetIchimoku(tf,ich,0);
+   IchimokuValues ich_prev;
+   ich_prev.tenkan=0; ich_prev.kijun=0; ich_prev.senkou_a=0; ich_prev.senkou_b=0; ich_prev.chikou=0;
+   bool has_ichimoku_prev=GetIchimoku(tf,ich_prev,1);
+
+   int tk_cross=0;
+   if(has_ichimoku && has_ichimoku_prev){
+      if(ich.tenkan>ich.kijun && ich_prev.tenkan<=ich_prev.kijun) tk_cross=1;
+      else if(ich.tenkan<ich.kijun && ich_prev.tenkan>=ich_prev.kijun) tk_cross=-1;
+   }
+
+   int cloud_color=0;
+   if(has_ichimoku){
+      double atr_for_eps = (atr>0?atr:ATRv(tf,14,0));
+      double kumo_thickness = MathAbs(ich.senkou_a-ich.senkou_b);
+      double eps = (atr_for_eps>0 ? atr_for_eps*0.10 : 0);
+      if(eps>0 && kumo_thickness<=eps) cloud_color=0;
+      else cloud_color = (ich.senkou_a>ich.senkou_b ? 1 : (ich.senkou_a<ich.senkou_b ? -1 : 0));
+   }
+
+   int price_vs_cloud=0;
+   if(has_ichimoku){
+      if(price>MathMax(ich.senkou_a,ich.senkou_b)) price_vs_cloud=1;
+      else if(price<MathMin(ich.senkou_a,ich.senkou_b)) price_vs_cloud=-1;
+      else price_vs_cloud=0;
+   }
+
    double atr_norm=(price>0?atr/price:0);
    double adx_main=0, di_plus=0, di_minus=0;
    bool has_adx=GetADX(tf,adx_main,di_plus,di_minus,0);
@@ -832,6 +926,8 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"timeframe\":\""+JsonEscape(tf_label)+"\","+
    "\"dir\":"+IntegerToString(dir)+","+
    "\"win_prob\":"+DoubleToString(ai.win_prob,3)+","+
+   "\"bid\":"+DoubleToString(bid,_Digits)+","+
+   "\"ask\":"+DoubleToString(ask,_Digits)+","+
    "\"rsi\":"+DoubleToString(rsi,2)+","+
    "\"atr\":"+DoubleToString(atr,5)+","+
    "\"atr_norm\":"+DoubleToString(atr_norm,8)+","+
@@ -840,6 +936,25 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"di_minus\":"+DoubleToString(has_adx?di_minus:0,2)+","+
    "\"bb_width\":"+DoubleToString(has_bb?bb_width:0,6)+","+
    "\"price\":"+DoubleToString(price,_Digits)+","+
+   "\"ema_25\":"+DoubleToString(ema_25,_Digits)+","+
+   "\"sma_100\":"+DoubleToString(sma_100,_Digits)+","+
+   "\"ma_cross\":"+IntegerToString(ma_cross)+","+
+   "\"macd\":{"+
+      "\"main\":"+DoubleToString(has_macd?macd_main:0,5)+","+
+      "\"signal\":"+DoubleToString(has_macd?macd_signal:0,5)+","+
+      "\"histogram\":"+DoubleToString(has_macd?macd_hist:0,5)+","+
+      "\"cross\":"+IntegerToString(macd_cross)+
+   "},"+
+   "\"ichimoku\":{"+
+      "\"tenkan\":"+DoubleToString(has_ichimoku?ich.tenkan:0,_Digits)+","+
+      "\"kijun\":"+DoubleToString(has_ichimoku?ich.kijun:0,_Digits)+","+
+      "\"senkou_a\":"+DoubleToString(has_ichimoku?ich.senkou_a:0,_Digits)+","+
+      "\"senkou_b\":"+DoubleToString(has_ichimoku?ich.senkou_b:0,_Digits)+","+
+      "\"chikou\":"+DoubleToString(has_ichimoku?ich.chikou:0,_Digits)+","+
+      "\"tk_cross\":"+IntegerToString(tk_cross)+","+
+      "\"cloud_color\":"+IntegerToString(cloud_color)+","+
+      "\"price_vs_cloud\":"+IntegerToString(price_vs_cloud)+
+   "},"+
    "\"reason\":\""+JsonEscape(reason)+"\","+
    "\"instance\":\""+JsonEscape(AI_EA_Instance)+"\","+
    "\"model_version\":\""+JsonEscape(AI_EA_Version)+"\","+
@@ -1130,8 +1245,10 @@ void OnM15NewBar()
    if(ai.recommended_min_win_prob>0.0 && ai.recommended_min_win_prob<effectiveMin) effectiveMin=ai.recommended_min_win_prob;
    double ev_r = (ai.expected_value_r>-100.0 ? ai.expected_value_r : (ai.win_prob*RewardRR - (1.0-ai.win_prob)*1.0));
    double ev_gate = (effectiveMin*RewardRR - (1.0-effectiveMin)*1.0);
-   // 二重ガード: Functions側が action=0 を返した場合は必ず見送る
-   bool threshold_met=(ai.action!=0 && (ai.win_prob>=effectiveMin || ev_r>=ev_gate));
+   // 二重ガード:
+   // 1) Functions側が action=0 を返した場合は必ず見送る
+   // 2) EA設定の MinWinProb 未満では絶対に発注しない（誤作動防止）
+   bool threshold_met=(ai.action!=0 && ai.win_prob>=MinWinProb);
 
    // derive expiry minutes for planned/virtual tracking
    int expiry_min = PendingExpiryMin;
@@ -1145,27 +1262,6 @@ void OnM15NewBar()
       // 以降の注文・仮想・記録は方向を統一
       TechSignal t_exec=t; t_exec.dir=decision_dir;
       TechSignal t_plan=t; t_plan.dir=suggested_dir;
-
-      // 🚨 BTCUSD UTC hour block
-      if(sym=="BTCUSD" && DisableBTC_UTC19){
-         int utcHour=GetUTCHour();
-         if(utcHour==19){
-            LogAIDecision("M15",decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_BTC_UTC19",threshold_met,posCount,0,tech_dir);
-            SafePrint("[M15] BTCUSD disabled at UTC19");
-            MaybeRecordVirtualSkip("SKIPPED_BTC_UTC19",t_plan,rsi,ai,expiry_min);
-            return;
-         }
-      }
-
-      // 🚨 BTCUSD pullback suppression (unless very high probability)
-      if(sym=="BTCUSD" && DisableBTC_Pullback && method=="pullback"){
-         if(ai.win_prob < BTC_Pullback_MinWinProb){
-            LogAIDecision("M15",decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_BTC_PULLBACK",threshold_met,posCount,0,tech_dir);
-            SafePrint(StringFormat("[M15] BTCUSD pullback blocked (prob=%.0f%% < %.0f%%)",ai.win_prob*100,BTC_Pullback_MinWinProb*100));
-            MaybeRecordVirtualSkip("SKIPPED_BTC_PULLBACK",t_plan,rsi,ai,expiry_min);
-            return;
-         }
-      }
 
       // ポジション数チェック（ペンディングオーダー含む）
       if(posCount>=MaxPositions){
@@ -1281,14 +1377,28 @@ void OnM15NewBar()
    }else{
       TechSignal t_plan=t; t_plan.dir=(ai.suggested_dir!=0?ai.suggested_dir:tech_dir);
       LogAIDecision("M15",ai.action,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_LOW_PROB",threshold_met,posCount,0,tech_dir);
-      SafePrint(StringFormat("[M15] skip prob=%.0f%% < thr=%.0f%% (eff=%.0f%% ev=%.2f gate=%.2f)",ai.win_prob*100,MinWinProb*100,effectiveMin*100,ev_r,ev_gate));
+      if(ai.action==0){
+         SafePrint(StringFormat("[M15] skip: server action=0 (prob=%.0f%% eff=%.0f%% ev=%.2f gate=%.2f method=%s reason=%s)",
+            ai.win_prob*100,effectiveMin*100,ev_r,ev_gate,ai.entry_method,ai.skip_reason));
+      }else{
+         SafePrint(StringFormat("[M15] skip: below threshold (prob=%.0f%% < eff=%.0f%% and ev=%.2f < gate=%.2f)",
+            ai.win_prob*100,effectiveMin*100,ev_r,ev_gate));
+      }
 
       // 検証用: 「実トレード閾値未満」だが一定以上の勝率帯は仮想トレードとして記録（実トレードはしない）
       // 上限は MT5設定 + サーバ推奨(下げ方向のみ) を反映した effectiveMin に追従させる
       // ガード由来（entry_method=none / skip_reason=guard）は除外
-      if(ai.win_prob>=VirtualLowBandMinProb && ai.win_prob<effectiveMin && ai.entry_method!="none" && ai.skip_reason!="guard")
+      double vUpper = MathMin(effectiveMin, VirtualLowBandMaxProb);
+      if(vUpper>VirtualLowBandMinProb && ai.win_prob>=VirtualLowBandMinProb && ai.win_prob<vUpper && ai.entry_method!="none" && ai.skip_reason!="guard")
       {
          MaybeRecordVirtualSkip("SKIPPED_LOW_BAND",t_plan,rsi,ai,expiry_min);
+      }
+
+      // action=0（サーバ側で最終見送り）でも高勝率なら仮想として残す
+      // 例: ML高品質パターン vs テクニカル矛盾など。検証/後学習/説明用にスナップショットが必要。
+      if(ai.action==0 && ai.win_prob>=VirtualLowBandMaxProb && ai.entry_method!="none" && ai.skip_reason!="guard")
+      {
+         MaybeRecordVirtualSkip("SKIPPED_ACTION_0",t_plan,rsi,ai,expiry_min);
       }
    }
 }
@@ -1318,7 +1428,8 @@ void OnH1NewBar()
    if(ai.recommended_min_win_prob>0.0 && ai.recommended_min_win_prob<effectiveMin) effectiveMin=ai.recommended_min_win_prob;
    double ev_r = (ai.expected_value_r>-100.0 ? ai.expected_value_r : (ai.win_prob*RewardRR - (1.0-ai.win_prob)*1.0));
    double ev_gate = (effectiveMin*RewardRR - (1.0-effectiveMin)*1.0);
-   bool threshold_met=(ai.action!=0 && (ai.win_prob>=effectiveMin || ev_r>=ev_gate));
+   // 二重ガード（H1再判定でも同様）
+   bool threshold_met=(ai.action!=0 && ai.win_prob>=MinWinProb);
    int suggested_dir = (ai.suggested_dir!=0?ai.suggested_dir:tech_dir);
    bool rev=(suggested_dir!=0 && suggested_dir!=g_pendingDir);
    

@@ -87,6 +87,15 @@ function toISO(value: any): string {
   return new Date().toISOString();
 }
 
+function normalizeSym(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value.trim();
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -100,6 +109,18 @@ serve(async (req: Request) => {
   }
   
   try {
+    // NOTE: This function uses the service role key for DB writes.
+    // Require a matching Bearer token to prevent random internet traffic from inserting junk rows.
+    const auth = req.headers.get("authorization") || "";
+    const expectedBearer = Deno.env.get("EA_LOG_BEARER_TOKEN") || SUPABASE_SERVICE_ROLE_KEY;
+    if (auth !== `Bearer ${expectedBearer}`) {
+      console.warn("[ea-log] Unauthorized request");
+      return new Response(
+        JSON.stringify({ error: "Unauthorized" }),
+        { status: 401, headers: corsHeaders() },
+      );
+    }
+
     const raw = await req.text();
     
     if (!raw || raw.trim().length === 0) {
@@ -130,12 +151,33 @@ serve(async (req: Request) => {
         { status: 400, headers: corsHeaders() }
       );
     }
+
+    const sym = normalizeSym((body as any).sym);
+    if (!sym) {
+      console.warn("[ea-log] Missing or empty sym");
+      return new Response(
+        JSON.stringify({ error: "Missing required field: sym" }),
+        { status: 400, headers: corsHeaders() },
+      );
+    }
+
+    const hasAnyMeaningfulField =
+      isNonEmptyString((body as any).action) ||
+      isNonEmptyString((body as any).trade_decision) ||
+      (typeof (body as any).win_prob === "number" && Number.isFinite((body as any).win_prob));
+    if (!hasAnyMeaningfulField) {
+      console.warn(`[ea-log] Rejecting low-signal payload sym=${sym}`);
+      return new Response(
+        JSON.stringify({ error: "Missing required fields (action/trade_decision/win_prob)" }),
+        { status: 400, headers: corsHeaders() },
+      );
+    }
     
     // Extract only essential columns for simplified ea-log table
     // EA can send all fields, but we only store what's needed for monitoring
     const logEntry: EALogEntry = {
       at: toISO(body.at),
-      sym: body.sym || "UNKNOWN",
+      sym,
       tf: body.tf || undefined,
       action: body.action || undefined,
       tech_action: body.tech_action || undefined,
