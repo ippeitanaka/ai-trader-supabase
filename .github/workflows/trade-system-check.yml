@@ -186,20 +186,31 @@ jobs:
           echo "📝 ea-log エンドポイント確認"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           
+          NOW_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+          # ea-log requires: sym, and at least one of (action/trade_decision/win_prob)
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
             "${{ secrets.SUPABASE_URL }}/functions/v1/ea-log" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
-            -d '{
-              "level": "INFO",
-              "message": "Health check from GitHub Actions",
-              "test_mode": true
-            }')
+            -d "{\
+              \"at\": \"${NOW_UTC}\",\
+              \"sym\": \"HEALTHCHECK\",\
+              \"tf\": \"H1\",\
+              \"action\": \"HOLD\",\
+              \"trade_decision\": \"HEALTH_CHECK\",\
+              \"win_prob\": 0.5,\
+              \"ai_reasoning\": \"Health check from GitHub Actions\",\
+              \"caller\": \"system-health-check\",\
+              \"instance\": \"github-actions\"\
+            }")')
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
           BODY=$(echo "$RESPONSE" | sed '$d')
           
           echo "HTTP Status: $HTTP_CODE"
+
+          echo "$BODY" | jq '.' || echo "$BODY"
           
           if [ "$HTTP_CODE" -eq 200 ]; then
             echo "✅ ea-log: 正常"
