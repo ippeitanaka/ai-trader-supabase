@@ -109,11 +109,86 @@ export interface TradeResponse {
   };
 }
 
+type InputSanityIssue = {
+  field: string;
+  problem: string;
+  value?: unknown;
+};
+
+function assessInputSanity(req: TradeRequest): InputSanityIssue[] {
+  const issues: InputSanityIssue[] = [];
+
+  const isFiniteNumber = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+  const requireFinite = (field: string, value: unknown) => {
+    if (!isFiniteNumber(value)) issues.push({ field, problem: "missing_or_non_finite", value });
+  };
+  const requirePositive = (field: string, value: unknown) => {
+    if (!isFiniteNumber(value) || value <= 0) issues.push({ field, problem: "non_positive", value });
+  };
+  const requireRange = (field: string, value: unknown, min: number, max: number) => {
+    if (!isFiniteNumber(value) || value < min || value > max) issues.push({ field, problem: `out_of_range(${min}-${max})`, value });
+  };
+
+  requirePositive("price", req.price);
+  requirePositive("bid", req.bid);
+  requirePositive("ask", req.ask);
+  if (isFiniteNumber(req.bid) && isFiniteNumber(req.ask) && req.ask < req.bid) {
+    issues.push({ field: "bid_ask", problem: "ask_lt_bid", value: { bid: req.bid, ask: req.ask } });
+  }
+
+  requirePositive("ema_25", req.ema_25);
+  requirePositive("sma_100", req.sma_100);
+  requirePositive("sma_200", req.sma_200);
+  requirePositive("sma_800", req.sma_800);
+  requireRange("rsi", req.rsi, 0, 100);
+  requirePositive("atr", req.atr);
+
+  // Optional regime fields: if provided, they must be sane.
+  if (typeof req.atr_norm !== "undefined") {
+    if (!isFiniteNumber(req.atr_norm) || req.atr_norm <= 0 || req.atr_norm > 0.2) {
+      issues.push({ field: "atr_norm", problem: "invalid_optional", value: req.atr_norm });
+    }
+  }
+  if (typeof req.adx !== "undefined") {
+    if (!isFiniteNumber(req.adx) || req.adx < 0 || req.adx > 100) {
+      issues.push({ field: "adx", problem: "invalid_optional", value: req.adx });
+    }
+  }
+  if (typeof req.bb_width !== "undefined") {
+    if (!isFiniteNumber(req.bb_width) || req.bb_width <= 0 || req.bb_width > 0.5) {
+      issues.push({ field: "bb_width", problem: "invalid_optional", value: req.bb_width });
+    }
+  }
+
+  // Nested required groups (EA payload corruption often shows up here)
+  requireFinite("macd.main", req.macd?.main);
+  requireFinite("macd.signal", req.macd?.signal);
+  requireFinite("macd.histogram", req.macd?.histogram);
+  requireFinite("macd.cross", req.macd?.cross);
+
+  requirePositive("ichimoku.tenkan", req.ichimoku?.tenkan);
+  requirePositive("ichimoku.kijun", req.ichimoku?.kijun);
+  requirePositive("ichimoku.senkou_a", req.ichimoku?.senkou_a);
+  requirePositive("ichimoku.senkou_b", req.ichimoku?.senkou_b);
+  requirePositive("ichimoku.chikou", req.ichimoku?.chikou);
+  requireFinite("ichimoku.tk_cross", req.ichimoku?.tk_cross);
+  requireFinite("ichimoku.cloud_color", req.ichimoku?.cloud_color);
+  requireFinite("ichimoku.price_vs_cloud", req.ichimoku?.price_vs_cloud);
+
+  return issues;
+}
+
 function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): TradeResponse {
   const symbol = (tradeReq.symbol || "").toUpperCase();
   const utcHour = new Date().getUTCHours();
 
   const reasons: string[] = [];
+
+  // Emergency guard: mtf_confirm is currently underperforming badly.
+  // Disable execution to stop bleeding; keep the info for logging/analysis.
+  if (response.entry_method === "mtf_confirm") {
+    reasons.push("mtf_confirm disabled");
+  }
 
   // Range-like regime: make breakout harder to pass.
   // Rationale: breakouts are more likely to fail in low-trend + low-volatility squeeze.
@@ -129,6 +204,7 @@ function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): 
     isFinite(adx) &&
     typeof bbWidth === "number" &&
     isFinite(bbWidth) &&
+    bbWidth > 0 &&
     adx < RANGE_ADX_MAX &&
     bbWidth < RANGE_BB_WIDTH_MAX;
 
@@ -157,6 +233,20 @@ function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): 
     response.win_prob < BTC_PULLBACK_MIN_WIN_PROB
   ) {
     reasons.push(`BTCUSD pullback blocked (<${BTC_PULLBACK_MIN_WIN_PROB})`);
+  }
+
+  // Emergency guard: cap XAUUSD lot scaling.
+  // Rationale: recent real-trade P/L indicates position sizing is too aggressive.
+  if (symbol === "XAUUSD") {
+    const lm = (response as any).lot_multiplier;
+    if (typeof lm === "number" && isFinite(lm) && lm > 1.0) {
+      (response as any).lot_multiplier = 1.0;
+      (response as any).lot_level = "CAPPED (XAUUSD)";
+      const prevReason = typeof (response as any).lot_reason === "string" ? (response as any).lot_reason : "";
+      (response as any).lot_reason = prevReason
+        ? `${prevReason} | GUARD: XAUUSD cap lot_multiplier=1.0`
+        : "GUARD: XAUUSD cap lot_multiplier=1.0";
+    }
   }
 
   if (reasons.length === 0) return response;
@@ -1381,6 +1471,38 @@ serve(async (req: Request) => {
     }
     
     const tradeReq: TradeRequest = body;
+
+    // Input sanity guard: if EA payload is corrupted (missing/zeroed indicators), never execute.
+    // Return a normal 200 response (action=0) so EA can continue operating without hard failures.
+    const sanityIssues = assessInputSanity(tradeReq);
+    if (sanityIssues.length > 0) {
+      const summary = sanityIssues
+        .slice(0, 8)
+        .map((i) => `${i.field}:${i.problem}`)
+        .join(", ");
+      const methodReason = `GUARD: bad_inputs (${sanityIssues.length}) ${summary}`;
+      console.warn(`[ai-trader] ⚠️ ${methodReason}`);
+
+      const requestedDir = tradeReq?.ea_suggestion?.dir;
+      const suggested_dir = requestedDir === 1 || requestedDir === -1 ? requestedDir : undefined;
+
+      const response: TradeResponse = {
+        win_prob: 0.5,
+        action: 0,
+        suggested_dir,
+        offset_factor: 0.2,
+        expiry_minutes: 90,
+        confidence: "low",
+        reasoning: methodReason,
+        skip_reason: "bad_inputs",
+        entry_method: "none",
+        entry_params: null,
+        method_selected_by: "Manual",
+        method_reason: methodReason,
+      };
+
+      return new Response(JSON.stringify(response), { status: 200, headers: corsHeaders() });
+    }
     
     // ⭐ OpenAI API KEY の存在確認とログ
     const hasOpenAIKey = OPENAI_API_KEY && OPENAI_API_KEY.length > 10 && !OPENAI_API_KEY.includes("YOUR_");

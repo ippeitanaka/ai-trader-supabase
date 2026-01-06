@@ -269,44 +269,82 @@ string JsonEscape(string s){
    return s;
 }
 
+// ===== Data readiness helpers =====
+// MT5 indicators can intermittently fail (invalid handle / CopyBuffer<=0) when history isn't ready.
+// These helpers preload bars and retry CopyBuffer to reduce "取り損ね".
+bool EnsureBars(ENUM_TIMEFRAMES tf,int minBars)
+{
+   int bars=Bars(_Symbol,tf);
+   if(bars>=minBars) return true;
+   MqlRates rates[];
+   int copied=CopyRates(_Symbol,tf,0,minBars,rates);
+   return copied>=minBars;
+}
+
+bool CopyBuffer1Retry(const int h,const int buffer,const int shift,double &out)
+{
+   double buf[];
+   for(int attempt=0; attempt<3; attempt++)
+   {
+      int bc=BarsCalculated(h);
+      if(bc>shift)
+      {
+         if(CopyBuffer(h,buffer,shift,1,buf)>0)
+         {
+            out=buf[0];
+            if(out!=EMPTY_VALUE) return true;
+         }
+      }
+      Sleep(20);
+   }
+   return false;
+}
+
 // ===== 指標関数 =====
 double RSIv(ENUM_TIMEFRAMES tf,int period=14,ENUM_APPLIED_PRICE price=PRICE_CLOSE,int shift=0)
-{int h=iRSI(_Symbol,tf,period,price);if(h==INVALID_HANDLE)return EMPTY_VALUE;
- double buf[]; if(CopyBuffer(h,0,shift,1,buf)<=0){IndicatorRelease(h);return EMPTY_VALUE;}
- IndicatorRelease(h);return buf[0];}
+{
+ int h=iRSI(_Symbol,tf,period,price);
+ if(h==INVALID_HANDLE) return EMPTY_VALUE;
+ double v=EMPTY_VALUE;
+ if(!EnsureBars(tf,period+shift+5) || !CopyBuffer1Retry(h,0,shift,v)) { IndicatorRelease(h); return EMPTY_VALUE; }
+ IndicatorRelease(h); return v;
+}
 
 double ATRv(ENUM_TIMEFRAMES tf,int p=14,int s=0){int h=iATR(_Symbol,tf,p);if(h==INVALID_HANDLE)return EMPTY_VALUE;
- double b[];if(CopyBuffer(h,0,s,1,b)<=0){IndicatorRelease(h);return EMPTY_VALUE;}
- IndicatorRelease(h);return b[0];}
+ double v=EMPTY_VALUE;
+ if(!EnsureBars(tf,p+s+5) || !CopyBuffer1Retry(h,0,s,v)) { IndicatorRelease(h); return EMPTY_VALUE; }
+ IndicatorRelease(h);return v;}
 
 double MA(ENUM_TIMEFRAMES tf,int period,ENUM_MA_METHOD method,ENUM_APPLIED_PRICE price,int shift=0)
 {int h=iMA(_Symbol,tf,period,0,method,price);if(h==INVALID_HANDLE)return EMPTY_VALUE;
- double b[];if(CopyBuffer(h,0,shift,1,b)<=0){IndicatorRelease(h);return EMPTY_VALUE;}
- IndicatorRelease(h);return b[0];}
+ double v=EMPTY_VALUE;
+ if(!EnsureBars(tf,period+shift+5) || !CopyBuffer1Retry(h,0,shift,v)) { IndicatorRelease(h); return EMPTY_VALUE; }
+ IndicatorRelease(h);return v;}
 
 // MACD取得関数
 bool GetMACD(ENUM_TIMEFRAMES tf,double &macd_main,double &macd_signal,double &macd_hist,int shift=0)
 {
+   // Need enough bars for slow EMA + shift margin
+   EnsureBars(tf,26+9+shift+10);
    int h=iMACD(_Symbol,tf,12,26,9,PRICE_CLOSE);
    if(h==INVALID_HANDLE){
       Print("[MACD] Failed to create indicator handle");
       return false;
    }
-   
-   double main_buf[],signal_buf[];
-   
+
+   double m=EMPTY_VALUE,s=EMPTY_VALUE;
    bool ok=true;
-   ok=ok&&CopyBuffer(h,0,shift,1,main_buf)>0;    // MACD Main
-   ok=ok&&CopyBuffer(h,1,shift,1,signal_buf)>0;  // Signal
-   
-   if(!ok){
+   ok=ok&&CopyBuffer1Retry(h,0,shift,m);    // MACD Main
+   ok=ok&&CopyBuffer1Retry(h,1,shift,s);    // Signal
+
+   if(!ok || m==EMPTY_VALUE || s==EMPTY_VALUE){
       IndicatorRelease(h);
       Print("[MACD] Failed to copy buffers");
       return false;
    }
-   
-   macd_main=main_buf[0];
-   macd_signal=signal_buf[0];
+
+   macd_main=m;
+   macd_signal=s;
    macd_hist=macd_main-macd_signal;
    
    IndicatorRelease(h);
@@ -316,27 +354,28 @@ bool GetMACD(ENUM_TIMEFRAMES tf,double &macd_main,double &macd_signal,double &ma
 // ADX（トレンド強度）取得: main(ADX), +DI, -DI
 bool GetADX(ENUM_TIMEFRAMES tf,double &adx_main,double &di_plus,double &di_minus,int shift=0)
 {
+   EnsureBars(tf,14+shift+10);
    int h=iADX(_Symbol,tf,14);
    if(h==INVALID_HANDLE){
       Print("[ADX] Failed to create indicator handle");
       return false;
    }
 
-   double adx_buf[],di_plus_buf[],di_minus_buf[];
+   double a=EMPTY_VALUE,dp=EMPTY_VALUE,dm=EMPTY_VALUE;
    bool ok=true;
-   ok=ok&&CopyBuffer(h,0,shift,1,adx_buf)>0;       // ADX
-   ok=ok&&CopyBuffer(h,1,shift,1,di_plus_buf)>0;   // +DI
-   ok=ok&&CopyBuffer(h,2,shift,1,di_minus_buf)>0;  // -DI
+   ok=ok&&CopyBuffer1Retry(h,0,shift,a);       // ADX
+   ok=ok&&CopyBuffer1Retry(h,1,shift,dp);      // +DI
+   ok=ok&&CopyBuffer1Retry(h,2,shift,dm);      // -DI
 
-   if(!ok){
+   if(!ok || a==EMPTY_VALUE || dp==EMPTY_VALUE || dm==EMPTY_VALUE){
       IndicatorRelease(h);
       Print("[ADX] Failed to copy buffers");
       return false;
    }
 
-   adx_main=adx_buf[0];
-   di_plus=di_plus_buf[0];
-   di_minus=di_minus_buf[0];
+   adx_main=a;
+   di_plus=dp;
+   di_minus=dm;
 
    IndicatorRelease(h);
    return true;
@@ -345,28 +384,34 @@ bool GetADX(ENUM_TIMEFRAMES tf,double &adx_main,double &di_plus,double &di_minus
 // ボリンジャーバンド幅（スクイーズ判定用途）: (Upper-Lower)/Middle
 bool GetBollingerWidth(ENUM_TIMEFRAMES tf,double &bb_width,double &bb_upper,double &bb_middle,double &bb_lower,int shift=0)
 {
+   EnsureBars(tf,20+shift+10);
    int h=iBands(_Symbol,tf,20,2.0,0,PRICE_CLOSE);
    if(h==INVALID_HANDLE){
       Print("[BB] Failed to create indicator handle");
       return false;
    }
 
-   double up_buf[],mid_buf[],low_buf[];
+   double up=EMPTY_VALUE,mid=EMPTY_VALUE,low=EMPTY_VALUE;
    bool ok=true;
-   ok=ok&&CopyBuffer(h,0,shift,1,up_buf)>0;
-   ok=ok&&CopyBuffer(h,1,shift,1,mid_buf)>0;
-   ok=ok&&CopyBuffer(h,2,shift,1,low_buf)>0;
+   ok=ok&&CopyBuffer1Retry(h,0,shift,up);
+   ok=ok&&CopyBuffer1Retry(h,1,shift,mid);
+   ok=ok&&CopyBuffer1Retry(h,2,shift,low);
 
-   if(!ok){
+   if(!ok || up==EMPTY_VALUE || mid==EMPTY_VALUE || low==EMPTY_VALUE){
       IndicatorRelease(h);
       Print("[BB] Failed to copy buffers");
       return false;
    }
 
-   bb_upper=up_buf[0];
-   bb_middle=mid_buf[0];
-   bb_lower=low_buf[0];
-   if(bb_middle!=0) bb_width=(bb_upper-bb_lower)/bb_middle; else bb_width=0;
+   bb_upper=up;
+   bb_middle=mid;
+   bb_lower=low;
+   if(bb_middle==0){
+      IndicatorRelease(h);
+      Print("[BB] Middle band is zero");
+      return false;
+   }
+   bb_width=(bb_upper-bb_lower)/bb_middle;
 
    IndicatorRelease(h);
    return true;
@@ -383,32 +428,32 @@ struct IchimokuValues{
 
 bool GetIchimoku(ENUM_TIMEFRAMES tf,IchimokuValues &ich,int shift=0)
 {
+   // Need enough bars for Tenkan/Kijun/Senkou + chikou reference
+   EnsureBars(tf,Ichimoku_Kijun+Ichimoku_Senkou+shift+50);
    int h=iIchimoku(_Symbol,tf,Ichimoku_Tenkan,Ichimoku_Kijun,Ichimoku_Senkou);
    if(h==INVALID_HANDLE){
       Print("[Ichimoku] Failed to create indicator handle");
       return false;
    }
-   
-   double tenkan_buf[],kijun_buf[],senkou_a_buf[],senkou_b_buf[];
-   
-   // 各バッファからデータを取得
+
+   double t=EMPTY_VALUE,k=EMPTY_VALUE,a=EMPTY_VALUE,b=EMPTY_VALUE;
    // 0:Tenkan, 1:Kijun, 2:SpanA, 3:SpanB, 4:Chikou
    bool ok=true;
-   ok=ok&&CopyBuffer(h,0,shift,1,tenkan_buf)>0;
-   ok=ok&&CopyBuffer(h,1,shift,1,kijun_buf)>0;
-   ok=ok&&CopyBuffer(h,2,shift,1,senkou_a_buf)>0;
-   ok=ok&&CopyBuffer(h,3,shift,1,senkou_b_buf)>0;
-   
-   if(!ok){
+   ok=ok&&CopyBuffer1Retry(h,0,shift,t);
+   ok=ok&&CopyBuffer1Retry(h,1,shift,k);
+   ok=ok&&CopyBuffer1Retry(h,2,shift,a);
+   ok=ok&&CopyBuffer1Retry(h,3,shift,b);
+
+   if(!ok || t==EMPTY_VALUE || k==EMPTY_VALUE || a==EMPTY_VALUE || b==EMPTY_VALUE){
       IndicatorRelease(h);
       Print("[Ichimoku] Failed to copy buffers");
       return false;
    }
-   
-   ich.tenkan=tenkan_buf[0];
-   ich.kijun=kijun_buf[0];
-   ich.senkou_a=senkou_a_buf[0];
-   ich.senkou_b=senkou_b_buf[0];
+
+   ich.tenkan=t;
+   ich.kijun=k;
+   ich.senkou_a=a;
+   ich.senkou_b=b;
 
    // Chikou(遅行スパン)は「終値を Ichimoku_Kijun 期間だけ過去にシフト」して描画されるため、
    // shift=0 のバッファ値が EMPTY_VALUE になり得る。
@@ -416,7 +461,11 @@ bool GetIchimoku(ENUM_TIMEFRAMES tf,IchimokuValues &ich,int shift=0)
    int need=shift+Ichimoku_Kijun;
    int bars=Bars(_Symbol,tf);
    if(bars>need) ich.chikou=iClose(_Symbol,tf,need);
-   else ich.chikou=0;
+   else {
+      IndicatorRelease(h);
+      Print("[Ichimoku] Not enough bars for chikou");
+      return false;
+   }
    
    IndicatorRelease(h);
    return true;
@@ -719,21 +768,19 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
 
    // レジーム判定用（追加特徴量）
    "\"atr_norm\":"+DoubleToString(atr_norm,8)+","+
-   "\"adx\":"+DoubleToString(has_adx?adx_main:0,2)+","+
-   "\"di_plus\":"+DoubleToString(has_adx?di_plus:0,2)+","+
-   "\"di_minus\":"+DoubleToString(has_adx?di_minus:0,2)+","+
-   "\"bb_width\":"+DoubleToString(has_bb?bb_width:0,6)+","+
+   (has_adx ? "\"adx\":"+DoubleToString(adx_main,2)+","+"\"di_plus\":"+DoubleToString(di_plus,2)+","+"\"di_minus\":"+DoubleToString(di_minus,2)+"," : "")+
+   (has_bb ? "\"bb_width\":"+DoubleToString(bb_width,6)+"," : "")+
    
    // MACD（生データ）
-   "\"macd\":{"+
+   (has_macd ? ("\"macd\":{"+
       "\"main\":"+DoubleToString(macd_main,5)+","+
       "\"signal\":"+DoubleToString(macd_signal,5)+","+
       "\"histogram\":"+DoubleToString(macd_hist,5)+","+
       "\"cross\":"+IntegerToString(macd_cross)+
-   "},"+
+   "},") : "")+
    
    // 一目均衡表（全ライン）
-   "\"ichimoku\":{"+
+   (has_ichimoku ? ("\"ichimoku\":{"+
       "\"tenkan\":"+DoubleToString(ich.tenkan,_Digits)+","+
       "\"kijun\":"+DoubleToString(ich.kijun,_Digits)+","+
       "\"senkou_a\":"+DoubleToString(ich.senkou_a,_Digits)+","+
@@ -744,7 +791,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
       "\"price_vs_cloud\":"+
          (price>MathMax(ich.senkou_a,ich.senkou_b)?"1":
           (price<MathMin(ich.senkou_a,ich.senkou_b)?"-1":"0"))+
-   "},"+
+   "},") : "")+
    
    // EA側の判断（参考情報として）
    "\"ea_suggestion\":{"+
@@ -931,30 +978,28 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"rsi\":"+DoubleToString(rsi,2)+","+
    "\"atr\":"+DoubleToString(atr,5)+","+
    "\"atr_norm\":"+DoubleToString(atr_norm,8)+","+
-   "\"adx\":"+DoubleToString(has_adx?adx_main:0,2)+","+
-   "\"di_plus\":"+DoubleToString(has_adx?di_plus:0,2)+","+
-   "\"di_minus\":"+DoubleToString(has_adx?di_minus:0,2)+","+
-   "\"bb_width\":"+DoubleToString(has_bb?bb_width:0,6)+","+
+   (has_adx ? "\"adx\":"+DoubleToString(adx_main,2)+","+"\"di_plus\":"+DoubleToString(di_plus,2)+","+"\"di_minus\":"+DoubleToString(di_minus,2)+"," : "")+
+   (has_bb ? "\"bb_width\":"+DoubleToString(bb_width,6)+"," : "")+
    "\"price\":"+DoubleToString(price,_Digits)+","+
    "\"ema_25\":"+DoubleToString(ema_25,_Digits)+","+
    "\"sma_100\":"+DoubleToString(sma_100,_Digits)+","+
    "\"ma_cross\":"+IntegerToString(ma_cross)+","+
-   "\"macd\":{"+
-      "\"main\":"+DoubleToString(has_macd?macd_main:0,5)+","+
-      "\"signal\":"+DoubleToString(has_macd?macd_signal:0,5)+","+
-      "\"histogram\":"+DoubleToString(has_macd?macd_hist:0,5)+","+
+   (has_macd ? ("\"macd\":{"+
+      "\"main\":"+DoubleToString(macd_main,5)+","+
+      "\"signal\":"+DoubleToString(macd_signal,5)+","+
+      "\"histogram\":"+DoubleToString(macd_hist,5)+","+
       "\"cross\":"+IntegerToString(macd_cross)+
-   "},"+
-   "\"ichimoku\":{"+
-      "\"tenkan\":"+DoubleToString(has_ichimoku?ich.tenkan:0,_Digits)+","+
-      "\"kijun\":"+DoubleToString(has_ichimoku?ich.kijun:0,_Digits)+","+
-      "\"senkou_a\":"+DoubleToString(has_ichimoku?ich.senkou_a:0,_Digits)+","+
-      "\"senkou_b\":"+DoubleToString(has_ichimoku?ich.senkou_b:0,_Digits)+","+
-      "\"chikou\":"+DoubleToString(has_ichimoku?ich.chikou:0,_Digits)+","+
+   "},") : "")+
+   (has_ichimoku ? ("\"ichimoku\":{"+
+      "\"tenkan\":"+DoubleToString(ich.tenkan,_Digits)+","+
+      "\"kijun\":"+DoubleToString(ich.kijun,_Digits)+","+
+      "\"senkou_a\":"+DoubleToString(ich.senkou_a,_Digits)+","+
+      "\"senkou_b\":"+DoubleToString(ich.senkou_b,_Digits)+","+
+      "\"chikou\":"+DoubleToString(ich.chikou,_Digits)+","+
       "\"tk_cross\":"+IntegerToString(tk_cross)+","+
       "\"cloud_color\":"+IntegerToString(cloud_color)+","+
       "\"price_vs_cloud\":"+IntegerToString(price_vs_cloud)+
-   "},"+
+   "},") : "")+
    "\"reason\":\""+JsonEscape(reason)+"\","+
    "\"instance\":\""+JsonEscape(AI_EA_Instance)+"\","+
    "\"model_version\":\""+JsonEscape(AI_EA_Version)+"\","+
