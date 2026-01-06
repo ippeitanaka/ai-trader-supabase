@@ -28,8 +28,8 @@ select
   max(created_at) as last_seen
 from "ea-log"
 where created_at >= now() - interval '7 days'
-group by sym
-order by bad_inputs_skips desc, sym;
+group by 1
+order by bad_inputs_skips desc, 1;
 
 -- 1) EA input quality: obvious anomalies (XAUUSD, last 7 days)
 -- If these counts are high, blame is more likely on EA-side indicator calculations / payload.
