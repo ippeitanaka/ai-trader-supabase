@@ -31,6 +31,36 @@ where at >= now() - interval '7 days'
 group by 1
 order by bad_inputs_skips desc, 1;
 
+-- 0.6) Same as 0.5, but last 24 hours (quick verification after deploy/EA update)
+select
+  sym as symbol,
+  coalesce(tf, 'unknown') as timeframe,
+  count(*) as events,
+  count(*) filter (where ai_reasoning ilike '%GUARD: bad_inputs%') as bad_inputs_skips,
+  round((count(*) filter (where ai_reasoning ilike '%GUARD: bad_inputs%')::numeric / nullif(count(*),0))*100, 2) as bad_inputs_pct,
+  max(at) as last_seen
+from "ea-log"
+where at >= now() - interval '24 hours'
+group by 1, 2
+having count(*) >= 10
+order by bad_inputs_skips desc, 1, 2;
+
+-- 0.7) Inspect recent bad_inputs guard events (last 24 hours)
+select
+  at,
+  sym as symbol,
+  tf as timeframe,
+  action,
+  trade_decision,
+  round((win_prob*100)::numeric, 1) as win_prob_pct,
+  left(coalesce(ai_reasoning,''), 160) as ai_reasoning_prefix,
+  order_ticket
+from "ea-log"
+where at >= now() - interval '24 hours'
+  and ai_reasoning ilike '%GUARD: bad_inputs%'
+order by at desc
+limit 100;
+
 -- 1) EA input quality: obvious anomalies (XAUUSD, last 7 days)
 -- If these counts are high, blame is more likely on EA-side indicator calculations / payload.
 select
