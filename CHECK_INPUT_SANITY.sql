@@ -23,11 +23,11 @@ order by pnl asc;
 select
   sym as symbol,
   count(*) as events,
-  count(*) filter (where method_reason ilike '%GUARD: bad_inputs%') as bad_inputs_skips,
-  round((count(*) filter (where method_reason ilike '%GUARD: bad_inputs%')::numeric / nullif(count(*),0))*100, 2) as bad_inputs_pct,
-  max(created_at) as last_seen
+  count(*) filter (where ai_reasoning ilike '%GUARD: bad_inputs%') as bad_inputs_skips,
+  round((count(*) filter (where ai_reasoning ilike '%GUARD: bad_inputs%')::numeric / nullif(count(*),0))*100, 2) as bad_inputs_pct,
+  max(at) as last_seen
 from "ea-log"
-where created_at >= now() - interval '7 days'
+where at >= now() - interval '7 days'
 group by 1
 order by bad_inputs_skips desc, 1;
 
