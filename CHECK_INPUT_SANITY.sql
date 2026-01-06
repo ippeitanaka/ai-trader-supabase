@@ -61,6 +61,19 @@ where at >= now() - interval '24 hours'
 order by at desc
 limit 100;
 
+-- 0.8) Is EA actively logging right now? (last 2 hours)
+-- If this shows recent rows but 0.7 stops appearing, the new EA build is likely running correctly.
+select
+  sym as symbol,
+  coalesce(tf, 'unknown') as timeframe,
+  count(*) as events,
+  count(*) filter (where ai_reasoning ilike '%GUARD: bad_inputs%') as bad_inputs_skips,
+  max(at) as last_seen
+from "ea-log"
+where at >= now() - interval '2 hours'
+group by 1, 2
+order by last_seen desc;
+
 -- 1) EA input quality: obvious anomalies (XAUUSD, last 7 days)
 -- If these counts are high, blame is more likely on EA-side indicator calculations / payload.
 select
@@ -149,3 +162,25 @@ where created_at >= now() - interval '7 days'
   and order_ticket is not null
 order by profit_loss asc
 limit 30;
+
+-- 4.1) Are NEW real trades still carrying bb_width<=0? (last 6 hours, all symbols)
+-- This helps confirm whether an old EA build is still running somewhere.
+select
+  created_at,
+  symbol,
+  timeframe,
+  order_ticket,
+  bb_width,
+  case
+    when bb_width is null then 'NULL (missing)'
+    when bb_width <= 0 then 'BAD (<=0)'
+    else 'OK'
+  end as bb_width_status,
+  instance,
+  model_version
+from ai_signals
+where created_at >= now() - interval '6 hours'
+  and actual_result in ('WIN','LOSS')
+  and order_ticket is not null
+order by created_at desc
+limit 50;
