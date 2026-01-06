@@ -406,12 +406,25 @@ bool GetBollingerWidth(ENUM_TIMEFRAMES tf,double &bb_width,double &bb_upper,doub
    bb_upper=up;
    bb_middle=mid;
    bb_lower=low;
-   if(bb_middle==0){
+   if(bb_middle<=0 || !MathIsValidNumber(bb_middle)){
       IndicatorRelease(h);
       Print("[BB] Middle band is zero");
       return false;
    }
+
+   // Basic sanity: upper should be above lower, and width should be finite and positive.
+   if(!MathIsValidNumber(bb_upper) || !MathIsValidNumber(bb_lower) || bb_upper<=bb_lower){
+      IndicatorRelease(h);
+      Print("[BB] Invalid band values");
+      return false;
+   }
+
    bb_width=(bb_upper-bb_lower)/bb_middle;
+   if(!MathIsValidNumber(bb_width) || bb_width<=0 || bb_width<1e-6){
+      IndicatorRelease(h);
+      Print("[BB] Invalid bb_width");
+      return false;
+   }
 
    IndicatorRelease(h);
    return true;
