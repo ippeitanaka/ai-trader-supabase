@@ -21,15 +21,15 @@ order by pnl asc;
 -- 0.5) Are we skipping due to bad EA inputs? (last 7 days)
 -- After the ai-trader input-sanity guard, you should see these instead of executions.
 select
-  symbol,
+  sym as symbol,
   count(*) as events,
   count(*) filter (where method_reason ilike '%GUARD: bad_inputs%') as bad_inputs_skips,
   round((count(*) filter (where method_reason ilike '%GUARD: bad_inputs%')::numeric / nullif(count(*),0))*100, 2) as bad_inputs_pct,
   max(created_at) as last_seen
 from "ea-log"
 where created_at >= now() - interval '7 days'
-group by symbol
-order by bad_inputs_skips desc, symbol;
+group by sym
+order by bad_inputs_skips desc, sym;
 
 -- 1) EA input quality: obvious anomalies (XAUUSD, last 7 days)
 -- If these counts are high, blame is more likely on EA-side indicator calculations / payload.
