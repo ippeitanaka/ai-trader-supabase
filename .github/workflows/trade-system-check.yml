@@ -14,6 +14,11 @@ on:
 jobs:
   system-health-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    concurrency:
+      group: trade-system-check
+      cancel-in-progress: true
     
     steps:
       - name: 🏥 トレードシステム稼働チェック開始
@@ -29,8 +34,11 @@ jobs:
         id: check_ai_trader
         run: |
           echo "📡 ai-trader エンドポイントをチェック中..."
+
+          # Fail fast and avoid hanging
+          set -euo pipefail
           
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          RESPONSE=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" -X POST \
             "${{ secrets.SUPABASE_URL }}/functions/v1/ai-trader" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
@@ -38,11 +46,14 @@ jobs:
               "symbol": "USDJPY",
               "timeframe": "H1",
               "price": 150.50,
+              "bid": 150.49,
+              "ask": 150.51,
               "rsi": 45.5,
               "atr": 0.0008,
-              "ema_13": 150.45,
               "ema_25": 150.40,
               "sma_100": 150.30,
+              "sma_200": 150.20,
+              "sma_800": 150.10,
               "ma_cross": 1,
               "macd": {
                 "main": 0.05,
@@ -62,9 +73,9 @@ jobs:
               },
               "ea_suggestion": {
                 "dir": 1,
-                "entry": 150.50,
-                "sl": 150.30,
-                "tp": 150.80
+                "tech_dir": 1,
+                "reason": "github-actions health check",
+                "ichimoku_score": 0.5
               },
               "test_mode": true
             }')
@@ -92,7 +103,8 @@ jobs:
           echo "🤖 OpenAI API 接続確認"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          set -euo pipefail
+          RESPONSE=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" -X POST \
             "${{ secrets.SUPABASE_URL }}/functions/v1/ai-trader" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
@@ -100,11 +112,14 @@ jobs:
               "symbol": "EURUSD",
               "timeframe": "H4",
               "price": 1.0850,
+              "bid": 1.0849,
+              "ask": 1.0851,
               "rsi": 65.0,
               "atr": 0.0012,
-              "ema_13": 1.0855,
               "ema_25": 1.0860,
               "sma_100": 1.0870,
+              "sma_200": 1.0880,
+              "sma_800": 1.0900,
               "ma_cross": -1,
               "macd": {
                 "main": -0.02,
@@ -124,9 +139,9 @@ jobs:
               },
               "ea_suggestion": {
                 "dir": -1,
-                "entry": 1.0850,
-                "sl": 1.0870,
-                "tp": 1.0820
+                "tech_dir": -1,
+                "reason": "github-actions health check",
+                "ichimoku_score": -0.5
               },
               "test_mode": true
             }')
@@ -158,7 +173,8 @@ jobs:
           echo "🤖 ML学習機能確認"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X GET \
+          set -euo pipefail
+          RESPONSE=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" -X GET \
             "${{ secrets.SUPABASE_URL }}/functions/v1/ml-training" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json")
@@ -189,7 +205,8 @@ jobs:
           NOW_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
           # ea-log requires: sym, and at least one of (action/trade_decision/win_prob)
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          set -euo pipefail
+          RESPONSE=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" -X POST \
             "${{ secrets.SUPABASE_URL }}/functions/v1/ea-log" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
@@ -203,7 +220,7 @@ jobs:
               \"ai_reasoning\": \"Health check from GitHub Actions\",\
               \"caller\": \"system-health-check\",\
               \"instance\": \"github-actions\"\
-            }")')
+            }")
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
           BODY=$(echo "$RESPONSE" | sed '$d')

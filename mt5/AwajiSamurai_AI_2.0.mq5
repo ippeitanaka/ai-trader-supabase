@@ -978,7 +978,9 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
       payload+=",\"order_ticket\":"+IntegerToString(ticket);
       if(entry_price>0) payload+=",\"entry_price\":"+DoubleToString(entry_price,_Digits);
    }
-   if(mark_filled){ payload+=",\"actual_result\":\"FILLED\""; }
+   // Only mark FILLED when we have a real broker ticket.
+   // Otherwise we would create FILLED rows without order_ticket/entry_price, and they cannot be updated later.
+   if(mark_filled && ticket>0){ payload+=",\"actual_result\":\"FILLED\""; }
    payload+="}";
 
    string resp;

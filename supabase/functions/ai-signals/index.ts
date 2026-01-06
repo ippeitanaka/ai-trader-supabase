@@ -352,6 +352,10 @@ serve(async (req: Request) => {
         );
       }
 
+      const requestedActualResult = (body.actual_result || 'PENDING');
+      const hasValidTicket = typeof body.order_ticket === "number" && Number.isFinite(body.order_ticket) && body.order_ticket > 0;
+      const actualResult = (requestedActualResult === 'FILLED' && !hasValidTicket) ? 'PENDING' : requestedActualResult;
+
       const entry: AISignalEntry = {
         symbol: body.symbol,
         timeframe: body.timeframe,
@@ -421,7 +425,7 @@ serve(async (req: Request) => {
         planned_order_type: body.planned_order_type ?? null,
         virtual_filled_at: body.virtual_filled_at ?? null,
         
-        actual_result: body.actual_result || 'PENDING',
+        actual_result: actualResult,
       };
 
       const { data, error } = await supabase
