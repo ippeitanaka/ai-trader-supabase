@@ -169,9 +169,25 @@ JSON schema:
 }
 
 interface SignalUpdateRequest {
-  order_ticket: number;
+  order_ticket: number | string;
   entry_price?: number;
   actual_result?: string;
+}
+
+function parseOrderTicket(value: unknown): string | null {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value <= 0) return null;
+    if (!Number.isInteger(value)) return null;
+    return String(value);
+  }
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return null;
+    if (!/^[0-9]+$/.test(s)) return null;
+    if (s === "0") return null;
+    return s;
+  }
+  return null;
 }
 
 function corsHeaders() {
@@ -197,8 +213,9 @@ serve(async (req: Request) => {
   
   try {
     const body: SignalUpdateRequest = await req.json();
-    
-    if (!body.order_ticket) {
+
+    const orderTicket = parseOrderTicket(body.order_ticket);
+    if (!orderTicket) {
       return new Response(
         JSON.stringify({ error: "order_ticket is required" }),
         { status: 400, headers: corsHeaders() }
@@ -228,7 +245,7 @@ serve(async (req: Request) => {
     const { data, error } = await supabase
       .from("ai_signals")
       .update(updateData)
-      .eq("order_ticket", body.order_ticket)
+      .eq("order_ticket", orderTicket)
       .select();
     
     if (error) {
@@ -240,18 +257,18 @@ serve(async (req: Request) => {
     }
     
     if (!data || data.length === 0) {
-      console.warn(`[ai-signals-update] No record found for ticket ${body.order_ticket}`);
+      console.warn(`[ai-signals-update] No record found for ticket ${orderTicket}`);
       return new Response(
         JSON.stringify({ 
           ok: false, 
           message: "No matching record found",
-          order_ticket: body.order_ticket 
+          order_ticket: orderTicket 
         }),
         { status: 404, headers: corsHeaders() }
       );
     }
-    
-    console.log(`[ai-signals-update] Updated ticket ${body.order_ticket}: ${JSON.stringify(updateData)}`);
+
+    console.log(`[ai-signals-update] Updated ticket ${orderTicket}: ${JSON.stringify(updateData)}`);
 
     // Best-effort: generate postmortem tags for LOSS/CANCELLED
     try {

@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| AwajiSamurai_AI_2.0.mq5  (ver 1.5.4)                            |
+//| AwajiSamurai_AI_2.0.mq5  (ver 1.5.5)                            |
 //| - Supabase: ai-signals(AI側) / ea-log                            |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
@@ -63,7 +63,7 @@ input string AI_Signals_Update_URL = "https://nebphrnnpmuqbkymwefs.supabase.co/f
 input string AI_Bearer_Token     = "YOUR_SERVICE_ROLE_KEY_HERE";
 
 input string AI_EA_Instance      = "main";
-input string AI_EA_Version       = "1.5.4";
+input string AI_EA_Version       = "1.5.6";
 input int    AI_Timeout_ms       = 5000;
 
 // ===== 一目均衡表設定 =====
@@ -83,8 +83,11 @@ datetime g_cooldownUntil=0; // TP/SLクローズ後のクールダウン期限
 
 // ポジション追跡用（ML学習用）
 ulong    g_trackedPositionTicket=0;
+ulong    g_trackedOrderTicket=0; // ai_signals.order_ticket に対応するキー（order ticket）
 datetime g_trackedPositionOpenTime=0;
 double   g_trackedPositionEntryPrice=0;
+bool     g_trackedFillSent=false;
+datetime g_trackedFillLastTry=0;
 
 // ===== Virtual (paper/shadow) trade tracking =====
 // Used to label SKIPPED-but-eligible signals with TP/SL outcome, without risking real capital.
@@ -118,6 +121,47 @@ void SafePrint(string msg)
 bool InCooldown()
 {
    return (g_cooldownUntil>0 && TimeCurrent()<g_cooldownUntil);
+}
+
+// ===== Volume (lots) normalization =====
+int VolumeDigitsFromStep(const double step)
+{
+   if(step<=0) return 2;
+   for(int d=0; d<=8; d++){
+      if(MathAbs(NormalizeDouble(step,d)-step) < 1e-12) return d;
+   }
+   return 2;
+}
+
+// Floors to the symbol's volume step and validates min/max.
+// Returns false when the normalized volume is below the broker's min.
+bool NormalizeLotsForSymbol(const double requested,double &normalized,string &why)
+{
+   double vmin=0.0,vmax=0.0,vstep=0.0;
+   if(!SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN,vmin)) vmin=0.0;
+   if(!SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX,vmax)) vmax=0.0;
+   if(!SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP,vstep)) vstep=0.0;
+
+   if(!MathIsValidNumber(requested) || requested<=0){
+      why="requested<=0";
+      return false;
+   }
+   if(vstep<=0) vstep=0.01;
+   int vd=VolumeDigitsFromStep(vstep);
+
+   double vol=MathFloor(requested/vstep)*vstep;
+   vol=NormalizeDouble(vol,vd);
+   if(vmax>0.0 && vol>vmax){
+      vol=MathFloor(vmax/vstep)*vstep;
+      vol=NormalizeDouble(vol,vd);
+   }
+   if(vmin>0.0 && vol<vmin){
+      why=StringFormat("below min (req=%.4f norm=%.4f min=%.4f step=%.4f)",requested,vol,vmin,vstep);
+      normalized=vol;
+      return false;
+   }
+   normalized=vol;
+   return true;
 }
 
 // ===== HTTPユーティリティ（★POSTはNUL無しで送る） =====
@@ -413,14 +457,16 @@ bool GetBollingerWidth(ENUM_TIMEFRAMES tf,double &bb_width,double &bb_upper,doub
    }
 
    // Basic sanity: upper should be above lower, and width should be finite and positive.
-   if(!MathIsValidNumber(bb_upper) || !MathIsValidNumber(bb_lower) || bb_upper<=bb_lower){
+   // NOTE: upper==lower can happen in extreme flat/low-vol regimes; treat it as width=0 (valid).
+   if(!MathIsValidNumber(bb_upper) || !MathIsValidNumber(bb_lower) || bb_upper<bb_lower){
       IndicatorRelease(h);
       Print("[BB] Invalid band values");
       return false;
    }
 
    bb_width=(bb_upper-bb_lower)/bb_middle;
-   if(!MathIsValidNumber(bb_width) || bb_width<=0 || bb_width<1e-6){
+   // width==0 is a valid squeeze; only reject NaN/inf/negative.
+   if(!MathIsValidNumber(bb_width) || bb_width<0){
       IndicatorRelease(h);
       Print("[BB] Invalid bb_width");
       return false;
@@ -746,6 +792,13 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    // ボリンジャーバンド幅
    double bb_width=0, bb_upper=0, bb_middle=0, bb_lower=0;
    bool has_bb=GetBollingerWidth(tf,bb_width,bb_upper,bb_middle,bb_lower,0);
+   // Guard: treat bb_width as optional; send only when it is a sane positive finite value.
+   // Some backends reject 0 / too-small values as invalid_optional.
+   if(has_bb){
+      if(!MathIsValidNumber(bb_width) || bb_width<1e-6 || bb_width>1.0){
+         has_bb=false;
+      }
+   }
 
    // 正規化ATR（ATR/価格）
    double atr_norm=(price>0?atr/price:0);
@@ -782,7 +835,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    // レジーム判定用（追加特徴量）
    "\"atr_norm\":"+DoubleToString(atr_norm,8)+","+
    (has_adx ? "\"adx\":"+DoubleToString(adx_main,2)+","+"\"di_plus\":"+DoubleToString(di_plus,2)+","+"\"di_minus\":"+DoubleToString(di_minus,2)+"," : "")+
-   (has_bb ? "\"bb_width\":"+DoubleToString(bb_width,6)+"," : "")+
+   (has_bb ? "\"bb_width\":"+DoubleToString(bb_width,8)+"," : "")+
    
    // MACD（生データ）
    (has_macd ? ("\"macd\":{"+
@@ -852,7 +905,14 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    }
    
    // ロット倍率（ML学習データに基づく）
-   double lm; if(ExtractJsonNumber(resp,"lot_multiplier",lm)) out_ai.lot_multiplier=lm; else out_ai.lot_multiplier=1.0;
+   double lm;
+   if(ExtractJsonNumber(resp,"lot_multiplier",lm)){
+      if(!MathIsValidNumber(lm) || lm<=0.0) lm=1.0;
+      // v1.5.0 design: 1-3x only (avoid unexpected downsizing that can violate broker min lot)
+      if(lm<1.0) lm=1.0;
+      if(lm>3.0) lm=3.0;
+      out_ai.lot_multiplier=lm;
+   }else out_ai.lot_multiplier=1.0;
    ExtractJsonString(resp,"lot_level",out_ai.lot_level);
    ExtractJsonString(resp,"lot_reason",out_ai.lot_reason);
    
@@ -896,7 +956,7 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
    "\"trade_decision\":\""+JsonEscape(trade_decision)+"\","+
    "\"threshold_met\":"+(threshold_met?"true":"false")+","+
    "\"current_positions\":"+IntegerToString(current_pos)+","+
-   (ticket>0?"\"order_ticket\":"+IntegerToString(ticket)+",":"")+
+   (ticket>0?"\"order_ticket\":\""+IntegerToString(ticket)+"\",":"")+
    "\"offset_factor\":"+DoubleToString(ai.offset_factor,3)+","+
    "\"expiry_minutes\":"+IntegerToString(ai.expiry_min)+","+
    "\"reason\":\""+JsonEscape(reason)+"\","+
@@ -971,6 +1031,12 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    bool has_adx=GetADX(tf,adx_main,di_plus,di_minus,0);
    double bb_width=0, bb_upper=0, bb_middle=0, bb_lower=0;
    bool has_bb=GetBollingerWidth(tf,bb_width,bb_upper,bb_middle,bb_lower,0);
+   // Guard: keep bb_width truly optional in ai_signals payload as well.
+   if(has_bb){
+      if(!MathIsValidNumber(bb_width) || bb_width<1e-6 || bb_width>1.0){
+         has_bb=false;
+      }
+   }
 
    string params="{"+
                 "\"k\":"+DoubleToString(ai.k,3)+","+
@@ -992,7 +1058,7 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"atr\":"+DoubleToString(atr,5)+","+
    "\"atr_norm\":"+DoubleToString(atr_norm,8)+","+
    (has_adx ? "\"adx\":"+DoubleToString(adx_main,2)+","+"\"di_plus\":"+DoubleToString(di_plus,2)+","+"\"di_minus\":"+DoubleToString(di_minus,2)+"," : "")+
-   (has_bb ? "\"bb_width\":"+DoubleToString(bb_width,6)+"," : "")+
+   (has_bb ? "\"bb_width\":"+DoubleToString(bb_width,8)+"," : "")+
    "\"price\":"+DoubleToString(price,_Digits)+","+
    "\"ema_25\":"+DoubleToString(ema_25,_Digits)+","+
    "\"sma_100\":"+DoubleToString(sma_100,_Digits)+","+
@@ -1033,7 +1099,7 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    if(planned_order_type>=0) payload+=",\"planned_order_type\":"+IntegerToString(planned_order_type);
 
    if(ticket>0){
-      payload+=",\"order_ticket\":"+IntegerToString(ticket);
+      payload+=",\"order_ticket\":\""+IntegerToString(ticket)+"\"";
       if(entry_price>0) payload+=",\"entry_price\":"+DoubleToString(entry_price,_Digits);
    }
    // Only mark FILLED when we have a real broker ticket.
@@ -1122,7 +1188,7 @@ void UpdateSignalResult(ulong ticket,double exit_price,double profit_loss,const 
    if(g_trackedPositionOpenTime>0) duration=(int)((now-g_trackedPositionOpenTime)/60);
    
    string payload="{"+
-   "\"order_ticket\":"+IntegerToString(ticket)+","+
+   "\"order_ticket\":\""+IntegerToString(ticket)+"\","+
    "\"exit_price\":"+DoubleToString(exit_price,_Digits)+","+
    "\"profit_loss\":"+DoubleToString(profit_loss,2)+","+
    "\"actual_result\":\""+result+"\","+
@@ -1142,7 +1208,7 @@ void UpdateSignalResult(ulong ticket,double exit_price,double profit_loss,const 
 void CancelSignal(ulong ticket,const string reason)
 {
    string payload="{"+
-   "\"order_ticket\":"+IntegerToString(ticket)+","+
+   "\"order_ticket\":\""+IntegerToString(ticket)+"\","+
    "\"actual_result\":\"CANCELLED\","+
    "\"cancelled_reason\":\""+JsonEscape(reason)+"\"}";
    
@@ -1382,26 +1448,37 @@ void OnM15NewBar()
          }
          // ⭐ ML学習データに基づくロット倍率を適用（最大値制限あり）
          double finalLots = MathMin(Lots * ai.lot_multiplier, MaxLots);
+         double normLots=finalLots; string lotWhy="";
+         if(!NormalizeLotsForSymbol(finalLots,normLots,lotWhy)){
+            LogAIDecision("M15",decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_INVALID_LOT",threshold_met,posCount,0,tech_dir);
+            SafePrint(StringFormat("[LOT] skip: %s",lotWhy));
+            return;
+         }
+         finalLots=normLots;
          if(ai.lot_multiplier > 1.0){
             SafePrint(StringFormat("[M15] Dynamic Lot Sizing: %.2fx (%.2f → %.2f) - %s",
                       ai.lot_multiplier, Lots, finalLots, ai.lot_level));
          }
          
          if(ai.order_type=="market"){
-            double slDist=t_exec.atr*RiskATRmult, tpDist=slDist*RewardRR; bool ok=false; double entry=0.0; ulong posTicket=0;
+            double slDist=t_exec.atr*RiskATRmult, tpDist=slDist*RewardRR; bool ok=false; double entry=0.0; ulong posTicket=0; ulong ordTicket=0;
             double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID), ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
             if(t_exec.dir>0){ planned_entry=ask; planned_sl=ask-slDist; planned_tp=ask+tpDist; planned_type=ORDER_TYPE_BUY; }
             else{ planned_entry=bid; planned_sl=bid+slDist; planned_tp=bid-tpDist; planned_type=ORDER_TYPE_SELL; }
-            if(t_exec.dir>0){ ok=trade.Buy(finalLots,_Symbol,0,ask-slDist,ask+tpDist); if(ok && PositionSelect(_Symbol)){posTicket=(ulong)PositionGetInteger(POSITION_TICKET); entry=PositionGetDouble(POSITION_PRICE_OPEN);} }
-            else{ ok=trade.Sell(finalLots,_Symbol,0,bid+slDist,bid-tpDist); if(ok && PositionSelect(_Symbol)){posTicket=(ulong)PositionGetInteger(POSITION_TICKET); entry=PositionGetDouble(POSITION_PRICE_OPEN);} }
-            if(ok && posTicket>0){
+            if(t_exec.dir>0){ ok=trade.Buy(finalLots,_Symbol,0,ask-slDist,ask+tpDist); if(ok){ ordTicket=trade.ResultOrder(); if(PositionSelect(_Symbol)){posTicket=(ulong)PositionGetInteger(POSITION_TICKET); entry=PositionGetDouble(POSITION_PRICE_OPEN);} } }
+            else{ ok=trade.Sell(finalLots,_Symbol,0,bid+slDist,bid-tpDist); if(ok){ ordTicket=trade.ResultOrder(); if(PositionSelect(_Symbol)){posTicket=(ulong)PositionGetInteger(POSITION_TICKET); entry=PositionGetDouble(POSITION_PRICE_OPEN);} } }
+            if(ok && posTicket>0 && ordTicket>0){
                // Market注文が成功したら即座に追跡開始（重複防止）
                g_trackedPositionTicket=posTicket;
+               g_trackedOrderTicket=ordTicket;
                g_trackedPositionOpenTime=(datetime)PositionGetInteger(POSITION_TIME);
                g_trackedPositionEntryPrice=entry;
+               g_trackedFillSent=false;
+               g_trackedFillLastTry=0;
                
-               RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,posTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,g_dynamicExpiryMin);
-               LogAIDecision("M15",decision_dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,"EXECUTED_MARKET",threshold_met,posCount,posTicket,tech_dir);
+               // ai_signals.order_ticket は order ticket をキーに統一する（update系が .eq('order_ticket', ...) を使うため）
+               RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,g_dynamicExpiryMin);
+               LogAIDecision("M15",decision_dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,"EXECUTED_MARKET",threshold_met,posCount,ordTicket,tech_dir);
                SafePrint(StringFormat("[M15] market executed dir=%d prob=%.0f%% lot=%.2f",t_exec.dir,ai.win_prob*100,finalLots));
                return;
             }else{
@@ -1415,6 +1492,13 @@ void OnM15NewBar()
       }else{ // pullback or default
          // ⭐ ML学習データに基づくロット倍率を適用（最大値制限あり）
          double finalLots = MathMin(Lots * ai.lot_multiplier, MaxLots);
+         double normLots=finalLots; string lotWhy="";
+         if(!NormalizeLotsForSymbol(finalLots,normLots,lotWhy)){
+            LogAIDecision("M15",decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_INVALID_LOT",threshold_met,posCount,0,tech_dir);
+            SafePrint(StringFormat("[LOT] skip: %s",lotWhy));
+            return;
+         }
+         finalLots=normLots;
          if(ai.lot_multiplier > 1.0){
             SafePrint(StringFormat("[M15] Dynamic Lot Sizing: %.2fx (%.2f → %.2f) - %s",
                       ai.lot_multiplier, Lots, finalLots, ai.lot_level));
@@ -1506,28 +1590,67 @@ void OnH1NewBar()
 // ===== ポジション監視（ML学習用） =====
 void CheckPositionStatus()
 {
+   // Ensure entry_price is recorded for tracked positions (market orders can report entry_price=0 right after OrderSend)
+   if(g_trackedOrderTicket>0 && g_trackedPositionTicket>0 && !g_trackedFillSent){
+      datetime now=TimeCurrent();
+      // try at most once per 60 seconds
+      if(g_trackedFillLastTry==0 || (now - g_trackedFillLastTry) >= 60){
+         g_trackedFillLastTry=now;
+         if(PositionSelectByTicket(g_trackedPositionTicket)){
+            double ep=PositionGetDouble(POSITION_PRICE_OPEN);
+            if(MathIsValidNumber(ep) && ep>0){
+               g_trackedPositionEntryPrice=ep;
+               string payload="{\"order_ticket\":\""+IntegerToString(g_trackedOrderTicket)+"\""+
+                              ",\"entry_price\":"+DoubleToString(g_trackedPositionEntryPrice,_Digits)+
+                              ",\"actual_result\":\"FILLED\"}";
+               string resp;
+               if(HttpPostJson(AI_Signals_Update_URL,AI_Bearer_Token,payload,resp,3000)){
+                  g_trackedFillSent=true;
+                  SafePrint(StringFormat("[AI_SIGNALS_UPDATE] Filled confirmed order=%d entry=%.5f",g_trackedOrderTicket,g_trackedPositionEntryPrice));
+               }
+            }
+         }
+      }
+   }
+
    // ペンディングオーダーが約定したかチェック
    if(g_pendingTicket>0 && !OrderAlive(g_pendingTicket)){
-      // 約定したか確認
-      if(PositionSelectByTicket(g_pendingTicket)){
-         g_trackedPositionTicket=g_pendingTicket;
-         g_trackedPositionOpenTime=PositionGetInteger(POSITION_TIME);
+      // NOTE: Order ticket != Position ticket. When the pending order is filled, find the new position by symbol+magic.
+      ulong posTicket=0;
+      for(int i=PositionsTotal()-1;i>=0;i--){
+         ulong t=PositionGetTicket(i);
+         if(t<=0) continue;
+         if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+         if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+         posTicket=t;
+         break;
+      }
+
+      if(posTicket>0 && PositionSelectByTicket(posTicket)){
+         g_trackedPositionTicket=posTicket;
+         g_trackedOrderTicket=g_pendingTicket;
+         g_trackedPositionOpenTime=(datetime)PositionGetInteger(POSITION_TIME);
          g_trackedPositionEntryPrice=PositionGetDouble(POSITION_PRICE_OPEN);
-         
-         // シグナル更新（エントリー価格を記録） - 新しいエンドポイントを使用
-         string payload="{\"order_ticket\":"+IntegerToString(g_trackedPositionTicket)+
+         g_trackedFillSent=false;
+         g_trackedFillLastTry=0;
+
+         // シグナル更新（エントリー価格を記録） - order_ticketキーで更新
+         string payload="{\"order_ticket\":\""+IntegerToString(g_trackedOrderTicket)+"\""+
                         ",\"entry_price\":"+DoubleToString(g_trackedPositionEntryPrice,_Digits)+
                         ",\"actual_result\":\"FILLED\"}";
          string resp;
          HttpPostJson(AI_Signals_Update_URL,AI_Bearer_Token,payload,resp,3000);
-         
-         SafePrint(StringFormat("[POSITION] Filled ticket=%d at %.5f",g_trackedPositionTicket,g_trackedPositionEntryPrice));
-         
-         // ペンディングチケットをリセット（重複ログ防止）
-         g_pendingTicket=0;
-         g_pendingDir=0;
-         g_pendingAt=0;
+
+         SafePrint(StringFormat("[POSITION] Filled order=%d pos=%d at %.5f",g_trackedOrderTicket,g_trackedPositionTicket,g_trackedPositionEntryPrice));
+      }else{
+         // Order disappeared but no position exists -> treat as cancelled to avoid stale PENDING rows.
+         CancelSignal(g_pendingTicket,"filled_not_found");
       }
+
+      // ペンディングチケットをリセット（重複ログ防止）
+      g_pendingTicket=0;
+      g_pendingDir=0;
+      g_pendingAt=0;
    }
    
    // 追跡中のポジションがクローズされたかチェック
@@ -1551,7 +1674,8 @@ void CheckPositionStatus()
                      if(profit>0.01) result="WIN";
                      else if(profit<-0.01) result="LOSS";
                      
-                     UpdateSignalResult(g_trackedPositionTicket,exit_price,profit,result,sl_hit,tp_hit);
+                     ulong keyTicket=(g_trackedOrderTicket>0?g_trackedOrderTicket:g_trackedPositionTicket);
+                     UpdateSignalResult(keyTicket,exit_price,profit,result,sl_hit,tp_hit);
 
                      // ★ TP/SL時のみクールダウンを設定
                      if(sl_hit || tp_hit){
@@ -1561,8 +1685,11 @@ void CheckPositionStatus()
                      }
                      
                      g_trackedPositionTicket=0;
+                     g_trackedOrderTicket=0;
                      g_trackedPositionOpenTime=0;
                      g_trackedPositionEntryPrice=0;
+                     g_trackedFillSent=false;
+                     g_trackedFillLastTry=0;
                      break;
                   }
                }
@@ -1578,7 +1705,7 @@ void CheckPositionStatus()
 // ===== メイン =====
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
-   SafePrint("[INIT] AwajiSamurai_AI_2.0 1.5.2 start (Quad Fusion + Virtual Learning)");
+   SafePrint(StringFormat("[INIT] AwajiSamurai_AI_2.0 %s start (build %s %s)", AI_EA_Version, __DATE__, __TIME__));
    SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",
       MinWinProb*100,RiskATRmult,RewardRR,Lots,MaxPositions));
    SafePrint("[INFO] Sending EMA25, SMA100, SMA200, SMA800, MACD, RSI, ATR, Ichimoku (all lines) to AI");

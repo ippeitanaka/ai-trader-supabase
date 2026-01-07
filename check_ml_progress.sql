@@ -77,11 +77,11 @@ LIMIT 10;
 -- 5. ML学習の実行履歴
 SELECT 
   created_at,
+  training_type,
   complete_trades_count,
   patterns_discovered,
   patterns_updated,
   overall_win_rate,
-  best_pattern_name,
   best_pattern_win_rate,
   status
 FROM ml_training_history
@@ -114,3 +114,32 @@ WHERE at >= '2025-10-24'
 GROUP BY DATE(at)
 ORDER BY date DESC
 LIMIT 30;
+
+-- 8. MLパターン使用シグナルの状態内訳（WIN/LOSS以外の滞留チェック）
+SELECT
+  actual_result,
+  COUNT(*) AS signals,
+  COUNT(*) FILTER (WHERE closed_at IS NOT NULL) AS with_closed_at,
+  COUNT(*) FILTER (WHERE entry_price IS NOT NULL) AS with_entry_price,
+  COUNT(*) FILTER (WHERE exit_price IS NOT NULL) AS with_exit_price,
+  COUNT(*) FILTER (WHERE profit_loss IS NOT NULL) AS with_profit_loss,
+  MIN(created_at) AS oldest,
+  MAX(created_at) AS newest
+FROM ai_signals
+WHERE ml_pattern_used = true
+GROUP BY actual_result
+ORDER BY signals DESC;
+
+-- 9. 古いPENDING（要調査: 期限切れキャンセル or 更新処理不具合の可能性）
+SELECT
+  symbol,
+  timeframe,
+  COUNT(*) AS pending_count,
+  MIN(created_at) AS oldest_pending,
+  MAX(created_at) AS newest_pending
+FROM ai_signals
+WHERE ml_pattern_used = true
+  AND actual_result = 'PENDING'
+  AND created_at < now() - interval '7 days'
+GROUP BY symbol, timeframe
+ORDER BY pending_count DESC;

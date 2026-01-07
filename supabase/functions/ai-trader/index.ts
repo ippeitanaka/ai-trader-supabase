@@ -6,6 +6,15 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
 const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") || "gpt-4o"; // デフォルト: gpt-4o (高精度)
 
+type MlMode = "off" | "log_only" | "on";
+
+function getMlMode(): MlMode {
+  const raw = (Deno.env.get("AI_TRADER_ML_MODE") ?? "log_only").toLowerCase().trim();
+  if (raw === "on" || raw === "true" || raw === "1") return "on";
+  if (raw === "off" || raw === "false" || raw === "0") return "off";
+  return "log_only";
+}
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 export interface TradeRequest {
@@ -563,6 +572,9 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
   const reason = ea_suggestion.reason;
   const ichimoku_score = ea_suggestion.ichimoku_score;
 
+  // MLモード: off=ML参照なし, log_only=MLを記録のみ(判断/ロットに影響させない), on=従来通り
+  const mlMode = getMlMode();
+
   const techDir = typeof ea_suggestion.tech_dir === "number" ? ea_suggestion.tech_dir : undefined;
 
   const atrNorm = typeof req.atr_norm === "number" ? req.atr_norm : undefined;
@@ -608,12 +620,23 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
   
   // ステップ3: ML学習データを取得（PHASE1以外）
   const ENABLE_ML_LEARNING = learningPhase !== "PHASE1_TECHNICAL";
+
+  // 実トレードにMLを組み込まない運用のため、MLの影響範囲をモードで制御する。
+  // - log_only: ml_patterns のマッチ結果は返す/保存するが、OpenAIプロンプトや win_prob/lot には反映しない。
+  // - off: ml_patterns を参照しない（完全無効）
+  // - on: 従来通り ML を判断に反映
+  const ENABLE_ML_PATTERN_LOOKUP = ENABLE_ML_LEARNING && mlMode !== "off";
+  const ENABLE_ML_CONTEXT_FOR_OPENAI = ENABLE_ML_LEARNING && mlMode === "on";
+  const APPLY_ML_WIN_PROB_ADJUSTMENT = ENABLE_ML_CONTEXT_FOR_OPENAI;
+  const APPLY_ML_LOT_MULTIPLIER = ENABLE_ML_CONTEXT_FOR_OPENAI;
+
+  console.log(`[AI] ML mode=${mlMode} (phase=${learningPhase})`);
   
   let matchedPatterns: any[] = [];
   let recommendations: any[] = [];
   let historicalTrades: any[] = [];
   
-  if (ENABLE_ML_LEARNING) {
+  if (ENABLE_ML_PATTERN_LOOKUP) {
     // 1. ML学習済みパターンをTOP3まで取得（フェーズに応じた閾値）
     const adxBucket = bucketAdx(adx ?? undefined);
     const bbBucket = bucketBbWidth(bbWidth ?? undefined);
@@ -640,8 +663,10 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
 
     const { data: patterns } = await patternQuery;
     matchedPatterns = patterns || [];
-    
-    // 2. ML推奨事項を取得
+  }
+
+  // MLを実判断に組み込むときだけ、推奨事項や類似トレードもプロンプト用に取得する。
+  if (ENABLE_ML_CONTEXT_FOR_OPENAI) {
     const { data: recs } = await supabase
       .from("ml_recommendations")
       .select("*")
@@ -649,8 +674,7 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
       .order("priority", { ascending: true })
       .limit(3);
     recommendations = recs || [];
-    
-    // 3. 過去の類似トレードを取得（成功事例と失敗事例）
+
     const { data: trades } = await supabase
       .from("ai_signals")
       .select("*")
@@ -725,10 +749,9 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
   }
   
   // 📊 ロット倍率を計算（ML学習データ + 直近パフォーマンスに基づく）
-  const lotMultiplierResult = calculateLotMultiplier(
-    matchedPatterns.length > 0 ? matchedPatterns[0] : null,
-    historicalTrades
-  );
+  const lotMultiplierResult = APPLY_ML_LOT_MULTIPLIER
+    ? calculateLotMultiplier(matchedPatterns.length > 0 ? matchedPatterns[0] : null, historicalTrades)
+    : { multiplier: 1.0, level: "Level 1 (通常)", reason: `ML disabled (mode=${mlMode})` };
   console.log(`[AI] Lot Multiplier: ${lotMultiplierResult.multiplier}x (${lotMultiplierResult.level}) - ${lotMultiplierResult.reason}`);
   
   // 過去の成功事例を抽出
@@ -1101,9 +1124,9 @@ entry_params 必須キー:
 - breakout: { o: 0.05-0.5, confirm_tf: "M1|M5|M15", confirm_rule: "close_break|macd_flip", order_type: "market|stop", expiry_bars: 1-6 }
 - mtf_confirm: { m5_rules: [..], order_type: "market|limit", expiry_bars: 1-6 }
 
-重要: 
+  重要: 
 • 上記の優先順位に従って判断してください
-• ${learningPhase === "PHASE3_FULL_ML" ? "ML学習データの過去勝率を最重視" : learningPhase === "PHASE2_HYBRID" && matchedPatterns.length > 0 ? "ML学習データとテクニカル指標をバランス良く総合判断" : "すべてのテクニカル指標を総合的に評価"}してください
+• ${ENABLE_ML_CONTEXT_FOR_OPENAI ? (learningPhase === "PHASE3_FULL_ML" ? "ML学習データの過去勝率を最重視" : learningPhase === "PHASE2_HYBRID" && matchedPatterns.length > 0 ? "ML学習データとテクニカル指標をバランス良く総合判断" : "すべてのテクニカル指標を総合的に評価") : "すべてのテクニカル指標を総合的に評価"}してください
 • 0%～90%の幅広い範囲で動的に算出してください`;
 
   // 学習データ収集フェーズ用の総合判断プロンプト（廃止：上記に統合）
@@ -1121,7 +1144,7 @@ entry_params 必須キー:
         messages: [
           { 
             role: "system", 
-            content: ENABLE_ML_LEARNING 
+            content: ENABLE_ML_CONTEXT_FOR_OPENAI 
               ? `あなたはプロの金融トレーダーです。以下の優先順位で分析してください:
 
 ⭐⭐⭐ 最優先: ML学習済みパターンの実績データ（勝率、利益率、サンプル数）
@@ -1193,7 +1216,7 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     }
     
     // ⭐ 学習データ収集フェーズではML調整をスキップ
-    if (ENABLE_ML_LEARNING && mlWinRateBoost !== 0) {
+    if (APPLY_ML_WIN_PROB_ADJUSTMENT && mlWinRateBoost !== 0) {
       const originalProb = win_prob;
       win_prob = win_prob + mlWinRateBoost;
       console.log(`[AI] ML adjustment applied: ${originalProb.toFixed(3)} → ${win_prob.toFixed(3)} (boost: ${mlWinRateBoost.toFixed(3)})`);
@@ -1212,9 +1235,12 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       clientMinWinProbProvided ? req.min_win_prob : undefined,
     ) ?? 0.70;
     const reasoningBase = aiResult.reasoning || "N/A";
-    const reasoning = clientMinWinProbProvided
+    const reasoningBase2 = clientMinWinProbProvided
       ? reasoningBase
       : `${reasoningBase} | WARN: min_win_prob not provided by client; default gate=0.70`;
+    const reasoning = (!ENABLE_ML_CONTEXT_FOR_OPENAI && (matchedPatterns?.length ?? 0) > 0)
+      ? `${reasoningBase2} | ML: ${mlMode} (pattern logged, not applied)`
+      : reasoningBase2;
     const recommended_min_win_prob = sanitizeRecommendedMinWinProb(aiResult.recommended_min_win_prob);
     // Guard: never execute below EA-configured minimum.
     // recommended_min_win_prob はログ/参考用（実行ゲートとしては使用しない）。

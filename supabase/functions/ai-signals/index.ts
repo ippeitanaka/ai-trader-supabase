@@ -290,7 +290,7 @@ interface AISignalEntry {
   virtual_filled_at?: string | null;
   
   // 注文情報
-  order_ticket?: number;
+  order_ticket?: number | string;
   entry_price?: number;
   
   // 結果情報（後で更新）
@@ -302,6 +302,22 @@ interface AISignalEntry {
   cancelled_reason?: string;
   sl_hit?: boolean;
   tp_hit?: boolean;
+}
+
+function parseOrderTicket(value: unknown): string | null {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value <= 0) return null;
+    if (!Number.isInteger(value)) return null;
+    return String(value);
+  }
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return null;
+    if (!/^[0-9]+$/.test(s)) return null;
+    if (s === "0") return null;
+    return s;
+  }
+  return null;
 }
 
 function corsHeaders() {
@@ -353,7 +369,8 @@ serve(async (req: Request) => {
       }
 
       const requestedActualResult = (body.actual_result || 'PENDING');
-      const hasValidTicket = typeof body.order_ticket === "number" && Number.isFinite(body.order_ticket) && body.order_ticket > 0;
+      const orderTicket = parseOrderTicket(body.order_ticket);
+      const hasValidTicket = typeof orderTicket === "string";
       const actualResult = (requestedActualResult === 'FILLED' && !hasValidTicket) ? 'PENDING' : requestedActualResult;
 
       const entry: AISignalEntry = {
@@ -399,7 +416,7 @@ serve(async (req: Request) => {
         ichimoku_price_vs_cloud: body.ichimoku?.price_vs_cloud,
         
         // エントリー手法
-        order_ticket: body.order_ticket,
+        order_ticket: orderTicket,
         entry_price: body.entry_price,
         entry_method: body.entry_method ?? null,
         entry_params: body.entry_params ?? null,
@@ -487,7 +504,9 @@ serve(async (req: Request) => {
         method_reason,
       } = body;
 
-      if (!signal_id && !order_ticket) {
+      const parsedOrderTicket = parseOrderTicket(order_ticket);
+
+      if (!signal_id && !parsedOrderTicket) {
         return new Response(
           JSON.stringify({ error: "signal_id or order_ticket is required" }),
           { status: 400, headers: corsHeaders() }
@@ -528,7 +547,7 @@ serve(async (req: Request) => {
         .from("ai_signals")
         .update(updateData);
 
-      query = signal_id ? query.eq("id", signal_id) : query.eq("order_ticket", order_ticket);
+      query = signal_id ? query.eq("id", signal_id) : query.eq("order_ticket", parsedOrderTicket);
 
       const { data, error } = await query.select();
 
