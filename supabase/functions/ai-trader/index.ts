@@ -98,11 +98,10 @@ export interface TradeResponse {
   recommended_min_win_prob?: number; // 0.60 - 0.75 (never higher to avoid reducing opportunities)
   expected_value_r?: number; // EV in R-multiples (loss=-1R, win=+1.5R)
   skip_reason?: string;
-  // Hybrid entry selection
-  entry_method?: "pullback" | "breakout" | "mtf_confirm" | "none";
-  entry_params?: Record<string, unknown> | null;
+  // Execution is market-only
+  entry_method?: "market";
+  entry_params?: null;
   method_selected_by?: "OpenAI" | "Fallback" | "Manual";
-  method_confidence?: number; // 0.0 - 1.0
   method_reason?: string;
   // ML pattern tracking
   ml_pattern_used?: boolean;
@@ -193,55 +192,9 @@ function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): 
 
   const reasons: string[] = [];
 
-  // Emergency guard: mtf_confirm is currently underperforming badly.
-  // Disable execution to stop bleeding; keep the info for logging/analysis.
-  if (response.entry_method === "mtf_confirm") {
-    reasons.push("mtf_confirm disabled");
-  }
-
-  // Range-like regime: make breakout harder to pass.
-  // Rationale: breakouts are more likely to fail in low-trend + low-volatility squeeze.
-  // Uses the same thresholds as signal tagging (weak_trend + bb_squeeze).
-  const RANGE_ADX_MAX = 15;
-  const RANGE_BB_WIDTH_MAX = 0.003;
-  const BREAKOUT_RANGE_EXTRA_MIN_WIN_PROB = 0.05;
-
-  const adx = tradeReq.adx;
-  const bbWidth = tradeReq.bb_width;
-  const isRangeLike =
-    typeof adx === "number" &&
-    isFinite(adx) &&
-    typeof bbWidth === "number" &&
-    isFinite(bbWidth) &&
-    bbWidth > 0 &&
-    adx < RANGE_ADX_MAX &&
-    bbWidth < RANGE_BB_WIDTH_MAX;
-
-  if (isRangeLike && response.entry_method === "breakout" && typeof response.win_prob === "number") {
-    const baseMinWinProb = typeof tradeReq.min_win_prob === "number" ? tradeReq.min_win_prob : 0.7;
-    const required = Math.min(baseMinWinProb + BREAKOUT_RANGE_EXTRA_MIN_WIN_PROB, 0.8);
-    if (response.win_prob < required) {
-      reasons.push(
-        `breakout suppressed in range (adx<${RANGE_ADX_MAX}, bb_width<${RANGE_BB_WIDTH_MAX}, need>=${required.toFixed(2)})`,
-      );
-    }
-  }
-
   // BTCUSD: avoid observed loss cluster at UTC19
   if (symbol === "BTCUSD" && utcHour === 19) {
     reasons.push("BTCUSD disabled at UTC19");
-  }
-
-  // BTCUSD: pullback underperforms unless probability is very high
-  // NOTE: Keep this guard lenient; overly strict values can lead to 100% SKIPPED.
-  const BTC_PULLBACK_MIN_WIN_PROB = 0.75;
-  if (
-    symbol === "BTCUSD" &&
-    response.entry_method === "pullback" &&
-    typeof response.win_prob === "number" &&
-    response.win_prob < BTC_PULLBACK_MIN_WIN_PROB
-  ) {
-    reasons.push(`BTCUSD pullback blocked (<${BTC_PULLBACK_MIN_WIN_PROB})`);
   }
 
   // Emergency guard: cap XAUUSD lot scaling.
@@ -265,10 +218,10 @@ function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): 
   return {
     ...response,
     action: 0,
-    entry_method: "none",
+    entry_method: "market",
     entry_params: null,
     skip_reason: response.skip_reason || "guard",
-    method_selected_by: "Manual",
+    method_selected_by: response.method_selected_by || "Manual",
     method_reason: response.method_reason ? `${response.method_reason} | ${guardNote}` : guardNote,
     reasoning: response.reasoning ? `${response.reasoning} | ${guardNote}` : guardNote,
   };
@@ -293,9 +246,6 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
   
   let offset_factor = 0.2;
   let expiry_minutes = 90;
-  // デフォルトのエントリー手法（簡易フォールバック）
-  let entry_method: "pullback" | "breakout" | "mtf_confirm" | "none" = "pullback";
-  const entry_params: Record<string, unknown> = {};
   
   // ATRによるリスク調整
   if (atr > 0) {
@@ -308,36 +258,6 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
     }
   }
 
-  // 簡易ルールでエントリー方式を選択
-  // 例: RSIが高め・ATR高→プルバック、レンジ気味→ブレイクアウト、矛盾あるが方向は出ている→MTFコンファーム
-  try {
-    const rsi = req.rsi;
-    if (rsi >= 65) {
-      entry_method = "pullback";
-      const k = atr > 0.001 ? 0.35 : atr > 0.0007 ? 0.3 : 0.25;
-      Object.assign(entry_params, { k, anchor_type: "ema25", expiry_bars: 2 });
-    } else if (rsi <= 35) {
-      entry_method = "pullback";
-      const k = atr > 0.001 ? 0.35 : 0.25;
-      Object.assign(entry_params, { k, anchor_type: "kijun", expiry_bars: 2 });
-    } else {
-      // 中立RSIの場合、MACDと価格vs雲で判断
-      const macdCross = req.macd.cross;
-      const priceVsCloud = req.ichimoku.price_vs_cloud;
-      if (Math.abs(macdCross) > 0 && priceVsCloud !== 0) {
-        entry_method = "breakout";
-        const o = atr > 0.001 ? 0.25 : 0.15;
-        Object.assign(entry_params, { o, confirm_tf: "M5", confirm_rule: "close_break", expiry_bars: 2 });
-      } else {
-        entry_method = "mtf_confirm";
-        Object.assign(entry_params, { m5_rules: ["swing", "rsi_back_50"], order_type: "market", expiry_bars: 3 });
-      }
-    }
-  } catch (_) {
-    // 失敗時は保守的にnone
-    entry_method = "none";
-  }
-  
   console.log(
     `[Fallback] QuadFusion: win_prob=${(analysis.win_prob * 100).toFixed(1)}% ` +
     `direction=${analysis.direction} confidence=${analysis.confidence}`
@@ -354,96 +274,15 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
     recommended_min_win_prob: 0.75,
     expected_value_r: computeExpectedValueR(analysis.win_prob),
     skip_reason: analysis.direction === 0 ? "no-trade" : "",
-    entry_method,
-    entry_params,
+    entry_method: "market",
+    entry_params: null,
     method_selected_by: "Fallback",
-    method_confidence: 0.5,
-    method_reason: "Rule-based selection using RSI/ATR/MACD/Ichimoku heuristics",
+    method_reason: "QuadFusion fallback (market-only execution)",
     ml_pattern_used: false,
     ml_pattern_id: null,
     ml_pattern_name: null,
     ml_pattern_confidence: null,
   };
-}
-
-/**
- * entry_params を検証して異常な数値を修正
- * OpenAI が時折極端な数値（1e+40 など）を返すことがあるため
- */
-function sanitizeEntryParams(params: Record<string, unknown>): Record<string, unknown> {
-  const MAX_REASONABLE_VALUE = 10.0;  // 通常 k, o は 0.1～1.0 程度
-  const sanitized: Record<string, unknown> = {};
-  
-  for (const [key, value] of Object.entries(params)) {
-    if (typeof value === 'number') {
-      // 異常値（NaN, Infinity, 極端に大きい値）を修正
-      if (isNaN(value) || !isFinite(value) || Math.abs(value) > MAX_REASONABLE_VALUE) {
-        console.warn(`[AI] Invalid entry_param detected: ${key}=${value}, using default`);
-        
-        // デフォルト値を設定
-        if (key === 'k') sanitized[key] = 0.35;  // pullback: 35%押し目
-        else if (key === 'o') sanitized[key] = 0.2;  // breakout: 20%超え
-        else if (key === 'expiry_bars') sanitized[key] = 3;
-        else sanitized[key] = 0.5;  // その他は中間値
-      } else {
-        sanitized[key] = value;
-      }
-    } else {
-      // 文字列等はそのまま
-      sanitized[key] = value;
-    }
-  }
-  
-  return sanitized;
-}
-
-function clampNumber(v: unknown, min: number, max: number): number | null {
-  if (typeof v !== "number" || !isFinite(v)) return null;
-  return Math.max(min, Math.min(max, v));
-}
-
-function normalizeEntryDecision(
-  method: "pullback" | "breakout" | "mtf_confirm" | "none",
-  params: Record<string, unknown> | null,
-  req: TradeRequest,
-): { entry_method: "pullback" | "breakout" | "mtf_confirm" | "none"; entry_params: Record<string, unknown> | null } {
-  if (method === "none") return { entry_method: "none", entry_params: null };
-  const out: Record<string, unknown> = { ...(params || {}) };
-
-  // Common defaults
-  const expiryBars = clampNumber(out.expiry_bars, 1, 6);
-  out.expiry_bars = Math.round((expiryBars ?? 3));
-
-  if (method === "pullback") {
-    const k = clampNumber(out.k, 0.1, 0.6);
-    out.k = Math.round(((k ?? (req.atr > 0.001 ? 0.35 : 0.3)) * 1000)) / 1000;
-    const anchor = typeof out.anchor_type === "string" ? out.anchor_type : "ema25";
-    out.anchor_type = ["ema25", "tenkan", "kijun"].includes(anchor) ? anchor : "ema25";
-    // execution-quality default: pullback is usually limit
-    const ot = typeof out.order_type === "string" ? out.order_type : "limit";
-    out.order_type = ["limit", "market"].includes(ot) ? ot : "limit";
-  }
-
-  if (method === "breakout") {
-    const o = clampNumber(out.o, 0.05, 0.5);
-    out.o = Math.round(((o ?? (req.atr > 0.001 ? 0.25 : 0.15)) * 1000)) / 1000;
-    const ctf = typeof out.confirm_tf === "string" ? out.confirm_tf : "M5";
-    out.confirm_tf = ["M1", "M5", "M15"].includes(ctf) ? ctf : "M5";
-    const cr = typeof out.confirm_rule === "string" ? out.confirm_rule : "close_break";
-    out.confirm_rule = ["close_break", "macd_flip"].includes(cr) ? cr : "close_break";
-    // execution-quality default: breakout is market (EA may map to stop/market)
-    const ot = typeof out.order_type === "string" ? out.order_type : "market";
-    out.order_type = ["market", "stop"].includes(ot) ? ot : "market";
-  }
-
-  if (method === "mtf_confirm") {
-    const rules = Array.isArray(out.m5_rules) ? out.m5_rules.filter((r) => typeof r === "string") : [];
-    out.m5_rules = rules.length > 0 ? rules.slice(0, 5) : ["swing", "rsi_back_50"];
-    const ot = typeof out.order_type === "string" ? out.order_type : "market";
-    out.order_type = ["market", "limit"].includes(ot) ? ot : "market";
-  }
-
-  return { entry_method: method, entry_params: out };
 }
 
 function sanitizeRecommendedMinWinProb(v: unknown): number | null {
@@ -1106,23 +945,14 @@ ${(() => {
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📋 回答形式（JSON）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-以下のJSON形式で回答してください（entry_methodに応じてentry_paramsの必須キーも必ず返す）:
+以下のJSON形式で回答してください:
 {
   "win_prob": 0.XX,  // 0.00～0.90の範囲で動的に設定
   "recommended_min_win_prob": 0.70, // 0.60～0.75（重要: 0.75を超えない＝取引機会を減らさない）
   "skip_reason": "", // 見送りなら理由（例: "range", "conflict", "news"）
   "confidence": "high" | "medium" | "low",
-  "reasoning": "判断理由（40文字以内、主要な根拠を明記）",
-  "entry_method": "pullback"|"breakout"|"mtf_confirm"|"none",
-  "entry_params": { },
-  "method_confidence": 0.0-1.0,
-  "method_reason": "…"
+  "reasoning": "判断理由（40文字以内、主要な根拠を明記）"
 }
-
-entry_params 必須キー:
-- pullback: { k: 0.1-0.6, anchor_type: "ema25|tenkan|kijun", order_type: "limit|market", expiry_bars: 1-6 }
-- breakout: { o: 0.05-0.5, confirm_tf: "M1|M5|M15", confirm_rule: "close_break|macd_flip", order_type: "market|stop", expiry_bars: 1-6 }
-- mtf_confirm: { m5_rules: [..], order_type: "market|limit", expiry_bars: 1-6 }
 
   重要: 
 • 上記の優先順位に従って判断してください
@@ -1172,13 +1002,7 @@ JSON形式で簡潔に回答してください。過度に楽観的な予測は�
 
 0%～90%の幅広い範囲で動的に算出し、JSON形式で簡潔に回答してください。指標間の矛盾が多いほど低勝率、一致が多いほど高勝率を設定してください。
 
-さらに、以下のエントリー方式から最適を1つ選び、パラメータも返してください。
-- pullback: 押し目/戻り待ち。例パラメータ: { k: 0.2-0.5, anchor_type: "ema25|tenkan|kijun", expiry_bars: 2|3 }
-- breakout: 直近高値/安値のブレイク確認。例: { o: 0.1-0.3, confirm_tf: "M5", confirm_rule: "close_break|macd_flip", expiry_bars: 2|3 }
-- mtf_confirm: M5でのミニ条件一致後に発注。例: { m5_rules: ["swing", "rsi_back_50"], order_type: "market|limit", expiry_bars: 2|3 }
-- none: 今は発注を見送り
-
-JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_reason": "", "confidence": "high|medium|low", "reasoning": "…", "entry_method": "pullback|breakout|mtf_confirm|none", "entry_params": { … }, "method_confidence": 0.0-1.0, "method_reason": "…"}`
+JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_reason": "", "confidence": "high|medium|low", "reasoning": "…"}`
           },
           { role: "user", content: prompt }
         ],
@@ -1248,36 +1072,9 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     // EV is deterministic from win_prob. Do NOT trust model-provided EV (often templates a constant).
     const expected_value_r = computeExpectedValueR(win_prob);
     const skip_reason = typeof aiResult.skip_reason === "string" ? aiResult.skip_reason : "";
-    let entry_method: "pullback" | "breakout" | "mtf_confirm" | "none" = "none";
-    let entry_params: Record<string, unknown> | null = null;
-    let method_confidence = typeof aiResult.method_confidence === 'number' ? aiResult.method_confidence : 0.5;
-    const method_reason = aiResult.method_reason || "N/A";
-
-    // AIが方式を返していれば採用
-    if (typeof aiResult.entry_method === 'string') {
-      const allowed = ["pullback", "breakout", "mtf_confirm", "none"] as const;
-      if ((allowed as readonly string[]).includes(aiResult.entry_method)) {
-        entry_method = aiResult.entry_method as any;
-      }
-    }
-    if (aiResult.entry_params && typeof aiResult.entry_params === 'object') {
-      entry_params = sanitizeEntryParams(aiResult.entry_params as any);
-    }
-
-    // 方式が不十分な場合はフォールバックで埋める
-    if (!entry_params || entry_method === "none") {
-      const fb = calculateSignalFallback(req);
-      if (entry_method === "none") entry_method = fb.entry_method as any;
-      if (!entry_params) entry_params = (fb.entry_params || {}) as any;
-      if (!method_confidence) method_confidence = fb.method_confidence || 0.5;
-    }
-
-    // Normalize decision to ensure execution-quality consistency
-    {
-      const normalized = normalizeEntryDecision(entry_method, entry_params, req);
-      entry_method = normalized.entry_method;
-      entry_params = normalized.entry_params;
-    }
+    const entry_method: "market" = "market";
+    const entry_params: null = null;
+    const method_reason = "market-only execution";
     
     // 詳細ログ出力
     console.log(
@@ -1300,7 +1097,6 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       entry_method,
       entry_params,
       method_selected_by: "OpenAI",
-      method_confidence,
       method_reason,
       lot_multiplier: lotMultiplierResult.multiplier,
       lot_level: lotMultiplierResult.level,
@@ -1440,7 +1236,7 @@ serve(async (req: Request) => {
           "rsi",
           "atr",
           "ichimoku_full",
-          "hybrid_entry_selection"
+          "market_only_execution"
         ],
         note: "Learning phase: AI comprehensively analyzes all technical indicators (MA, MACD, RSI, ATR, Ichimoku). Win probability: 0%-90% dynamic range. ML will be enabled after 100+ trades."
       }),
@@ -1521,7 +1317,7 @@ serve(async (req: Request) => {
         confidence: "low",
         reasoning: methodReason,
         skip_reason: "bad_inputs",
-        entry_method: "none",
+        entry_method: "market",
         entry_params: null,
         method_selected_by: "Manual",
         method_reason: methodReason,
@@ -1582,7 +1378,7 @@ serve(async (req: Request) => {
       `[ai-trader] 📊 RESULT: ${tradeReq.symbol} ${tradeReq.timeframe} ` +
       `req_dir=${tradeReq.ea_suggestion.dir}${techDirInfo} action=${response.action}${suggestedDirInfo} win=${response.win_prob.toFixed(3)}${ichimokuInfo} ` +
       `reason="${tradeReq.ea_suggestion.reason}" method=${predictionMethod}` +
-      (response.entry_method ? ` | entry_method=${response.entry_method} sel_by=${response.method_selected_by || 'N/A'} conf=${typeof response.method_confidence==='number'?response.method_confidence.toFixed(2):'N/A'}` : ``)
+      (response.entry_method ? ` | entry_method=${response.entry_method} sel_by=${response.method_selected_by || 'N/A'}` : ``)
     );
     
     // ⚠️ フォールバックの場合は警告

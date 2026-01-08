@@ -521,7 +521,7 @@ serve(async (req: Request) => {
   if (bb_width !== undefined) updateData.bb_width = bb_width;
       if (exit_price !== undefined) updateData.exit_price = exit_price;
       if (profit_loss !== undefined) updateData.profit_loss = profit_loss;
-      if (actual_result) updateData.actual_result = actual_result;
+        if (actual_result) updateData.actual_result = actual_result;
       if (closed_at) updateData.closed_at = closed_at;
       if (hold_duration_minutes !== undefined) updateData.hold_duration_minutes = hold_duration_minutes;
       if (sl_hit !== undefined) updateData.sl_hit = sl_hit;
@@ -542,6 +542,38 @@ serve(async (req: Request) => {
         if (method_selected_by !== undefined) updateData.method_selected_by = method_selected_by;
         if (method_confidence !== undefined) updateData.method_confidence = method_confidence;
         if (method_reason !== undefined) updateData.method_reason = method_reason;
+
+      // Guard: prevent FILLED without a valid order_ticket for non-virtual trades.
+      // - Real execution should always have a positive order_ticket.
+      // - Virtual (paper/shadow) trades may use signal_id-based updates with no ticket.
+      if (updateData.actual_result === "FILLED" && !parsedOrderTicket) {
+        const virtualIntent =
+          is_virtual === true ||
+          updateData.is_virtual === true ||
+          (typeof updateData.virtual_filled_at === "string" && updateData.virtual_filled_at.trim() !== "");
+
+        let existingIsVirtual = false;
+        if (!virtualIntent && signal_id) {
+          const { data: existing, error: existingErr } = await supabase
+            .from("ai_signals")
+            .select("is_virtual")
+            .eq("id", signal_id)
+            .maybeSingle();
+          if (existingErr) {
+            console.warn("[ai-signals] Failed to fetch existing is_virtual:", existingErr.message);
+          }
+          existingIsVirtual = existing?.is_virtual === true;
+        }
+
+        if (!virtualIntent && !existingIsVirtual) {
+          return new Response(
+            JSON.stringify({
+              error: "FILLED requires a valid order_ticket unless is_virtual=true",
+            }),
+            { status: 400, headers: corsHeaders() }
+          );
+        }
+      }
 
       let query = supabase
         .from("ai_signals")

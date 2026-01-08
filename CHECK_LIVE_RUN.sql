@@ -22,21 +22,124 @@ where created_at >= now() - interval '2 hours'
 order by created_at desc
 limit 200;
 
+-- 1.1) Are the repeated values just rounding? (ea-log, today)
+-- Compare raw win_prob (more precision) vs rounded.
+select
+  e.created_at,
+  e.sym,
+  e.tf,
+  e.trade_decision,
+  e.win_prob as win_prob_raw,
+  round((e.win_prob * 100.0)::numeric, 3) as win_prob_pct_3dp,
+  round((e.win_prob * 100.0)::numeric, 1) as win_prob_pct_1dp,
+  e.buy_win_prob as buy_win_prob_raw,
+  e.sell_win_prob as sell_win_prob_raw,
+  left(coalesce(e.ai_reasoning, ''), 120) as reasoning_prefix
+from "ea-log" e
+where e.created_at >= date_trunc('day', now())
+order by e.created_at desc
+limit 200;
+
+-- 1.2) Distribution of win_prob (ea-log, today)
+-- If you see only a few buckets AND many rows mention QuadFusion/Fallback,
+-- OpenAI may not be used and the rule-based engine produces clustered probabilities.
+select
+  round((e.win_prob * 100.0)::numeric, 1) as win_prob_pct_1dp,
+  count(*) as events,
+  count(*) filter (where e.ai_reasoning ilike '%QuadFusion%') as quadfusion_mentions,
+  count(*) filter (where e.ai_reasoning ilike '%[Fallback]%' or e.ai_reasoning ilike '%fallback%') as fallback_mentions,
+  max(e.created_at) as last_seen
+from "ea-log" e
+where e.created_at >= date_trunc('day', now())
+group by 1
+order by events desc, 1 desc;
+
+-- 1.3) Quantization check: distinct win_prob per symbol/TF (ea-log, today)
+-- If distinct_count is very small (e.g., <=3) for many symbols/TFs, the model is effectively bucketizing.
+select
+  e.sym as symbol,
+  coalesce(e.tf, 'unknown') as timeframe,
+  count(*) as events,
+  count(distinct e.win_prob) as distinct_win_prob_raw,
+  count(distinct round((e.win_prob * 100.0)::numeric, 1)) as distinct_win_prob_pct_1dp,
+  min(e.win_prob) as min_win_prob_raw,
+  max(e.win_prob) as max_win_prob_raw,
+  max(e.created_at) as last_seen
+from "ea-log" e
+where e.created_at >= date_trunc('day', now())
+group by 1, 2
+having count(*) >= 10
+order by distinct_win_prob_raw asc, events desc;
+
 -- 2) AI signals (ai_signals): last 2 hours
 -- Notes:
--- - actual_result='FILLED' when entry happened
+-- - For real trades, order_ticket should be present when actual_result='FILLED'.
+-- - For virtual (paper/shadow) trades, order_ticket may be NULL by design.
 select
   created_at,
   symbol,
   timeframe,
   dir,
   round((win_prob * 100.0)::numeric, 1) as win_prob_pct,
+  is_virtual,
   actual_result,
   order_ticket,
   instance,
   model_version
 from ai_signals
 where created_at >= now() - interval '2 hours'
+order by created_at desc
+limit 200;
+
+-- 2.2) ai_signals method source & win_prob clustering (today)
+-- If method_selected_by='Fallback' dominates, repeated win_prob values are expected.
+select
+  coalesce(method_selected_by, 'unknown') as method_selected_by,
+  round((win_prob * 100.0)::numeric, 1) as win_prob_pct_1dp,
+  count(*) as signals,
+  count(*) filter (where coalesce(is_virtual, false) = false) as real_like,
+  count(*) filter (where coalesce(is_virtual, false) = true) as virtual_like,
+  max(created_at) as last_seen
+from ai_signals
+where created_at >= date_trunc('day', now())
+group by 1, 2
+order by signals desc, 1, 2 desc;
+
+-- 2.3) Quantization check: distinct win_prob per symbol/TF (ai_signals, today)
+select
+  s.symbol,
+  coalesce(s.timeframe, 'unknown') as timeframe,
+  coalesce(s.method_selected_by, 'unknown') as method_selected_by,
+  count(*) as signals,
+  count(distinct s.win_prob) as distinct_win_prob_raw,
+  count(distinct round((s.win_prob * 100.0)::numeric, 1)) as distinct_win_prob_pct_1dp,
+  min(s.win_prob) as min_win_prob_raw,
+  max(s.win_prob) as max_win_prob_raw,
+  max(s.created_at) as last_seen
+from ai_signals s
+where s.created_at >= date_trunc('day', now())
+group by 1, 2, 3
+having count(*) >= 10
+order by distinct_win_prob_raw asc, signals desc;
+
+-- 2.1) Anomaly check: FILLED with NULL ticket on non-virtual rows (last 48 hours)
+-- This should be 0 if the server-side guards are working.
+select
+  created_at,
+  symbol,
+  timeframe,
+  is_virtual,
+  actual_result,
+  order_ticket,
+  entry_price,
+  left(coalesce(reason, ''), 120) as reason_prefix,
+  instance,
+  model_version
+from ai_signals
+where created_at >= now() - interval '48 hours'
+  and coalesce(is_virtual, false) = false
+  and actual_result = 'FILLED'
+  and order_ticket is null
 order by created_at desc
 limit 200;
 
