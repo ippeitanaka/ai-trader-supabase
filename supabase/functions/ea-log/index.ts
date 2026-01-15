@@ -10,6 +10,9 @@ interface EALogEntry {
   at: string;                    // トレード判断日時
   sym: string;                   // 銘柄
   tf?: string;                   // タイムフレーム（補足情報）
+  regime?: string;               // 相場状態（trend/range/uncertain）
+  strategy?: string;             // 戦略（trend_follow/mean_revert/none）
+  regime_confidence?: string;    // 判定信頼度（high/medium/low）
   action?: string;               // 売買の判断 (BUY/SELL/HOLD)
   tech_action?: string;          // テクニカル起点の方向（検証用）
   suggested_action?: string;     // AIがより良いと見た方向（検証用）
@@ -27,6 +30,9 @@ interface EALogInput {
   at: string;
   sym: string;
   tf?: string;
+  regime?: string;
+  strategy?: string;
+  regime_confidence?: string;
   rsi?: number;
   atr?: number;
   price?: number;
@@ -96,6 +102,28 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function buildRegimePrefix(regime?: string, strategy?: string, conf?: string): string {
+  const r = typeof regime === "string" ? regime.trim() : "";
+  const s = typeof strategy === "string" ? strategy.trim() : "";
+  const c = typeof conf === "string" ? conf.trim() : "";
+  if (!r && !s && !c) return "";
+  const parts: string[] = [];
+  if (r) parts.push(`regime=${r}`);
+  if (s) parts.push(`strategy=${s}`);
+  if (c) parts.push(`conf=${c}`);
+  return `[${parts.join(" ")}]`;
+}
+
+function attachRegimeToReasoning(reasoning: unknown, regime?: string, strategy?: string, conf?: string): string | undefined {
+  const prefix = buildRegimePrefix(regime, strategy, conf);
+  if (!prefix) return typeof reasoning === "string" ? reasoning : undefined;
+
+  const text = typeof reasoning === "string" ? reasoning.trim() : "";
+  // Avoid duplicating if already prefixed
+  if (text.startsWith("[regime=") || text.startsWith(prefix)) return text || prefix;
+  return text ? `${prefix} ${text}` : prefix;
+}
+
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -112,9 +140,13 @@ serve(async (req: Request) => {
     // NOTE: This function uses the service role key for DB writes.
     // Require a matching Bearer token to prevent random internet traffic from inserting junk rows.
     const auth = req.headers.get("authorization") || "";
-    const expectedBearer = Deno.env.get("EA_LOG_BEARER_TOKEN") || SUPABASE_SERVICE_ROLE_KEY;
-    if (auth !== `Bearer ${expectedBearer}`) {
-      console.warn("[ea-log] Unauthorized request");
+    const configuredBearer = (Deno.env.get("EA_LOG_BEARER_TOKEN") || "").trim();
+    const allowed = new Set<string>();
+    if (configuredBearer) allowed.add(`Bearer ${configuredBearer}`);
+    // Keep accepting service role bearer for backwards compatibility with existing EA setups.
+    allowed.add(`Bearer ${SUPABASE_SERVICE_ROLE_KEY}`);
+    if (!allowed.has(auth)) {
+      console.warn("[ea-log] Unauthorized request (bearer mismatch)");
       return new Response(
         JSON.stringify({ error: "Unauthorized" }),
         { status: 401, headers: corsHeaders() },
@@ -179,6 +211,9 @@ serve(async (req: Request) => {
       at: toISO(body.at),
       sym,
       tf: body.tf || undefined,
+      regime: body.regime || undefined,
+      strategy: body.strategy || undefined,
+      regime_confidence: body.regime_confidence || undefined,
       action: body.action || undefined,
       tech_action: body.tech_action || undefined,
       suggested_action: body.suggested_action || undefined,
@@ -196,7 +231,13 @@ serve(async (req: Request) => {
     const { error: insertError } = await supabase.from("ea-log").insert(logEntry);
     if (insertError) {
       const msg = String(insertError.message || "");
-      const isMissingColumn = /column .* does not exist/i.test(msg) || /42703/.test(msg);
+      const code = String((insertError as any).code ?? "");
+      const isMissingColumn =
+        code === "42703" ||
+        code === "PGRST204" ||
+        /column .* does not exist/i.test(msg) ||
+        /schema cache/i.test(msg) ||
+        /Could not find the .* column .* schema cache/i.test(msg);
       if (!isMissingColumn) {
         console.error("[ea-log] DB error:", insertError);
         return new Response(
@@ -212,7 +253,7 @@ serve(async (req: Request) => {
         action: logEntry.action,
         trade_decision: logEntry.trade_decision,
         win_prob: logEntry.win_prob,
-        ai_reasoning: logEntry.ai_reasoning,
+        ai_reasoning: attachRegimeToReasoning(body.ai_reasoning, body.regime, body.strategy, body.regime_confidence),
         order_ticket: logEntry.order_ticket,
       };
 
@@ -228,7 +269,9 @@ serve(async (req: Request) => {
       console.warn("[ea-log] Inserted legacy entry (remote schema not migrated yet)");
     }
     
-    console.log(`[ea-log] ${logEntry.sym} ${logEntry.tf || "?"} ${body.caller || "-"} ${logEntry.action || "?"}`);
+    console.log(
+      `[ea-log] sym=${logEntry.sym} tf=${logEntry.tf || "?"} caller=${body.caller || "-"} action=${logEntry.action || "?"} decision=${logEntry.trade_decision || "-"} ticket=${logEntry.order_ticket ?? "-"} win_prob=${logEntry.win_prob ?? "-"}`,
+    );
     
     return new Response(
       JSON.stringify({ ok: true }),

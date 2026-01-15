@@ -18,16 +18,18 @@ echo "📊 最新のea_logエントリー（最新5件）:"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 RESPONSE=$(curl -s -X GET \
-  "${PROJECT_URL}/rest/v1/ea_log?select=timestamp,symbol,action,win_prob,reasoning&order=timestamp.desc&limit=5" \
+  "${PROJECT_URL}/rest/v1/ea-log?select=at,sym,action,win_prob,ai_reasoning,trade_decision,order_ticket&order=at.desc&limit=5" \
   -H "apikey: ${ANON_KEY}" \
   -H "Authorization: Bearer ${ANON_KEY}")
 
 echo "$RESPONSE" | jq -r '.[] | "
-📅 時刻: \(.timestamp)
-💱 銘柄: \(.symbol)
+📅 時刻: \(.at)
+💱 銘柄: \(.sym)
 📈 判定: \(.action)
 🎯 勝率: \(.win_prob)
-💬 理由: \(.reasoning)
+🧾 実行: \(.trade_decision)
+🎫 Ticket: \(.order_ticket)
+💬 理由: \(.ai_reasoning)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 "'
 
@@ -39,7 +41,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 KEYWORDS=("パーフェクトオーダー" "200日線" "800日線" "長期トレンド" "長期上昇" "長期下降")
 
 for keyword in "${KEYWORDS[@]}"; do
-  count=$(echo "$RESPONSE" | jq -r --arg kw "$keyword" '[.[] | select(.reasoning | contains($kw))] | length')
+  count=$(echo "$RESPONSE" | jq -r --arg kw "$keyword" '[.[] | select(.ai_reasoning | contains($kw))] | length')
   if [ "$count" -gt 0 ]; then
     echo "✅ 「${keyword}」: ${count}件 検出"
   else

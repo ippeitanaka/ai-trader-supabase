@@ -30,6 +30,36 @@ function toFiniteNumberOrNull(value: unknown): number | null {
   return isFiniteNumber(value) ? value : null;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function mergeRegimeIntoEntryParams(
+  entryParams: unknown,
+  regime: unknown,
+  strategy: unknown,
+  regimeConfidence: unknown,
+): any {
+  const r = typeof regime === "string" ? regime.trim() : "";
+  const s = typeof strategy === "string" ? strategy.trim() : "";
+  const c = typeof regimeConfidence === "string" ? regimeConfidence.trim() : "";
+  const hasAny = Boolean(r || s || c);
+  if (!hasAny) return entryParams ?? null;
+
+  const regimeObj: Record<string, string> = {};
+  if (r) regimeObj.regime = r;
+  if (s) regimeObj.strategy = s;
+  if (c) regimeObj.regime_confidence = c;
+
+  if (entryParams === null || entryParams === undefined) {
+    return { _regime: regimeObj };
+  }
+  if (isPlainObject(entryParams)) {
+    return { ...entryParams, _regime: regimeObj };
+  }
+  return { _value: entryParams, _regime: regimeObj };
+}
+
 // Guard helpers for Postgres numeric(p,s) columns
 function pgNumeric20_5(value: unknown): number | null {
   const n = toFiniteNumberOrNull(value);
@@ -242,6 +272,11 @@ interface AISignalEntry {
   reason?: string;
   instance?: string;
   model_version?: string;
+
+  // Market regime / strategy classification (optional)
+  regime?: string | null;
+  strategy?: string | null;
+  regime_confidence?: string | null;
   
   // 価格情報
   bid?: number;
@@ -281,6 +316,9 @@ interface AISignalEntry {
   ml_pattern_name?: string | null;
   ml_pattern_confidence?: number | null;
 
+  // manual trade
+  lot_size?: number;
+
   // Virtual (paper/shadow) trade support
   is_virtual?: boolean | null;
   planned_entry_price?: number | null;
@@ -302,6 +340,12 @@ interface AISignalEntry {
   cancelled_reason?: string;
   sl_hit?: boolean;
   tp_hit?: boolean;
+}
+
+function safeText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const s = value.trim();
+  return s.length > 0 ? s : null;
 }
 
 function parseOrderTicket(value: unknown): string | null {
@@ -389,6 +433,10 @@ serve(async (req: Request) => {
         reason: body.reason,
         instance: body.instance,
         model_version: body.model_version,
+
+        regime: safeText(body.regime),
+        strategy: safeText(body.strategy),
+        regime_confidence: safeText(body.regime_confidence),
         
         // 価格情報
         bid: pgNumeric20_5(body.bid) ?? undefined,
@@ -416,7 +464,7 @@ serve(async (req: Request) => {
         ichimoku_price_vs_cloud: body.ichimoku?.price_vs_cloud,
         
         // エントリー手法
-        order_ticket: orderTicket,
+        order_ticket: orderTicket ?? undefined,
         entry_price: body.entry_price,
         entry_method: body.entry_method ?? null,
         entry_params: body.entry_params ?? null,
@@ -452,11 +500,60 @@ serve(async (req: Request) => {
         .single();
 
       if (error) {
+        const code = (error as any).code ?? null;
+        const msg = String((error as any).message ?? "");
+        const isMissingColumn =
+          code === "42703" ||
+          code === "PGRST204" ||
+          /column .* does not exist/i.test(msg) ||
+          /schema cache/i.test(msg) ||
+          /Could not find the .* column .* schema cache/i.test(msg);
+
+        if (isMissingColumn) {
+          // Backwards-compatible fallback: remote DB schema might not yet have
+          // regime/strategy columns. Retry without them.
+          const legacyEntry: any = { ...entry };
+          legacyEntry.entry_params = mergeRegimeIntoEntryParams(
+            legacyEntry.entry_params,
+            entry.regime,
+            entry.strategy,
+            entry.regime_confidence,
+          );
+          delete legacyEntry.regime;
+          delete legacyEntry.strategy;
+          delete legacyEntry.regime_confidence;
+
+          const { data: legacyData, error: legacyError } = await supabase
+            .from("ai_signals")
+            .insert(legacyEntry)
+            .select()
+            .single();
+
+          if (!legacyError) {
+            console.warn("[ai-signals] Inserted legacy entry (remote schema not migrated yet)");
+            return new Response(
+              JSON.stringify({ success: true, signal_id: legacyData.id }),
+              { status: 200, headers: corsHeaders() }
+            );
+          }
+
+          console.error("[ai-signals] Legacy insert error:", legacyError);
+          return new Response(
+            JSON.stringify({
+              error: legacyError.message,
+              code: (legacyError as any).code ?? null,
+              details: (legacyError as any).details ?? null,
+              hint: (legacyError as any).hint ?? null,
+            }),
+            { status: 500, headers: corsHeaders() }
+          );
+        }
+
         console.error("[ai-signals] Insert error:", error);
         return new Response(
           JSON.stringify({
             error: error.message,
-            code: (error as any).code ?? null,
+            code,
             details: (error as any).details ?? null,
             hint: (error as any).hint ?? null,
           }),

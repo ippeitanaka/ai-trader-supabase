@@ -6,6 +6,229 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
 const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") || "gpt-4o"; // デフォルト: gpt-4o (高精度)
 
+type CalibrationMode = "off" | "on";
+
+function getCalibrationMode(): CalibrationMode {
+  const raw = (Deno.env.get("AI_TRADER_WINPROB_CALIBRATION") ?? "off").toLowerCase().trim();
+  if (raw === "on" || raw === "true" || raw === "1") return "on";
+  return "off";
+}
+
+function getCalibrationLookbackDays(): number {
+  const v = Number(Deno.env.get("AI_TRADER_CALIBRATION_LOOKBACK_DAYS") ?? 90);
+  if (!Number.isFinite(v) || v < 7) return 90;
+  return Math.min(365, Math.floor(v));
+}
+
+function getCalibrationLimit(): number {
+  const v = Number(Deno.env.get("AI_TRADER_CALIBRATION_LIMIT") ?? 200);
+  if (!Number.isFinite(v) || v < 50) return 200;
+  return Math.min(1000, Math.floor(v));
+}
+
+function getCalibrationMinN(): number {
+  const v = Number(Deno.env.get("AI_TRADER_CALIBRATION_MIN_N") ?? 30);
+  if (!Number.isFinite(v) || v < 10) return 30;
+  return Math.min(300, Math.floor(v));
+}
+
+function getCalibrationMinBinN(): number {
+  const v = Number(Deno.env.get("AI_TRADER_CALIBRATION_MIN_BIN_N") ?? 8);
+  if (!Number.isFinite(v) || v < 3) return 8;
+  return Math.min(50, Math.floor(v));
+}
+
+function clampWinProb(v: number): number {
+  // Policy in this project: win_prob is within [0.00, 0.90]
+  const minProb = 0.0;
+  const maxProb = 0.9;
+  return Math.max(minProb, Math.min(maxProb, v));
+}
+
+type CalibrationScope = "symbol_tf_dir" | "symbol_tf" | "symbol" | "timeframe" | "global";
+type CalibrationDebug = {
+  applied: boolean;
+  scope?: CalibrationScope;
+  n?: number;
+  avg_p?: number;
+  win_rate?: number;
+  bin?: number;
+  bin_n?: number;
+  bin_win_rate?: number;
+  method?: "bin_smoothed" | "mean_shift";
+  note?: string;
+};
+
+type CalibrationCacheEntry = {
+  expiresAt: number;
+  debug: CalibrationDebug;
+  // Mapping for 0.05 bins.
+  binWinRate: Record<string, { n: number; winRate: number }>;
+  avgP: number;
+  winRate: number;
+};
+
+const calibrationCache = new Map<string, CalibrationCacheEntry>();
+
+function binKey05(p: number): string {
+  const b = Math.floor(Math.max(0, Math.min(0.899999, p)) / 0.05) * 0.05;
+  return b.toFixed(2);
+}
+
+function round3(v: number): number {
+  return Math.round(v * 1000) / 1000;
+}
+
+async function fetchCalibrationRows(
+  scope: CalibrationScope,
+  req: TradeRequest,
+): Promise<Array<{ win_prob: number; actual_result: string }>> {
+  const lookbackDays = getCalibrationLookbackDays();
+  const limit = getCalibrationLimit();
+  const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
+
+  let q = supabase
+    .from("ai_signals")
+    .select("win_prob,actual_result")
+    .gte("created_at", since)
+    .in("actual_result", ["WIN", "LOSS"])
+    .eq("is_virtual", false)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (scope === "symbol_tf_dir") {
+    q = q.eq("symbol", req.symbol).eq("timeframe", req.timeframe).eq("dir", req.ea_suggestion.dir);
+  } else if (scope === "symbol_tf") {
+    q = q.eq("symbol", req.symbol).eq("timeframe", req.timeframe);
+  } else if (scope === "symbol") {
+    q = q.eq("symbol", req.symbol);
+  } else if (scope === "timeframe") {
+    q = q.eq("timeframe", req.timeframe);
+  }
+
+  const { data, error } = await q;
+  if (error) {
+    console.warn(`[calibration] fetch error scope=${scope}: ${error.message}`);
+    return [];
+  }
+
+  const rows = (data ?? []) as Array<{ win_prob: number; actual_result: string }>;
+  return rows
+    .filter((r) => typeof r.win_prob === "number" && Number.isFinite(r.win_prob))
+    .map((r) => ({ win_prob: clampWinProb(r.win_prob), actual_result: String(r.actual_result || "") }));
+}
+
+function buildCalibrationCacheEntry(rows: Array<{ win_prob: number; actual_result: string }>, scope: CalibrationScope): CalibrationCacheEntry | null {
+  if (!rows || rows.length === 0) return null;
+
+  let n = 0;
+  let sumP = 0;
+  let wins = 0;
+
+  const bins: Record<string, { n: number; wins: number }> = {};
+
+  for (const r of rows) {
+    const p = r.win_prob;
+    const y = r.actual_result === "WIN" ? 1 : r.actual_result === "LOSS" ? 0 : null;
+    if (y === null) continue;
+    n += 1;
+    sumP += p;
+    wins += y;
+
+    const bk = binKey05(p);
+    const b = (bins[bk] = bins[bk] ?? { n: 0, wins: 0 });
+    b.n += 1;
+    b.wins += y;
+  }
+
+  if (n === 0) return null;
+  const avgP = sumP / n;
+  const winRate = wins / n;
+
+  // Laplace smoothing to avoid 0/1 extremes when n is small.
+  const binWinRate: Record<string, { n: number; winRate: number }> = {};
+  for (const [k, b] of Object.entries(bins)) {
+    const alpha = 1;
+    binWinRate[k] = { n: b.n, winRate: (b.wins + alpha) / (b.n + 2 * alpha) };
+  }
+
+  return {
+    expiresAt: Date.now() + 5 * 60 * 1000, // 5 min TTL
+    debug: { applied: true, scope, n, avg_p: avgP, win_rate: winRate },
+    binWinRate,
+    avgP,
+    winRate,
+  };
+}
+
+async function getCalibrationEntry(req: TradeRequest): Promise<{ entry: CalibrationCacheEntry | null; scopeTried: CalibrationScope | null }> {
+  const mode = getCalibrationMode();
+  if (mode !== "on") return { entry: null, scopeTried: null };
+
+  const scopes: CalibrationScope[] = ["symbol_tf_dir", "symbol_tf", "symbol", "timeframe", "global"];
+  const minN = getCalibrationMinN();
+
+  for (const scope of scopes) {
+    const key = `v1|${scope}|${req.symbol}|${req.timeframe}|${req.ea_suggestion.dir}`;
+    const cached = calibrationCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      if ((cached.debug.n ?? 0) >= minN) return { entry: cached, scopeTried: scope };
+    }
+
+    const rows = await fetchCalibrationRows(scope, req);
+    const built = buildCalibrationCacheEntry(rows, scope);
+    if (built) calibrationCache.set(key, built);
+    if (built && (built.debug.n ?? 0) >= minN) return { entry: built, scopeTried: scope };
+  }
+
+  return { entry: null, scopeTried: null };
+}
+
+async function calibrateWinProb(req: TradeRequest, rawWinProb: number): Promise<{ winProb: number; debug: CalibrationDebug }> {
+  const mode = getCalibrationMode();
+  const raw = clampWinProb(rawWinProb);
+  if (mode !== "on") return { winProb: raw, debug: { applied: false, note: "calibration_off" } };
+
+  const { entry, scopeTried } = await getCalibrationEntry(req);
+  if (!entry || !scopeTried) return { winProb: raw, debug: { applied: false, note: "insufficient_history" } };
+
+  const bk = binKey05(raw);
+  const bin = entry.binWinRate[bk];
+  const minBinN = getCalibrationMinBinN();
+
+  let calibrated: number;
+  let method: "bin_smoothed" | "mean_shift";
+  let bin_n = bin?.n ?? 0;
+  let bin_wr = bin?.winRate;
+
+  if (bin && bin.n >= minBinN) {
+    // Blend raw with empirical bin win rate. Weight grows with bin sample size.
+    const w = Math.min(0.8, bin.n / 30);
+    calibrated = raw * (1 - w) + bin.winRate * w;
+    method = "bin_smoothed";
+  } else {
+    // Fallback: align mean prediction to realized mean in-scope (stable under small bins)
+    const shift = entry.winRate - entry.avgP;
+    calibrated = raw + shift;
+    method = "mean_shift";
+  }
+
+  calibrated = clampWinProb(calibrated);
+
+  const debug: CalibrationDebug = {
+    applied: true,
+    scope: scopeTried,
+    n: entry.debug.n,
+    avg_p: entry.avgP,
+    win_rate: entry.winRate,
+    bin: Number(bk),
+    bin_n,
+    bin_win_rate: bin_wr,
+    method,
+  };
+  return { winProb: calibrated, debug };
+}
+
 type MlMode = "off" | "log_only" | "on";
 
 function getMlMode(): MlMode {
@@ -109,12 +332,53 @@ export interface TradeResponse {
   ml_pattern_name?: string | null;
   ml_pattern_confidence?: number | null;
 
+  // Market regime / strategy classification (for debugging & post-analysis)
+  regime?: "trend" | "range" | "uncertain";
+  strategy?: "trend_follow" | "mean_revert" | "none";
+  regime_confidence?: "high" | "medium" | "low";
+
   // Optional debug payload for dual-direction evaluation
   direction_eval?: {
     selected_dir: number;
     buy?: { win_prob: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
     sell?: { win_prob: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
   };
+}
+
+function classifyMarketRegime(req: TradeRequest): Pick<TradeResponse, "regime" | "strategy" | "regime_confidence"> {
+  // Use optional fields when present; default safely.
+  const adx = typeof req.adx === "number" && Number.isFinite(req.adx) ? req.adx : null;
+  const bb = typeof req.bb_width === "number" && Number.isFinite(req.bb_width) ? req.bb_width : null;
+  const atrNorm = typeof req.atr_norm === "number" && Number.isFinite(req.atr_norm) ? req.atr_norm : null;
+
+  // Thresholds are intentionally conservative.
+  // - ADX: trend strength (20-25+ is typically trending)
+  // - bb_width / atr_norm: volatility expansion (breakouts) vs squeeze (range)
+  const adxTrend = adx !== null && adx >= 22;
+  const adxRange = adx !== null && adx <= 18;
+
+  const volTrend = (bb !== null && bb >= 0.030) || (atrNorm !== null && atrNorm >= 0.0020);
+  const volRange = (bb !== null && bb <= 0.015) || (atrNorm !== null && atrNorm <= 0.0012);
+
+  // Strong trend: ADX high AND volatility not squeezed.
+  if (adxTrend && volTrend) {
+    return { regime: "trend", strategy: "trend_follow", regime_confidence: "high" };
+  }
+
+  // Range: ADX low AND volatility squeezed.
+  if (adxRange && volRange) {
+    return { regime: "range", strategy: "mean_revert", regime_confidence: "high" };
+  }
+
+  // Mixed signals.
+  if ((adxTrend && !volRange) || (volTrend && !adxRange)) {
+    return { regime: "trend", strategy: "trend_follow", regime_confidence: "medium" };
+  }
+  if ((adxRange && !volTrend) || (volRange && !adxTrend)) {
+    return { regime: "range", strategy: "mean_revert", regime_confidence: "medium" };
+  }
+
+  return { regime: "uncertain", strategy: "none", regime_confidence: "low" };
 }
 
 type InputSanityIssue = {
@@ -283,6 +547,35 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
     ml_pattern_name: null,
     ml_pattern_confidence: null,
   };
+}
+
+async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promise<TradeResponse> {
+  const base = calculateSignalFallback(req);
+  const clientMinWinProbProvided = typeof req.min_win_prob === "number";
+  const client_min_win_prob = sanitizeRecommendedMinWinProb(
+    clientMinWinProbProvided ? req.min_win_prob : undefined,
+  ) ?? 0.70;
+
+  const raw = typeof base.win_prob === "number" ? base.win_prob : 0.5;
+  const { winProb: calibrated, debug } = await calibrateWinProb(req, raw);
+
+  const dir = (base.action === 1 || base.action === -1) ? base.action : 0;
+  const action = dir !== 0 && calibrated >= client_min_win_prob ? dir : 0;
+  const expected_value_r = computeExpectedValueR(calibrated);
+
+  const reasoningSuffix = debug.applied
+    ? ` | CAL(${debug.method}/${debug.scope} n=${debug.n}): raw=${round3(raw)}→${round3(calibrated)}`
+    : "";
+
+  return {
+    ...base,
+    win_prob: round3(calibrated),
+    action,
+    expected_value_r,
+    reasoning: (base.reasoning || "") + reasoningSuffix,
+    win_prob_raw: round3(raw),
+    win_prob_calibration: debug,
+  } as any;
 }
 
 function sanitizeRecommendedMinWinProb(v: unknown): number | null {
@@ -727,11 +1020,19 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 🎯 フェーズ別システムプロンプト生成
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  
+  // IMPORTANT:
+  // - ML mode=log_only must NOT influence OpenAI decisions.
+  // - Only include ML-derived context in the prompt when ENABLE_ML_CONTEXT_FOR_OPENAI is true.
+  const ML_PROMPT_ENABLED = ENABLE_ML_CONTEXT_FOR_OPENAI;
+  const mlContextForPrompt = ML_PROMPT_ENABLED ? mlContext : "";
+  const successCasesForPrompt = ML_PROMPT_ENABLED ? successCases : "";
+  const failureCasesForPrompt = ML_PROMPT_ENABLED ? failureCases : "";
+  const recommendationsForPrompt = ML_PROMPT_ENABLED ? recommendationsText : "";
+
   let systemPrompt = "";
   let priorityGuideline = "";
   
-  if (learningPhase === "PHASE3_FULL_ML" && matchedPatterns.length > 0) {
+  if (ML_PROMPT_ENABLED && learningPhase === "PHASE3_FULL_ML" && matchedPatterns.length > 0) {
     // ━━━ PHASE 3: 完全MLモード（1000件以上） ━━━
     priorityGuideline = `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -744,12 +1045,12 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
     
     systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。1000件以上の実績データに基づくML学習結果を最重視して勝率を予測してください。
 ${priorityGuideline}
-${mlContext}${successCases}${failureCases}${recommendationsText}
+${mlContextForPrompt}${successCasesForPrompt}${failureCasesForPrompt}${recommendationsForPrompt}
   補助情報: RSI=${rsi.toFixed(2)}, ATR=${atr.toFixed(5)}${atrNorm !== undefined ? `, ATR_norm=${atrNorm.toFixed(8)}` : ""}${adx !== undefined ? `, ADX=${adx.toFixed(2)}` : ""}${diPlus !== undefined ? `, +DI=${diPlus.toFixed(2)}` : ""}${diMinus !== undefined ? `, -DI=${diMinus.toFixed(2)}` : ""}${bbWidth !== undefined ? `, BB_width=${bbWidth.toFixed(6)}` : ""}
 ${ichimokuContext}
 EA判断: ${reason}`;
     
-  } else if (learningPhase === "PHASE2_HYBRID" && matchedPatterns.length > 0) {
+  } else if (ML_PROMPT_ENABLED && learningPhase === "PHASE2_HYBRID" && matchedPatterns.length > 0) {
     // ━━━ PHASE 2: ハイブリッドモード（80-999件、パターンあり） ━━━
     priorityGuideline = `
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -764,7 +1065,7 @@ EA判断: ${reason}`;
     
     systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。高品質なML学習結果とテクニカル指標を総合的に判断し、勝率を予測してください。
 ${priorityGuideline}
-${mlContext}${successCases}${failureCases}
+${mlContextForPrompt}${successCasesForPrompt}${failureCasesForPrompt}
   テクニカル指標: RSI=${rsi.toFixed(2)}, ATR=${atr.toFixed(5)}${atrNorm !== undefined ? `, ATR_norm=${atrNorm.toFixed(8)}` : ""}${adx !== undefined ? `, ADX=${adx.toFixed(2)}` : ""}${diPlus !== undefined ? `, +DI=${diPlus.toFixed(2)}` : ""}${diMinus !== undefined ? `, -DI=${diMinus.toFixed(2)}` : ""}${bbWidth !== undefined ? `, BB_width=${bbWidth.toFixed(6)}` : ""}
 ${ichimokuContext}
 EA判断: ${reason}`;
@@ -783,7 +1084,7 @@ EA判断: ${reason}`;
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
     
     systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。すべてのテクニカル指標とEA側の総合判断を総合的に分析し、取引の成功確率（勝率）を0.0～1.0の範囲で予測してください。
-${priorityGuideline}${mlContext}
+  ${priorityGuideline}${mlContextForPrompt}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 市場情報
@@ -1015,7 +1316,7 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       const errorText = await response.text();
       console.error(`[AI] OpenAI API error: ${response.status} - ${errorText}`);
       console.warn("[AI] Falling back to rule-based calculation");
-      return calculateSignalFallback(req);
+      return await calculateSignalFallbackWithCalibration(req);
     }
 
     const data = await response.json();
@@ -1026,7 +1327,7 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     if (!jsonMatch) {
       console.error("[AI] No JSON in response. Raw content:", content.substring(0, 200));
       console.warn("[AI] Falling back to rule-based calculation");
-      return calculateSignalFallback(req);
+      return await calculateSignalFallbackWithCalibration(req);
     }
     
   const aiResult = JSON.parse(jsonMatch[0]);
@@ -1047,11 +1348,15 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     }
     
     // 勝率範囲を0%～90%に設定（幅広く動的に算出）
-    let minProb = 0.00;  // 最悪のシナリオ: 0%
-    let maxProb = 0.90;  // 最高のシナリオ: 90%
-    
-    // 極端に制限はせず、AIの判断を尊重
-    win_prob = Math.max(minProb, Math.min(maxProb, win_prob));
+    win_prob = clampWinProb(win_prob);
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ✅ Win probability calibration (server-side)
+    // Uses recent realized outcomes (WIN/LOSS) from ai_signals to reduce overconfidence.
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const raw_win_prob = win_prob;
+    const cal = await calibrateWinProb(req, raw_win_prob);
+    win_prob = cal.winProb;
     
     const confidence = aiResult.confidence || "unknown";
     const clientMinWinProbProvided = typeof req.min_win_prob === "number";
@@ -1069,7 +1374,7 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     // Guard: never execute below EA-configured minimum.
     // recommended_min_win_prob はログ/参考用（実行ゲートとしては使用しない）。
     const action_gate_min_win_prob = client_min_win_prob;
-    // EV is deterministic from win_prob. Do NOT trust model-provided EV (often templates a constant).
+    // EV is deterministic from win_prob.
     const expected_value_r = computeExpectedValueR(win_prob);
     const skip_reason = typeof aiResult.skip_reason === "string" ? aiResult.skip_reason : "";
     const entry_method: "market" = "market";
@@ -1083,14 +1388,18 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       `lot=${lotMultiplierResult.multiplier}x (${lotMultiplierResult.level})`
     );
     
+    const calSuffix = cal.debug.applied
+      ? ` | CAL(${cal.debug.method}/${cal.debug.scope} n=${cal.debug.n}): raw=${round3(raw_win_prob)}→${round3(win_prob)}`
+      : "";
+
     return {
-      win_prob: Math.round(win_prob * 1000) / 1000,
+      win_prob: round3(win_prob),
       action: win_prob >= action_gate_min_win_prob ? dir : 0,
       suggested_dir: dir,
       offset_factor: atr > 0.001 ? 0.25 : 0.2,
       expiry_minutes: 90,
       confidence: confidence,
-      reasoning: reasoning,
+      reasoning: `${reasoning}${calSuffix}`,
       recommended_min_win_prob: recommended_min_win_prob ?? undefined,
       expected_value_r,
       skip_reason,
@@ -1105,13 +1414,15 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       ml_pattern_id: matchedPatterns && matchedPatterns.length > 0 ? matchedPatterns[0].id : null,
       ml_pattern_name: matchedPatterns && matchedPatterns.length > 0 ? matchedPatterns[0].pattern_name : null,
       ml_pattern_confidence: matchedPatterns && matchedPatterns.length > 0 ? Math.round(matchedPatterns[0].win_rate * 100 * 100) / 100 : null,
+      win_prob_raw: round3(raw_win_prob),
+      win_prob_calibration: cal.debug,
     } as any;
     
   } catch (error) {
     console.error("[AI] OpenAI exception:", error instanceof Error ? error.message : String(error));
     console.error("[AI] Stack trace:", error instanceof Error ? error.stack : "N/A");
     console.warn("[AI] Falling back to rule-based calculation");
-    return calculateSignalFallback(req);
+    return await calculateSignalFallbackWithCalibration(req);
   }
 }
 
@@ -1361,6 +1672,11 @@ serve(async (req: Request) => {
 
     // Apply hard guards (double-safety with EA-side rules)
     response = applyExecutionGuards(tradeReq, response);
+
+    // Attach market regime classification for logging/analysis.
+    // Keep this deterministic so it exists even when OpenAI is unavailable.
+    const regimeInfo = classifyMarketRegime(tradeReq);
+    response = { ...response, ...regimeInfo };
     
     // ⭐ 詳細ログ出力（判定方法を明示）
     const ichimokuInfo = tradeReq.ea_suggestion.ichimoku_score !== undefined 
