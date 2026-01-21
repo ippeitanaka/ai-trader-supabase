@@ -102,6 +102,85 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function pickAiReasoning(body: any): string | undefined {
+  // Prefer the richest field that contains gate diagnostics (GATE/costSrc).
+  // Some EA clients send a short 'ai_reasoning' but keep the full ai-trader output under other keys.
+  const candidates: Array<{ key: string; value: unknown }> = [
+    { key: "ai_reasoning", value: body?.ai_reasoning },
+    { key: "reasoning", value: body?.reasoning },
+    { key: "reason", value: body?.reason },
+    { key: "ai_trader_reasoning", value: body?.ai_trader_reasoning },
+    { key: "ai.reasoning", value: body?.ai?.reasoning },
+    { key: "aiTrader.reasoning", value: body?.aiTrader?.reasoning },
+    { key: "ai_trader_response.reasoning", value: body?.ai_trader_response?.reasoning },
+    { key: "ai_trader_response.ai_reasoning", value: body?.ai_trader_response?.ai_reasoning },
+    { key: "response.reasoning", value: body?.response?.reasoning },
+  ];
+
+  const texts = candidates
+    .map((c) => ({ key: c.key, text: typeof c.value === "string" ? c.value.trim() : "" }))
+    .filter((c) => c.text.length > 0);
+  if (texts.length === 0) return undefined;
+
+  // 1) Prefer explicit gate diagnostics.
+  const withGate = texts.find((c) => /\bGATE\(/i.test(c.text) || /\bcostSrc\s*=/i.test(c.text));
+  if (withGate) return withGate.text;
+
+  // 2) Otherwise take the longest text (likely the most informative).
+  texts.sort((a, b) => b.text.length - a.text.length);
+  return texts[0].text;
+}
+
+function pickRegimeFields(body: any, reasoning?: string): {
+  regime?: string;
+  strategy?: string;
+  regime_confidence?: string;
+} {
+  const pickString = (v: unknown): string | undefined => {
+    if (typeof v !== "string") return undefined;
+    const t = v.trim();
+    return t.length > 0 ? t : undefined;
+  };
+
+  // 1) Prefer explicit top-level fields.
+  let regime = pickString(body?.regime);
+  let strategy = pickString(body?.strategy);
+  let regime_confidence = pickString(body?.regime_confidence);
+
+  // 2) Fallback: some clients send the full ai-trader response nested.
+  const nestedCandidates = [
+    body?.ai_trader_response,
+    body?.response,
+    body?.ai,
+    body?.aiTrader,
+  ];
+  for (const n of nestedCandidates) {
+    if (!regime) regime = pickString(n?.regime);
+    if (!strategy) strategy = pickString(n?.strategy);
+    if (!regime_confidence) regime_confidence = pickString(n?.regime_confidence);
+    if (regime && strategy && regime_confidence) break;
+  }
+
+  // 3) Fallback: parse from reasoning prefix (e.g. "[regime=trend strategy=trend_follow conf=high] ...").
+  const text = typeof reasoning === "string" ? reasoning : "";
+  if (text) {
+    if (!regime) {
+      const m = text.match(/\bregime\s*=\s*([a-z_]+)/i);
+      if (m) regime = m[1];
+    }
+    if (!strategy) {
+      const m = text.match(/\bstrategy\s*=\s*([a-z_]+)/i);
+      if (m) strategy = m[1];
+    }
+    if (!regime_confidence) {
+      const m = text.match(/\bconf\s*=\s*([a-z_]+)/i);
+      if (m) regime_confidence = m[1];
+    }
+  }
+
+  return { regime, strategy, regime_confidence };
+}
+
 function buildRegimePrefix(regime?: string, strategy?: string, conf?: string): string {
   const r = typeof regime === "string" ? regime.trim() : "";
   const s = typeof strategy === "string" ? strategy.trim() : "";
@@ -207,13 +286,22 @@ serve(async (req: Request) => {
     
     // Extract only essential columns for simplified ea-log table
     // EA can send all fields, but we only store what's needed for monitoring
+    const pickedReasoning = pickAiReasoning(body as any);
+    const pickedRegime = pickRegimeFields(body as any, pickedReasoning);
+    const normalizedReasoning = attachRegimeToReasoning(
+      pickedReasoning,
+      pickedRegime.regime ?? body.regime,
+      pickedRegime.strategy ?? body.strategy,
+      pickedRegime.regime_confidence ?? body.regime_confidence,
+    );
+
     const logEntry: EALogEntry = {
       at: toISO(body.at),
       sym,
       tf: body.tf || undefined,
-      regime: body.regime || undefined,
-      strategy: body.strategy || undefined,
-      regime_confidence: body.regime_confidence || undefined,
+      regime: (pickedRegime.regime ?? body.regime) || undefined,
+      strategy: (pickedRegime.strategy ?? body.strategy) || undefined,
+      regime_confidence: (pickedRegime.regime_confidence ?? body.regime_confidence) || undefined,
       action: body.action || undefined,
       tech_action: body.tech_action || undefined,
       suggested_action: body.suggested_action || undefined,
@@ -222,7 +310,7 @@ serve(async (req: Request) => {
       sell_win_prob: body.sell_win_prob !== undefined ? Number(body.sell_win_prob) : undefined,
       trade_decision: body.trade_decision || undefined,
       win_prob: body.win_prob !== undefined ? Number(body.win_prob) : undefined,
-      ai_reasoning: body.ai_reasoning || undefined,
+      ai_reasoning: normalizedReasoning,
       order_ticket: body.order_ticket !== undefined ? Number(body.order_ticket) : undefined,
     };
 
@@ -253,7 +341,7 @@ serve(async (req: Request) => {
         action: logEntry.action,
         trade_decision: logEntry.trade_decision,
         win_prob: logEntry.win_prob,
-        ai_reasoning: attachRegimeToReasoning(body.ai_reasoning, body.regime, body.strategy, body.regime_confidence),
+        ai_reasoning: normalizedReasoning,
         order_ticket: logEntry.order_ticket,
       };
 

@@ -8,6 +8,11 @@ const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") || "gpt-4o"; // デフォル�
 
 type CalibrationMode = "off" | "on";
 
+function isCalibrationRequired(): boolean {
+  const raw = (Deno.env.get("AI_TRADER_CALIBRATION_REQUIRED") ?? "off").toLowerCase().trim();
+  return raw === "on" || raw === "true" || raw === "1";
+}
+
 function getCalibrationMode(): CalibrationMode {
   const raw = (Deno.env.get("AI_TRADER_WINPROB_CALIBRATION") ?? "off").toLowerCase().trim();
   if (raw === "on" || raw === "true" || raw === "1") return "on";
@@ -320,6 +325,9 @@ export interface TradeResponse {
   // Dynamic gating / EV
   recommended_min_win_prob?: number; // 0.60 - 0.75 (never higher to avoid reducing opportunities)
   expected_value_r?: number; // EV in R-multiples (loss=-1R, win=+1.5R)
+  // Cost diagnostics
+  cost_r?: number;
+  cost_r_source?: "real" | "assumed";
   skip_reason?: string;
   // Execution is market-only
   entry_method?: "market";
@@ -379,6 +387,37 @@ function classifyMarketRegime(req: TradeRequest): Pick<TradeResponse, "regime" |
   }
 
   return { regime: "uncertain", strategy: "none", regime_confidence: "low" };
+}
+
+function buildRegimePrefix(
+  regime?: TradeResponse["regime"],
+  strategy?: TradeResponse["strategy"],
+  conf?: TradeResponse["regime_confidence"],
+): string {
+  const r = typeof regime === "string" ? regime.trim() : "";
+  const s = typeof strategy === "string" ? strategy.trim() : "";
+  const c = typeof conf === "string" ? conf.trim() : "";
+  if (!r && !s && !c) return "";
+  const parts: string[] = [];
+  if (r) parts.push(`regime=${r}`);
+  if (s) parts.push(`strategy=${s}`);
+  if (c) parts.push(`conf=${c}`);
+  return `[${parts.join(" ")}]`;
+}
+
+function attachRegimePrefixToReasoning(
+  reasoning: unknown,
+  regime?: TradeResponse["regime"],
+  strategy?: TradeResponse["strategy"],
+  conf?: TradeResponse["regime_confidence"],
+): string | undefined {
+  const prefix = buildRegimePrefix(regime, strategy, conf);
+  const text = typeof reasoning === "string" ? reasoning.trim() : "";
+  if (!prefix) return text || undefined;
+
+  // Avoid duplicating if the model already included regime info.
+  if (/\bregime\s*=\s*/i.test(text) || text.startsWith(prefix)) return text || prefix;
+  return text ? `${prefix} ${text}` : prefix;
 }
 
 type InputSanityIssue = {
@@ -551,43 +590,218 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
 
 async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promise<TradeResponse> {
   const base = calculateSignalFallback(req);
+  const rt = await getRuntimeTradeParams(req);
+  const calibrationMode = getCalibrationMode();
+  const calibrationRequired = calibrationMode === "on" && isCalibrationRequired();
   const clientMinWinProbProvided = typeof req.min_win_prob === "number";
   const client_min_win_prob = sanitizeRecommendedMinWinProb(
-    clientMinWinProbProvided ? req.min_win_prob : undefined,
+    clientMinWinProbProvided ? req.min_win_prob : (rt.minWinProbFromConfig ?? undefined),
   ) ?? 0.70;
+  const minEvR = getMinEvR();
+  const evGateMinWinProb = computeEvGateMinWinProb({ rewardRR: rt.rewardRR, costR: rt.costR, minEvR });
+  const minWinProbFloor = getMinWinProbFloor();
+  const maxCostR = getMaxCostR();
+  // Respect EA/configured minimum, never execute below it.
+  const action_gate_min_win_prob = Math.max(minWinProbFloor, client_min_win_prob);
 
   const raw = typeof base.win_prob === "number" ? base.win_prob : 0.5;
   const { winProb: calibrated, debug } = await calibrateWinProb(req, raw);
 
-  const dir = (base.action === 1 || base.action === -1) ? base.action : 0;
-  const action = dir !== 0 && calibrated >= client_min_win_prob ? dir : 0;
-  const expected_value_r = computeExpectedValueR(calibrated);
+  const calibrationOk = !calibrationRequired || debug.applied;
 
-  const reasoningSuffix = debug.applied
-    ? ` | CAL(${debug.method}/${debug.scope} n=${debug.n}): raw=${round3(raw)}→${round3(calibrated)}`
+  const dir = (base.action === 1 || base.action === -1) ? base.action : 0;
+  const expected_value_r = computeExpectedValueR(calibrated, rt.rewardRR, rt.costR);
+  const costOk = rt.costR <= maxCostR;
+  const action =
+    dir !== 0 &&
+      costOk &&
+      calibrationOk &&
+      calibrated >= action_gate_min_win_prob &&
+      expected_value_r >= minEvR
+      ? dir
+      : 0;
+
+  let skip_reason = typeof base.skip_reason === "string" ? base.skip_reason : "";
+  if (action === 0 && dir !== 0) {
+    const parts: string[] = [];
+    if (!calibrationOk) parts.push("calibration_not_applied");
+    if (!costOk) parts.push("cost_too_high");
+    if (expected_value_r < minEvR) parts.push("ev_below_min");
+    if (calibrated < action_gate_min_win_prob) parts.push("winprob_below_gate");
+    if (parts.length > 0) skip_reason = skip_reason ? `${skip_reason}|${parts.join("+")}` : parts.join("+");
+  }
+
+  // Put diagnostics first so they survive EA-side truncation.
+  const gateTag =
+    `GATE(EV>=${minEvR.toFixed(2)}R rr=${round3(rt.rewardRR)} costR=${round3(rt.costR)} ` +
+    `costSrc=${rt.costRSource} maxCostR=${round3(maxCostR)} gateP=${round3(action_gate_min_win_prob)} ` +
+    `calReq=${calibrationRequired ? 1 : 0} calApplied=${debug.applied ? 1 : 0})`;
+
+  const calTag = debug.applied
+    ? `CAL(${debug.method}/${debug.scope} n=${debug.n}): raw=${round3(raw)}→${round3(calibrated)}`
     : "";
+
+  const baseReasoning = typeof base.reasoning === "string" ? base.reasoning.trim() : "";
+  const tags = [gateTag, calTag].filter((s) => s && s.trim().length > 0).join(" | ");
+  const reasoning = baseReasoning ? `${tags} | ${baseReasoning}` : tags;
 
   return {
     ...base,
     win_prob: round3(calibrated),
     action,
     expected_value_r,
-    reasoning: (base.reasoning || "") + reasoningSuffix,
+    cost_r: round3(rt.costR),
+    cost_r_source: rt.costRSource,
+    reasoning,
     win_prob_raw: round3(raw),
     win_prob_calibration: debug,
+    skip_reason,
   } as any;
 }
 
 function sanitizeRecommendedMinWinProb(v: unknown): number | null {
   if (typeof v !== "number" || !isFinite(v)) return null;
-  // Policy: never raise above 0.75 (avoid reducing trade opportunities)
-  const clamped = Math.max(0.6, Math.min(0.75, v));
+  // Policy:
+  // - never raise above 0.75 (avoid reducing trade opportunities)
+  // - allow values below 0.60 because win_prob may be calibrated downward
+  const clamped = Math.max(0.40, Math.min(0.75, v));
   return Math.round(clamped * 1000) / 1000;
 }
 
-function computeExpectedValueR(winProb: number): number {
-  // EV model consistent with virtual tracking: loss=-1R, win=+1.5R
-  const ev = (winProb * 1.5) - ((1 - winProb) * 1.0);
+function getMinEvR(): number {
+  const v = Number(Deno.env.get("AI_TRADER_MIN_EV_R") ?? 0.10);
+  if (!Number.isFinite(v)) return 0.10;
+  return Math.max(0.0, Math.min(0.5, Math.round(v * 1000) / 1000));
+}
+
+function getMinWinProbFloor(): number {
+  // Floor to prevent execution with too-low win_prob when RR is high.
+  const v = Number(Deno.env.get("AI_TRADER_MIN_WIN_PROB_FLOOR") ?? 0.55);
+  if (!Number.isFinite(v)) return 0.55;
+  return Math.max(0.40, Math.min(0.75, Math.round(v * 1000) / 1000));
+}
+
+function getMaxCostR(): number {
+  // Hard guard: avoid trading when spread is too large relative to ATR-based risk distance.
+  // Example: 0.12 means spread consumes 12% of 1R risk distance.
+  const v = Number(Deno.env.get("AI_TRADER_MAX_COST_R") ?? 0.12);
+  if (!Number.isFinite(v)) return 0.12;
+  return Math.max(0.0, Math.min(0.5, Math.round(v * 1000) / 1000));
+}
+
+function getAssumedCostR(): number {
+  // Fallback cost in R when bid/ask/atr are missing.
+  // Default aligns with analysis SQL (assumed_cost_r=0.02).
+  const v = Number(Deno.env.get("AI_TRADER_ASSUMED_COST_R") ?? 0.02);
+  if (!Number.isFinite(v)) return 0.02;
+  return Math.max(0.0, Math.min(0.5, Math.round(v * 1000) / 1000));
+}
+
+type AiConfigRuntimeRow = {
+  min_win_prob?: number | null;
+  reward_rr?: number | null;
+  risk_atr_mult?: number | null;
+};
+
+type AiConfigCacheEntry = {
+  expiresAt: number;
+  row: AiConfigRuntimeRow | null;
+};
+
+const aiConfigCache = new Map<string, AiConfigCacheEntry>();
+
+function normalizeInstance(instance: unknown): string {
+  const s = typeof instance === "string" ? instance.trim() : "";
+  return s ? s : "main";
+}
+
+async function fetchAiConfigRuntimeRow(instance: string): Promise<AiConfigRuntimeRow | null> {
+  const cached = aiConfigCache.get(instance);
+  if (cached && cached.expiresAt > Date.now()) return cached.row;
+
+  const { data, error } = await supabase
+    .from("ai_config")
+    .select("min_win_prob,reward_rr,risk_atr_mult")
+    .eq("instance", instance)
+    .maybeSingle();
+
+  if (error) {
+    console.warn(`[ai-trader] ai_config fetch error instance=${instance}: ${error.message}`);
+    aiConfigCache.set(instance, { expiresAt: Date.now() + 60_000, row: null });
+    return null;
+  }
+
+  const row = (data ?? null) as AiConfigRuntimeRow | null;
+  aiConfigCache.set(instance, { expiresAt: Date.now() + 5 * 60_000, row });
+  return row;
+}
+
+async function getRuntimeTradeParams(req: TradeRequest): Promise<{
+  instance: string;
+  minWinProbFromConfig: number | null;
+  rewardRR: number;
+  riskAtrMult: number;
+  costR: number;
+  costRSource: "real" | "assumed";
+}> {
+  const instance = normalizeInstance(req.instance);
+  const row = await fetchAiConfigRuntimeRow(instance);
+
+  const rewardRR =
+    typeof row?.reward_rr === "number" && Number.isFinite(row.reward_rr) && row.reward_rr > 0
+      ? row.reward_rr
+      : 1.5;
+  const riskAtrMult =
+    typeof row?.risk_atr_mult === "number" && Number.isFinite(row.risk_atr_mult) && row.risk_atr_mult > 0
+      ? row.risk_atr_mult
+      : 2.0;
+  const minWinProbFromConfig =
+    typeof row?.min_win_prob === "number" && Number.isFinite(row.min_win_prob)
+      ? sanitizeRecommendedMinWinProb(row.min_win_prob)
+      : null;
+
+  const assumedCostR = getAssumedCostR();
+  const hasSpread =
+    typeof req.ask === "number" &&
+    typeof req.bid === "number" &&
+    Number.isFinite(req.ask) &&
+    Number.isFinite(req.bid) &&
+    req.ask >= req.bid;
+  const hasAtr = typeof req.atr === "number" && Number.isFinite(req.atr) && req.atr > 0;
+
+  const spread = hasSpread ? req.ask - req.bid : 0;
+  const atr = hasAtr ? req.atr : 0;
+  const riskDistance = atr > 0 ? atr * riskAtrMult : 0;
+  const hasRealCost = hasSpread && hasAtr && riskDistance > 0;
+  const costR = hasRealCost ? spread / riskDistance : assumedCostR;
+  const costRSource: "real" | "assumed" = hasRealCost ? "real" : "assumed";
+
+  return {
+    instance,
+    minWinProbFromConfig,
+    rewardRR,
+    riskAtrMult,
+    costR: round3(costR),
+    costRSource,
+  };
+}
+
+function computeEvGateMinWinProb(opts: { rewardRR: number; costR: number; minEvR: number }): number {
+  const rr = Number.isFinite(opts.rewardRR) && opts.rewardRR > 0 ? opts.rewardRR : 1.5;
+  const costR = Number.isFinite(opts.costR) && opts.costR > 0 ? opts.costR : 0;
+  const minEvR = Number.isFinite(opts.minEvR) && opts.minEvR > 0 ? opts.minEvR : 0;
+
+  // Solve: p*rr - (1-p) - costR >= minEvR  =>  p >= (1 + costR + minEvR) / (rr + 1)
+  const denom = rr + 1;
+  if (denom <= 0) return 0.9;
+  return clampWinProb((1 + costR + minEvR) / denom);
+}
+
+function computeExpectedValueR(winProb: number, rewardRR = 1.5, costR = 0): number {
+  const rr = Number.isFinite(rewardRR) && rewardRR > 0 ? rewardRR : 1.5;
+  const c = Number.isFinite(costR) && costR > 0 ? costR : 0;
+  // EV model: loss=-1R, win=+RR, then subtract transaction cost in R.
+  const ev = (winProb * rr) - ((1 - winProb) * 1.0) - c;
   return Math.round(ev * 1000) / 1000;
 }
 
@@ -1337,7 +1551,7 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     if (isNaN(win_prob) || win_prob < 0 || win_prob > 1) {
       console.error("[AI] Invalid win_prob:", win_prob, "from AI response:", JSON.stringify(aiResult));
       console.warn("[AI] Falling back to rule-based calculation");
-      return calculateSignalFallback(req);
+      return await calculateSignalFallbackWithCalibration(req);
     }
     
     // ⭐ 学習データ収集フェーズではML調整をスキップ
@@ -1354,29 +1568,38 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     // ✅ Win probability calibration (server-side)
     // Uses recent realized outcomes (WIN/LOSS) from ai_signals to reduce overconfidence.
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const calibrationMode = getCalibrationMode();
+    const calibrationRequired = calibrationMode === "on" && isCalibrationRequired();
+
     const raw_win_prob = win_prob;
     const cal = await calibrateWinProb(req, raw_win_prob);
     win_prob = cal.winProb;
+
+    const calibrationOk = !calibrationRequired || cal.debug.applied;
     
     const confidence = aiResult.confidence || "unknown";
+    const rt = await getRuntimeTradeParams(req);
     const clientMinWinProbProvided = typeof req.min_win_prob === "number";
     const client_min_win_prob = sanitizeRecommendedMinWinProb(
-      clientMinWinProbProvided ? req.min_win_prob : undefined,
+      clientMinWinProbProvided ? req.min_win_prob : (rt.minWinProbFromConfig ?? undefined),
     ) ?? 0.70;
     const reasoningBase = aiResult.reasoning || "N/A";
-    const reasoningBase2 = clientMinWinProbProvided
+    const reasoningBase2 = clientMinWinProbProvided || rt.minWinProbFromConfig !== null
       ? reasoningBase
-      : `${reasoningBase} | WARN: min_win_prob not provided by client; default gate=0.70`;
+      : `${reasoningBase} | WARN: min_win_prob not provided; default gate=0.70`;
     const reasoning = (!ENABLE_ML_CONTEXT_FOR_OPENAI && (matchedPatterns?.length ?? 0) > 0)
       ? `${reasoningBase2} | ML: ${mlMode} (pattern logged, not applied)`
       : reasoningBase2;
     const recommended_min_win_prob = sanitizeRecommendedMinWinProb(aiResult.recommended_min_win_prob);
-    // Guard: never execute below EA-configured minimum.
     // recommended_min_win_prob はログ/参考用（実行ゲートとしては使用しない）。
-    const action_gate_min_win_prob = client_min_win_prob;
-    // EV is deterministic from win_prob.
-    const expected_value_r = computeExpectedValueR(win_prob);
-    const skip_reason = typeof aiResult.skip_reason === "string" ? aiResult.skip_reason : "";
+    const minEvR = getMinEvR();
+    const evGateMinWinProb = computeEvGateMinWinProb({ rewardRR: rt.rewardRR, costR: rt.costR, minEvR });
+    const minWinProbFloor = getMinWinProbFloor();
+    const maxCostR = getMaxCostR();
+    // Respect EA/configured minimum, never execute below it.
+    const action_gate_min_win_prob = Math.max(minWinProbFloor, client_min_win_prob);
+    const expected_value_r = computeExpectedValueR(win_prob, rt.rewardRR, rt.costR);
+    let skip_reason = typeof aiResult.skip_reason === "string" ? aiResult.skip_reason : "";
     const entry_method: "market" = "market";
     const entry_params: null = null;
     const method_reason = "market-only execution";
@@ -1388,20 +1611,45 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       `lot=${lotMultiplierResult.multiplier}x (${lotMultiplierResult.level})`
     );
     
-    const calSuffix = cal.debug.applied
-      ? ` | CAL(${cal.debug.method}/${cal.debug.scope} n=${cal.debug.n}): raw=${round3(raw_win_prob)}→${round3(win_prob)}`
+    // Put diagnostics first so they survive EA-side truncation.
+    const gateTag =
+      `GATE(EV>=${minEvR.toFixed(2)}R rr=${round3(rt.rewardRR)} costR=${round3(rt.costR)} ` +
+      `costSrc=${rt.costRSource} maxCostR=${round3(maxCostR)} gateP=${round3(action_gate_min_win_prob)} ` +
+      `calReq=${calibrationRequired ? 1 : 0} calApplied=${cal.debug.applied ? 1 : 0})`;
+
+    const calTag = cal.debug.applied
+      ? `CAL(${cal.debug.method}/${cal.debug.scope} n=${cal.debug.n}): raw=${round3(raw_win_prob)}→${round3(win_prob)}`
       : "";
+
+    const tags = [gateTag, calTag].filter((s) => s && s.trim().length > 0).join(" | ");
+
+    const costOk = rt.costR <= maxCostR;
+    const willExecute =
+      costOk &&
+      calibrationOk &&
+      win_prob >= action_gate_min_win_prob &&
+      expected_value_r >= minEvR;
+    if (!willExecute && dir !== 0) {
+      const parts: string[] = [];
+      if (!calibrationOk) parts.push("calibration_not_applied");
+      if (!costOk) parts.push("cost_too_high");
+      if (expected_value_r < minEvR) parts.push("ev_below_min");
+      if (win_prob < action_gate_min_win_prob) parts.push("winprob_below_gate");
+      if (parts.length > 0) skip_reason = skip_reason ? `${skip_reason}|${parts.join("+")}` : parts.join("+");
+    }
 
     return {
       win_prob: round3(win_prob),
-      action: win_prob >= action_gate_min_win_prob ? dir : 0,
+      action: willExecute ? dir : 0,
       suggested_dir: dir,
       offset_factor: atr > 0.001 ? 0.25 : 0.2,
       expiry_minutes: 90,
       confidence: confidence,
-      reasoning: `${reasoning}${calSuffix}`,
+      reasoning: `${tags} | ${reasoning}`,
       recommended_min_win_prob: recommended_min_win_prob ?? undefined,
       expected_value_r,
+      cost_r: round3(rt.costR),
+      cost_r_source: rt.costRSource,
       skip_reason,
       entry_method,
       entry_params,
@@ -1430,16 +1678,16 @@ function pickBetterDirection(
   buy: TradeResponse,
   sell: TradeResponse,
 ): { selectedDir: 1 | -1; selected: TradeResponse } {
-  // Primary: higher win_prob. Secondary: higher expected_value_r.
-  const buyWin = typeof buy.win_prob === "number" ? buy.win_prob : -Infinity;
-  const sellWin = typeof sell.win_prob === "number" ? sell.win_prob : -Infinity;
-
-  if (buyWin > sellWin) return { selectedDir: 1, selected: buy };
-  if (sellWin > buyWin) return { selectedDir: -1, selected: sell };
-
+  // Primary: higher expected_value_r. Secondary: higher win_prob.
   const buyEv = typeof buy.expected_value_r === "number" ? buy.expected_value_r : -Infinity;
   const sellEv = typeof sell.expected_value_r === "number" ? sell.expected_value_r : -Infinity;
-  if (buyEv >= sellEv) return { selectedDir: 1, selected: buy };
+
+  if (buyEv > sellEv) return { selectedDir: 1, selected: buy };
+  if (sellEv > buyEv) return { selectedDir: -1, selected: sell };
+
+  const buyWin = typeof buy.win_prob === "number" ? buy.win_prob : -Infinity;
+  const sellWin = typeof sell.win_prob === "number" ? sell.win_prob : -Infinity;
+  if (buyWin >= sellWin) return { selectedDir: 1, selected: buy };
   return { selectedDir: -1, selected: sell };
 }
 
@@ -1526,6 +1774,24 @@ serve(async (req: Request) => {
     const keyStatus = OPENAI_API_KEY 
       ? (hasKey ? `configured (${OPENAI_API_KEY.length} chars)` : "invalid or placeholder")
       : "NOT SET";
+
+    const mlMode = getMlMode();
+
+    // Compute learning phase in the same way as POST (lightweight count query)
+    const { count: completedTradesCount } = await supabase
+      .from("ai_signals")
+      .select("*", { count: "exact", head: true })
+      .in("actual_result", ["WIN", "LOSS"])
+      .eq("is_virtual", false);
+    const totalCompletedTrades = completedTradesCount || 0;
+    const learningPhase = totalCompletedTrades < 80
+      ? "PHASE1_TECHNICAL"
+      : totalCompletedTrades < 1000
+        ? "PHASE2_HYBRID"
+        : "PHASE3_FULL_ML";
+
+    const mlLearningEnabled = learningPhase !== "PHASE1_TECHNICAL";
+    const mlAppliedToDecisions = mlLearningEnabled && mlMode === "on";
     
     return new Response(
       JSON.stringify({ 
@@ -1534,7 +1800,11 @@ serve(async (req: Request) => {
         version: "2.4.0-learning-phase",
         mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
-        ml_learning_enabled: false,
+        ml_learning_enabled: mlLearningEnabled,
+        ml_mode: mlMode,
+        ml_phase: learningPhase,
+        ml_applied_to_decisions: mlAppliedToDecisions,
+        ml_completed_trades: totalCompletedTrades,
         openai_key_status: keyStatus,
         fallback_available: true,
         win_prob_range: "0% - 90%",
@@ -1549,7 +1819,7 @@ serve(async (req: Request) => {
           "ichimoku_full",
           "market_only_execution"
         ],
-        note: "Learning phase: AI comprehensively analyzes all technical indicators (MA, MACD, RSI, ATR, Ichimoku). Win probability: 0%-90% dynamic range. ML will be enabled after 100+ trades."
+        note: "Learning phase: AI comprehensively analyzes all technical indicators (MA, MACD, RSI, ATR, Ichimoku). ML phase gating: <80 trades=technical, 80-999=hybrid, 1000+=full. Set AI_TRADER_ML_MODE=on to apply ML to decisions (otherwise log_only)."
       }),
       { status: 200, headers: corsHeaders() }
     );
@@ -1677,6 +1947,15 @@ serve(async (req: Request) => {
     // Keep this deterministic so it exists even when OpenAI is unavailable.
     const regimeInfo = classifyMarketRegime(tradeReq);
     response = { ...response, ...regimeInfo };
+
+    // Embed regime info into reasoning so downstream loggers can reconstruct
+    // even if clients don't forward separate regime/strategy fields.
+    (response as any).reasoning = attachRegimePrefixToReasoning(
+      (response as any).reasoning,
+      (response as any).regime,
+      (response as any).strategy,
+      (response as any).regime_confidence,
+    );
     
     // ⭐ 詳細ログ出力（判定方法を明示）
     const ichimokuInfo = tradeReq.ea_suggestion.ichimoku_score !== undefined 

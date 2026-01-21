@@ -368,7 +368,7 @@ function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-    "Access-Control-Allow-Methods": "POST, PUT, OPTIONS",
+    "Access-Control-Allow-Methods": "POST, PUT, GET, OPTIONS",
     "Content-Type": "application/json",
   };
 }
@@ -379,7 +379,149 @@ serve(async (req: Request) => {
   }
 
   try {
-    const body = await req.json();
+    // GET may not have a JSON body; treat it as a lightweight health/status endpoint.
+    if (req.method === "GET") {
+      const url = new URL(req.url);
+      const hoursRaw = url.searchParams.get("hours");
+      const limitRaw = url.searchParams.get("limit");
+      const diagSymbol = (url.searchParams.get("symbol") ?? "").trim();
+      const diagTimeframe = (url.searchParams.get("timeframe") ?? "").trim();
+
+      const windowHours = Math.max(1, Math.min(72, Number(hoursRaw ?? 6)));
+      const rowLimit = Math.max(10, Math.min(500, Number(limitRaw ?? 200)));
+      const sinceIso = new Date(Date.now() - windowHours * 60 * 60 * 1000).toISOString();
+
+      const { data: recent, error } = await supabase
+        .from("ai_signals")
+        .select(
+          "id, created_at, symbol, timeframe, actual_result, ml_pattern_used, ml_pattern_name, ml_pattern_confidence",
+        )
+        .gte("created_at", sinceIso)
+        .order("created_at", { ascending: false })
+        .limit(rowLimit);
+
+      const latestSignal = error ? null : (recent?.[0] ?? null);
+
+      const rows = Array.isArray(recent) ? recent : [];
+      const signals = rows.length;
+      const mlUsed = rows.reduce((sum, r: any) => sum + (r?.ml_pattern_used ? 1 : 0), 0);
+      const mlUsedPct = signals > 0 ? Math.round((mlUsed / signals) * 1000) / 10 : 0;
+
+      const bySymbolTfMap = new Map<string, { symbol: string; timeframe: string; signals: number; ml_used: number }>();
+      const topPatternsMap = new Map<string, { pattern_name: string; uses: number }>();
+
+      for (const r of rows as any[]) {
+        const symbol = typeof r?.symbol === "string" ? r.symbol : "?";
+        const timeframe = typeof r?.timeframe === "string" ? r.timeframe : "?";
+        const key = `${symbol}|${timeframe}`;
+        const cur = bySymbolTfMap.get(key) ?? { symbol, timeframe, signals: 0, ml_used: 0 };
+        cur.signals += 1;
+        if (r?.ml_pattern_used) cur.ml_used += 1;
+        bySymbolTfMap.set(key, cur);
+
+        if (r?.ml_pattern_used && typeof r?.ml_pattern_name === "string" && r.ml_pattern_name.trim()) {
+          const pn = r.ml_pattern_name.trim();
+          const pcur = topPatternsMap.get(pn) ?? { pattern_name: pn, uses: 0 };
+          pcur.uses += 1;
+          topPatternsMap.set(pn, pcur);
+        }
+      }
+
+      const bySymbolTimeframe = [...bySymbolTfMap.values()]
+        .map((x) => ({
+          ...x,
+          ml_used_pct: x.signals > 0 ? Math.round((x.ml_used / x.signals) * 1000) / 10 : 0,
+        }))
+        .sort((a, b) => b.signals - a.signals)
+        .slice(0, 20);
+
+      const mlTopPatterns = [...topPatternsMap.values()]
+        .sort((a, b) => b.uses - a.uses)
+        .slice(0, 10);
+
+      // Optional: ML pattern availability diagnostics for a specific symbol/timeframe.
+      // Example: /ai-signals?hours=24&symbol=BTCUSD&timeframe=M15
+      let mlPatternDiag: any = null;
+      if (diagSymbol && diagTimeframe) {
+        const base = supabase
+          .from("ml_patterns")
+          .select(
+            "id, pattern_name, direction, confidence_score, real_trades, total_trades, win_rate, is_active",
+            { count: "exact", head: false },
+          )
+          .eq("symbol", diagSymbol)
+          .eq("timeframe", diagTimeframe)
+          .eq("is_active", true);
+
+        const [{ data: top, error: topErr }, { count: totalCount, error: countErr }, { count: buyCount }, { count: sellCount }] = await Promise.all([
+          base.order("confidence_score", { ascending: false }).limit(5),
+          supabase
+            .from("ml_patterns")
+            .select("id", { count: "exact", head: true })
+            .eq("symbol", diagSymbol)
+            .eq("timeframe", diagTimeframe)
+            .eq("is_active", true),
+          supabase
+            .from("ml_patterns")
+            .select("id", { count: "exact", head: true })
+            .eq("symbol", diagSymbol)
+            .eq("timeframe", diagTimeframe)
+            .eq("is_active", true)
+            .eq("direction", 1),
+          supabase
+            .from("ml_patterns")
+            .select("id", { count: "exact", head: true })
+            .eq("symbol", diagSymbol)
+            .eq("timeframe", diagTimeframe)
+            .eq("is_active", true)
+            .eq("direction", -1),
+        ]);
+
+        mlPatternDiag = {
+          symbol: diagSymbol,
+          timeframe: diagTimeframe,
+          active_patterns_total: totalCount ?? 0,
+          active_patterns_buy: buyCount ?? 0,
+          active_patterns_sell: sellCount ?? 0,
+          top_patterns: topErr ? [] : (top ?? []).map((p: any) => ({
+            id: p.id,
+            pattern_name: p.pattern_name,
+            direction: p.direction,
+            confidence_score: p.confidence_score,
+            real_trades: p.real_trades,
+            total_trades: p.total_trades,
+            win_rate: p.win_rate,
+          })),
+          error: (topErr || countErr) ? { message: (topErr ?? countErr)?.message } : null,
+        };
+      }
+
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          service: "ai-signals",
+          now: new Date().toISOString(),
+          window_hours: windowHours,
+          rows_sampled: signals,
+          ml_used: mlUsed,
+          ml_used_pct: mlUsedPct,
+          by_symbol_timeframe: bySymbolTimeframe,
+          ml_top_patterns: mlTopPatterns,
+          ml_pattern_diagnostics: mlPatternDiag,
+          latest_signal: latestSignal,
+          latest_signal_error: error ? { message: error.message } : null,
+        }),
+        { status: 200, headers: corsHeaders() },
+      );
+    }
+
+    const body = await req.json().catch(() => null);
+    if (body === null) {
+      return new Response(
+        JSON.stringify({ error: "invalid_json_body" }),
+        { status: 400, headers: corsHeaders() },
+      );
+    }
     
     // POST: 新規シグナル記録
     if (req.method === "POST") {

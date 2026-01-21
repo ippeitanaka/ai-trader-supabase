@@ -1,6 +1,65 @@
 -- Live run verification (production)
 -- Run these in Supabase SQL Editor (project: nebphrnnpmuqbkymwefs)
 
+-- 0) Deploy verification: is the new EV/cost gate active?
+-- Expected after deploy:
+-- - ea-log.ai_reasoning contains "GATE(" and "costSrc=real|assumed"
+-- - ai_signals.reason may also contain it depending on what you persist
+-- - ai_signals should have bid/ask/atr populated more consistently
+
+-- 0.1) ea-log: presence of gate diagnostics (last 24h)
+select
+  count(*) as events,
+  count(*) filter (where coalesce(ai_reasoning,'') ilike '%GATE(%') as with_gate_suffix,
+  count(*) filter (where coalesce(ai_reasoning,'') ilike '%costSrc=real%') as costsrc_real,
+  count(*) filter (where coalesce(ai_reasoning,'') ilike '%costSrc=assumed%') as costsrc_assumed,
+  max(created_at) as last_seen
+from "ea-log"
+where created_at >= now() - interval '24 hours';
+
+-- 0.1b) ea-log: gate coverage + reasoning health by trade_decision (last 24h)
+-- If avg_len is ~120 and with_gate is low, the EA is likely truncating and losing a suffix.
+select
+  coalesce(trade_decision, '(null)') as trade_decision,
+  count(*) as events,
+  count(*) filter (where coalesce(ai_reasoning,'') ilike '%GATE(%') as with_gate,
+  count(*) filter (where ai_reasoning is null or btrim(ai_reasoning) = '') as reasoning_missing,
+  round(avg(length(coalesce(ai_reasoning, '')))::numeric, 1) as avg_reasoning_len,
+  max(created_at) as last_seen
+from "ea-log"
+where created_at >= now() - interval '24 hours'
+group by 1
+order by events desc, trade_decision;
+
+-- 0.2) ai_signals: bid/ask/atr availability (last 24h)
+-- If real_ratio is low, spread cost is frequently assumed (risk of overtrading).
+select
+  count(*) as signals,
+  count(*) filter (
+    where ask is not null and bid is not null and ask >= bid
+      and atr is not null and atr > 0
+  ) as has_real_cost_inputs,
+  round(
+    (count(*) filter (
+      where ask is not null and bid is not null and ask >= bid
+        and atr is not null and atr > 0
+    )::numeric / nullif(count(*),0)) * 100,
+    2
+  ) as real_ratio_pct,
+  max(created_at) as last_seen
+from ai_signals
+where created_at >= now() - interval '24 hours';
+
+-- 0.3) ai_signals: if you persist GATE suffix into reason, you can verify it here (optional)
+select
+  count(*) as signals,
+  count(*) filter (where coalesce(reason,'') ilike '%GATE(%') as with_gate_suffix,
+  count(*) filter (where coalesce(reason,'') ilike '%costSrc=real%') as costsrc_real,
+  count(*) filter (where coalesce(reason,'') ilike '%costSrc=assumed%') as costsrc_assumed,
+  max(created_at) as last_seen
+from ai_signals
+where created_at >= now() - interval '24 hours';
+
 -- 1) EA decision logs (ea-log): last 2 hours
 select
   created_at,

@@ -109,7 +109,7 @@ SELECT
   AVG(win_prob) as avg_win_prob,
   COUNT(*) FILTER (WHERE win_prob >= 0.80) as high_confidence_trades,
   COUNT(*) FILTER (WHERE trade_decision = 'EXECUTED' OR trade_decision = 'EXECUTED_MARKET') as executed
-FROM ea_log
+FROM public."ea-log"
 WHERE at >= '2025-10-24'
 GROUP BY DATE(at)
 ORDER BY date DESC
