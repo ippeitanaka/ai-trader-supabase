@@ -168,6 +168,9 @@ async function generatePostmortem(row: any): Promise<Postmortem> {
     return fallbackPostmortem(row);
   }
 
+  const timeoutMsRaw = Number(Deno.env.get("POSTMORTEM_TIMEOUT_MS") ?? "2500");
+  const timeoutMs = Math.max(500, Math.min(10_000, Number.isFinite(timeoutMsRaw) ? timeoutMsRaw : 2500));
+
   const prompt = `You are an expert trading postmortem analyst.
 Return strict JSON only.
 
@@ -217,13 +220,18 @@ Task:
 JSON schema:
 { "tags": ["tag1"], "summary": "..." }`;
 
+  let timeoutId: number | null = null;
+  const controller = new AbortController();
   try {
+    timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${OPENAI_API_KEY}`,
       },
+      signal: controller.signal,
       body: JSON.stringify({
         model: OPENAI_MODEL,
         messages: [
@@ -252,6 +260,8 @@ JSON schema:
     return sanitizePostmortem({ tags, summary, model: OPENAI_MODEL }, row);
   } catch (_err) {
     return fallbackPostmortem(row);
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
   }
 }
 
@@ -350,18 +360,60 @@ function safeText(value: unknown): string | null {
 
 function parseOrderTicket(value: unknown): string | null {
   if (typeof value === "number") {
+    // NOTE: JS number cannot represent all 64-bit integers safely.
+    // MT5 tickets can exceed Number.MAX_SAFE_INTEGER; require string in that case.
     if (!Number.isFinite(value) || value <= 0) return null;
-    if (!Number.isInteger(value)) return null;
-    return String(value);
+    if (!Number.isSafeInteger(value)) return null;
+    const s = String(value);
+    if (s.length > 20) return null;
+    return s;
   }
   if (typeof value === "string") {
     const s = value.trim();
     if (!s) return null;
     if (!/^[0-9]+$/.test(s)) return null;
     if (s === "0") return null;
+    if (s.length > 20) return null;
     return s;
   }
   return null;
+}
+
+type ActualResult = "PENDING" | "FILLED" | "WIN" | "LOSS" | "BREAK_EVEN" | "CANCELLED";
+
+function normalizeActualResult(value: unknown): ActualResult | null {
+  if (typeof value !== "string") return null;
+  const s = value.trim().toUpperCase();
+  switch (s) {
+    case "PENDING":
+    case "FILLED":
+    case "WIN":
+    case "LOSS":
+    case "BREAK_EVEN":
+    case "CANCELLED":
+      return s;
+    default:
+      return null;
+  }
+}
+
+function isAllowedActualResultTransition(prev: ActualResult | null, next: ActualResult): boolean {
+  if (prev === null) return true;
+  if (prev === next) return true;
+
+  switch (prev) {
+    case "PENDING":
+      return ["FILLED", "WIN", "LOSS", "BREAK_EVEN", "CANCELLED"].includes(next);
+    case "FILLED":
+      return ["WIN", "LOSS", "BREAK_EVEN", "CANCELLED"].includes(next);
+    case "WIN":
+    case "LOSS":
+    case "BREAK_EVEN":
+    case "CANCELLED":
+      return false;
+    default:
+      return false;
+  }
 }
 
 function corsHeaders() {
@@ -554,10 +606,10 @@ serve(async (req: Request) => {
         );
       }
 
-      const requestedActualResult = (body.actual_result || 'PENDING');
+      const requestedActualResult = normalizeActualResult(body.actual_result) ?? "PENDING";
       const orderTicket = parseOrderTicket(body.order_ticket);
       const hasValidTicket = typeof orderTicket === "string";
-      const actualResult = (requestedActualResult === 'FILLED' && !hasValidTicket) ? 'PENDING' : requestedActualResult;
+      const actualResult = (requestedActualResult === "FILLED" && !hasValidTicket) ? "PENDING" : requestedActualResult;
 
       const entry: AISignalEntry = {
         symbol: body.symbol,
@@ -760,7 +812,16 @@ serve(async (req: Request) => {
   if (bb_width !== undefined) updateData.bb_width = bb_width;
       if (exit_price !== undefined) updateData.exit_price = exit_price;
       if (profit_loss !== undefined) updateData.profit_loss = profit_loss;
-        if (actual_result) updateData.actual_result = actual_result;
+
+      const normalizedActualResult = normalizeActualResult(actual_result);
+      if (actual_result !== undefined && normalizedActualResult === null) {
+        return new Response(
+          JSON.stringify({ error: "invalid actual_result" }),
+          { status: 400, headers: corsHeaders() }
+        );
+      }
+      if (normalizedActualResult) updateData.actual_result = normalizedActualResult;
+
       if (closed_at) updateData.closed_at = closed_at;
       if (hold_duration_minutes !== undefined) updateData.hold_duration_minutes = hold_duration_minutes;
       if (sl_hit !== undefined) updateData.sl_hit = sl_hit;
@@ -811,6 +872,38 @@ serve(async (req: Request) => {
             }),
             { status: 400, headers: corsHeaders() }
           );
+        }
+      }
+
+      // Validate actual_result state transitions (best-effort, requires existing row).
+      if (updateData.actual_result) {
+        const { data: existingRow, error: existingErr } = signal_id
+          ? await supabase
+              .from("ai_signals")
+              .select("id, actual_result")
+              .eq("id", signal_id)
+              .maybeSingle()
+          : await supabase
+              .from("ai_signals")
+              .select("id, actual_result")
+              .eq("order_ticket", parsedOrderTicket as string)
+              .maybeSingle();
+
+        if (existingErr) {
+          console.warn("[ai-signals] Failed to fetch existing row for transition validation:", existingErr.message);
+        } else if (existingRow) {
+          const prev = normalizeActualResult(existingRow.actual_result) as ActualResult | null;
+          const next = updateData.actual_result as ActualResult;
+          if (!isAllowedActualResultTransition(prev, next)) {
+            return new Response(
+              JSON.stringify({
+                error: "invalid actual_result transition",
+                previous: prev,
+                next,
+              }),
+              { status: 409, headers: corsHeaders() }
+            );
+          }
         }
       }
 

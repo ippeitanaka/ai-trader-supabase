@@ -35,6 +35,15 @@ input int    SlippagePoints      = 1000;
 input long   Magic               = 26091501;
 input int    MaxPositions        = 1;      // 同一銘柄の最大ポジション数
 
+// MaxPositions のカウントに「ペンディングオーダー(約定待ち)」も含めるか
+// true: 重複/レース抑止を優先（デフォルト）
+// false: 同時保有を優先（pendingが残っていても新規が通る）
+input bool   CountPendingOrdersInMaxPos = true;
+
+// 複数ポジション運用時の追跡枠（ai_signals の更新・結果反映に必要）
+// MaxPositions>1 の場合は、この数が小さすぎると一部が結果更新できず PENDING/FILLED が残り得る。
+input int    TrackedMaxTrades    = 10;
+
 input bool   DebugLogs           = true;
 input int    LogCooldownSec      = 30;  // 0=全出力, >0=間引き, -1=完全OFF
 input int    CooldownAfterCloseMin = 30; // TP/SL後のクールダウン（分）
@@ -51,16 +60,32 @@ input bool   VirtualTrack_LowBand = true;
 input double VirtualLowBandMinProb = 0.60;
 input double VirtualLowBandMaxProb = 0.69;
 
+// Virtual watch capacity (too small => many is_virtual rows remain PENDING)
+input int    VirtualMaxWatches     = 2000;
+
 // ★ URLは自分のプロジェクトに合わせて設定
 input string AI_Endpoint_URL     = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-trader";
 input string EA_Log_URL          = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ea-log";
 input string AI_Signals_URL      = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals";
 input string AI_Signals_Update_URL = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals-update";
-input string AI_Bearer_Token     = "YOUR_SERVICE_ROLE_KEY_HERE";
+
+// ★ Supabase Functions 呼び出し用 (Bearer)
+// - Dashboard の Project Settings -> API で取得
+// - anon key / service_role key のどちらでも動くが、運用方針に合わせて設定
+input string AI_Bearer_Token     = "";
+
+// ★ ea-log は不正投稿防止のため、別トークン運用も可能
+// - 空なら AI_Bearer_Token を使う
+// - 推奨: ea-log専用のEA_LOG_BEARER_TOKENをSupabase secretsに設定し、EA側はパラメータで設定
+//   （このソースにはトークンを直書きしない）
+input string EA_Log_Bearer_Token = "";
+
+// Bearerが未設定のまま誤って稼働させるのを防ぐ
+input bool   RequireBearerToken  = true;
 
 input string AI_EA_Instance      = "main";
 input string AI_EA_Version       = "1.5.6";
-input int    AI_Timeout_ms       = 5000;
+input int    AI_Timeout_ms       = 10000;
 
 // ===== 一目均衡表設定 =====
 input bool   UseIchimoku         = true;   // 一目均衡表を使用
@@ -78,8 +103,14 @@ int      g_dynamicExpiryMin=PendingExpiryMin;
 datetime g_cooldownUntil=0; // TP/SLクローズ後のクールダウン期限
 
 // ポジション追跡用（ML学習用）
-// NOTE: MaxPositions>1 でも学習ログが崩れないように複数チケットを追跡する。
-// order_ticket は ai_signals の更新キー。
+ulong    g_trackedPositionTicket=0;
+ulong    g_trackedOrderTicket=0; // ai_signals.order_ticket に対応するキー（order ticket）
+datetime g_trackedPositionOpenTime=0;
+double   g_trackedPositionEntryPrice=0;
+bool     g_trackedFillSent=false;
+datetime g_trackedFillLastTry=0;
+
+// 複数ポジション追跡（MaxPositions>1 対応）
 struct TrackedTrade{
    ulong    position_ticket;
    ulong    order_ticket;
@@ -88,70 +119,60 @@ struct TrackedTrade{
    bool     fill_sent;
    datetime fill_last_try;
 };
-#define MAX_TRACKED_TRADES 10
-TrackedTrade g_tracked[MAX_TRACKED_TRADES];
+TrackedTrade g_tracked[];
 
-void ResetTrackedTrade(TrackedTrade &t){
-   t.position_ticket=0;
-   t.order_ticket=0;
-   t.open_time=0;
-   t.entry_price=0;
-   t.fill_sent=false;
-   t.fill_last_try=0;
-}
-
-int FindTrackedByPosition(const ulong posTicket){
-   if(posTicket==0) return -1;
-   for(int i=0;i<MAX_TRACKED_TRADES;i++) if(g_tracked[i].position_ticket==posTicket) return i;
-   return -1;
-}
-
-int FindTrackedByOrder(const ulong ordTicket){
-   if(ordTicket==0) return -1;
-   for(int i=0;i<MAX_TRACKED_TRADES;i++) if(g_tracked[i].order_ticket==ordTicket) return i;
-   return -1;
-}
-
-int FindFreeTrackedSlot(){
-   for(int i=0;i<MAX_TRACKED_TRADES;i++) if(g_tracked[i].position_ticket==0 && g_tracked[i].order_ticket==0) return i;
-   return -1;
-}
-
-int TrackedInFlightCount(){
-   int c=0;
-   for(int i=0;i<MAX_TRACKED_TRADES;i++) if(g_tracked[i].order_ticket>0 && g_tracked[i].position_ticket==0) c++;
-   return c;
-}
-
-// Count positions/pending + in-flight market orders not yet visible to CountPositions().
-int EffectivePositionsForLimit(){
-   return CountPositions() + TrackedInFlightCount();
-}
-
-int UpsertTrackedTrade(ulong posTicket,ulong ordTicket,datetime openTime,double entryPrice)
+void ClearTrackedSlot(const int idx)
 {
-   int idx=-1;
-   if(posTicket>0) idx=FindTrackedByPosition(posTicket);
-   if(idx<0 && ordTicket>0) idx=FindTrackedByOrder(ordTicket);
-   if(idx<0) idx=FindFreeTrackedSlot();
-   if(idx<0){
-      SafePrint("[TRACK] No free tracked slot (increase MAX_TRACKED_TRADES)");
-      return -1;
-   }
+   if(idx<0 || idx>=ArraySize(g_tracked)) return;
+   g_tracked[idx].position_ticket=0;
+   g_tracked[idx].order_ticket=0;
+   g_tracked[idx].open_time=0;
+   g_tracked[idx].entry_price=0;
+   g_tracked[idx].fill_sent=false;
+   g_tracked[idx].fill_last_try=0;
+}
 
-   bool isNew=(g_tracked[idx].position_ticket==0 && g_tracked[idx].order_ticket==0);
-   if(isNew) ResetTrackedTrade(g_tracked[idx]);
-
-   if(posTicket>0) g_tracked[idx].position_ticket=posTicket;
-   if(ordTicket>0) g_tracked[idx].order_ticket=ordTicket;
-   if(openTime>0) g_tracked[idx].open_time=openTime;
-   if(entryPrice>0) g_tracked[idx].entry_price=entryPrice;
-   // If we now have both tickets, make sure we attempt the fill update unless it already succeeded.
-   if(isNew){
-      g_tracked[idx].fill_sent=false;
-      g_tracked[idx].fill_last_try=0;
+int FindFreeTrackedSlot()
+{
+   for(int i=0;i<ArraySize(g_tracked);i++)
+   {
+      if(g_tracked[i].position_ticket==0 && g_tracked[i].order_ticket==0) return i;
    }
-   return idx;
+   return -1;
+}
+
+int FindTrackedByPositionTicket(const ulong posTicket)
+{
+   if(posTicket==0) return -1;
+   for(int i=0;i<ArraySize(g_tracked);i++)
+   {
+      if(g_tracked[i].position_ticket==posTicket) return i;
+   }
+   return -1;
+}
+
+bool IsPositionTracked(const ulong posTicket)
+{
+   return FindTrackedByPositionTicket(posTicket)>=0;
+}
+
+bool AddTrackedTrade(const ulong posTicket,const ulong ordTicket,const datetime openTime,const double entryPrice)
+{
+   if(posTicket==0) return false;
+   if(IsPositionTracked(posTicket)) return true;
+   int idx=FindFreeTrackedSlot();
+   if(idx<0)
+   {
+      SafePrint(StringFormat("[TRACK] No free slot (cap=%d) pos=%s order=%s", ArraySize(g_tracked), ULongToString(posTicket), ULongToString(ordTicket)));
+      return false;
+   }
+   g_tracked[idx].position_ticket=posTicket;
+   g_tracked[idx].order_ticket=ordTicket;
+   g_tracked[idx].open_time=openTime;
+   g_tracked[idx].entry_price=entryPrice;
+   g_tracked[idx].fill_sent=false;
+   g_tracked[idx].fill_last_try=0;
+   return true;
 }
 
 // ===== Virtual (paper/shadow) trade tracking =====
@@ -169,7 +190,14 @@ struct VirtualWatch{
    double   sl;
    double   tp;
 };
-VirtualWatch g_virtual[10];
+VirtualWatch g_virtual[];
+
+// ===== string helpers =====
+// #property strict では ulong を IntegerToString に直接渡すとコンパイルエラーになることがあるため、明示的に文字列化する。
+string ULongToString(const ulong v)
+{
+   return StringFormat("%I64u", v);
+}
 
 // ===== ログ =====
 void SafePrint(string msg)
@@ -230,6 +258,12 @@ bool NormalizeLotsForSymbol(const double requested,double &normalized,string &wh
 }
 
 // ===== HTTPユーティリティ（★POSTはNUL無しで送る） =====
+string BuildAuthHeader(const string bearer)
+{
+   if(bearer=="") return "";
+   return "Authorization: Bearer "+bearer+"\r\n";
+}
+
 bool HttpPostJson(const string url,const string bearer,const string payload,string &resp,int timeout_ms=5000)
 {
    uchar data[];
@@ -239,7 +273,7 @@ bool HttpPostJson(const string url,const string bearer,const string payload,stri
    while(n > 0 && data[n-1] == 0) n--;
    if(n != ArraySize(data)) ArrayResize(data, n);
 
-   string headers="Content-Type: application/json\r\nAuthorization: Bearer "+bearer+"\r\n";
+   string headers="Content-Type: application/json\r\n"+BuildAuthHeader(bearer);
    uchar result[]; string result_headers;
    int status=WebRequest("POST",url,headers,timeout_ms,data,result,result_headers);
    if(status==-1){ int ec=GetLastError(); PrintFormat("[HTTP] POST fail=%d url=%s", ec, url); return false; }
@@ -251,7 +285,7 @@ bool HttpPostJson(const string url,const string bearer,const string payload,stri
 bool HttpGet(const string url,const string bearer,string &resp,int timeout_ms=5000)
 {
    uchar dummyData[]; // GETでも第5引数は配列変数が必要
-   string headers="Authorization: Bearer "+bearer+"\r\n";
+   string headers=BuildAuthHeader(bearer);
    uchar result[]; string result_headers;
    int status=WebRequest("GET",url,headers,timeout_ms,dummyData,result,result_headers);
    if(status==-1){ int ec=GetLastError(); PrintFormat("[HTTP] GET fail=%d url=%s", ec, url); return false; }
@@ -267,7 +301,7 @@ bool HttpPut(const string url,const string bearer,const string payload,string &r
    while(n > 0 && data[n-1] == 0) n--;
    if(n != ArraySize(data)) ArrayResize(data, n);
 
-   string headers="Content-Type: application/json\r\nAuthorization: Bearer "+bearer+"\r\n";
+   string headers="Content-Type: application/json\r\n"+BuildAuthHeader(bearer);
    uchar result[]; string result_headers;
    int status=WebRequest("PUT",url,headers,timeout_ms,data,result,result_headers);
    if(status==-1){ int ec=GetLastError(); PrintFormat("[HTTP] PUT fail=%d url=%s", ec, url); return false; }
@@ -305,16 +339,41 @@ int FindFreeVirtualSlot()
    return -1;
 }
 
+void PurgeExpiredVirtualWatches(datetime now)
+{
+   for(int i=0;i<ArraySize(g_virtual);i++)
+   {
+      if(g_virtual[i].signal_id==0) continue;
+      if(g_virtual[i].state!=V_WAIT_FILL) continue;
+      if(now<=g_virtual[i].expiry_at) continue;
+
+      // If it is already expired, try cancelling it to prevent DB backlog.
+      // Only free the slot when cancel succeeded; otherwise let CheckVirtualWatches retry.
+      if(CancelSignalById(g_virtual[i].signal_id,"virtual_expired"))
+      {
+         g_virtual[i].signal_id=0;
+      }
+   }
+}
+
 int TrackVirtual(const VirtualWatch &w)
 {
    int idx=FindFreeVirtualSlot();
-   if(idx<0){ SafePrint("[VIRTUAL] No free slot (increase g_virtual size)"); return -1; }
+   if(idx<0){
+      PurgeExpiredVirtualWatches(TimeCurrent());
+      idx=FindFreeVirtualSlot();
+   }
+   if(idx<0){
+      SafePrint(StringFormat("[VIRTUAL] No free slot (cap=%d) -> cancelling signal_id=%d", ArraySize(g_virtual), w.signal_id));
+      CancelSignalById(w.signal_id,"virtual_no_slot");
+      return -1;
+   }
    g_virtual[idx]=w;
    return idx;
 }
 
 // Update ai_signals by signal_id (virtual/paper trades)
-void UpdateSignalResultById(long signal_id,double exit_price,double profit_loss,const string result,bool sl_hit,bool tp_hit,datetime filled_at=0)
+bool UpdateSignalResultById(long signal_id,double exit_price,double profit_loss,const string result,bool sl_hit,bool tp_hit,datetime filled_at=0)
 {
    datetime now=TimeCurrent();
    int duration=0;
@@ -330,11 +389,13 @@ void UpdateSignalResultById(long signal_id,double exit_price,double profit_loss,
    "\"tp_hit\":"+(tp_hit?"true":"false")+"}";
    string resp;
    if(!HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000)){
-      SafePrint("[AI_SIGNALS] Failed to update virtual result");
+      SafePrint(StringFormat("[AI_SIGNALS] Failed to update virtual result (signal_id=%d)", signal_id));
+      return false;
    }
+   return true;
 }
 
-void UpdateSignalVirtualFilled(long signal_id,double entry_price,datetime filled_at)
+bool UpdateSignalVirtualFilled(long signal_id,double entry_price,datetime filled_at)
 {
    string payload="{"+
    "\"signal_id\":"+IntegerToString(signal_id)+","+
@@ -342,17 +403,25 @@ void UpdateSignalVirtualFilled(long signal_id,double entry_price,datetime filled
    "\"virtual_filled_at\":\""+TimeToString(filled_at,TIME_DATE|TIME_SECONDS)+"\","+
    "\"actual_result\":\"FILLED\"}";
    string resp;
-   HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000);
+   if(!HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000)){
+      SafePrint(StringFormat("[AI_SIGNALS] Failed to mark virtual filled (signal_id=%d)", signal_id));
+      return false;
+   }
+   return true;
 }
 
-void CancelSignalById(long signal_id,const string reason)
+bool CancelSignalById(long signal_id,const string reason)
 {
    string payload="{"+
    "\"signal_id\":"+IntegerToString(signal_id)+","+
    "\"actual_result\":\"CANCELLED\","+
    "\"cancelled_reason\":\""+JsonEscape(reason)+"\"}";
    string resp;
-   HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000);
+   if(!HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000)){
+      SafePrint(StringFormat("[AI_SIGNALS] Failed to cancel virtual (signal_id=%d reason=%s)", signal_id, reason));
+      return false;
+   }
+   return true;
 }
 
 bool ShouldVirtualTrack(const string decision_code)
@@ -787,8 +856,69 @@ bool ExtractJsonInSectionString(const string section,const string key,string &ou
    out=StringSubstr(section,pos,end-pos); StringReplace(out,"\\\"","\""); StringReplace(out,"\\\\","\\"); return true;
 }
 
+bool ValidateAIResponse(const AIOut &ai,string &why)
+{
+   if(!MathIsValidNumber(ai.win_prob) || ai.win_prob<0.0 || ai.win_prob>1.0){
+      why="invalid win_prob";
+      return false;
+   }
+   if(!(ai.action==0 || ai.action==1 || ai.action==-1)){
+      why="invalid action";
+      return false;
+   }
+   if(!MathIsValidNumber(ai.lot_multiplier) || ai.lot_multiplier<1.0 || ai.lot_multiplier>3.0){
+      why="invalid lot_multiplier";
+      return false;
+   }
+   if(ai.buy_win_prob>=0.0 && (!MathIsValidNumber(ai.buy_win_prob) || ai.buy_win_prob<0.0 || ai.buy_win_prob>1.0)){
+      why="invalid buy_win_prob";
+      return false;
+   }
+   if(ai.sell_win_prob>=0.0 && (!MathIsValidNumber(ai.sell_win_prob) || ai.sell_win_prob<0.0 || ai.sell_win_prob>1.0)){
+      why="invalid sell_win_prob";
+      return false;
+   }
+   if(ai.recommended_min_win_prob>0.0 && (!MathIsValidNumber(ai.recommended_min_win_prob) || ai.recommended_min_win_prob<0.0 || ai.recommended_min_win_prob>1.0)){
+      why="invalid recommended_min_win_prob";
+      return false;
+   }
+   if(ai.expected_value_r>-900.0 && !MathIsValidNumber(ai.expected_value_r)){
+      why="invalid expected_value_r";
+      return false;
+   }
+   if(ai.ml_pattern_confidence>0.0 && (!MathIsValidNumber(ai.ml_pattern_confidence) || ai.ml_pattern_confidence<0.0 || ai.ml_pattern_confidence>100.0)){
+      why="invalid ml_pattern_confidence";
+      return false;
+   }
+   return true;
+}
+
 bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,const string reason,double ichimoku_score,AIOut &out_ai)
 {
+   // default init (ExtractJson* が失敗しても未初期化値を使わない)
+   out_ai.win_prob=0.0;
+   out_ai.action=0;
+   out_ai.offset_factor=0.0;
+   out_ai.expiry_min=0;
+   out_ai.reasoning="";
+   out_ai.confidence="";
+   out_ai.suggested_dir=0;
+   out_ai.buy_win_prob=-1.0;
+   out_ai.sell_win_prob=-1.0;
+   out_ai.recommended_min_win_prob=0.0;
+   out_ai.expected_value_r=-999.0;
+   out_ai.skip_reason="";
+   out_ai.entry_method="market";
+   out_ai.method_selected_by="Manual";
+   out_ai.method_reason="market-only execution";
+   out_ai.lot_multiplier=1.0;
+   out_ai.lot_level="";
+   out_ai.lot_reason="";
+   out_ai.ml_pattern_used=false;
+   out_ai.ml_pattern_id=0;
+   out_ai.ml_pattern_name="";
+   out_ai.ml_pattern_confidence=0.0;
+
    // ★ テクニカル指標の詳細データを取得
    ENUM_TIMEFRAMES tf=(tf_label=="M15")?TF_Entry:TF_Recheck;
    double ema_25=MA(tf,25,MODE_EMA,PRICE_CLOSE,0);
@@ -856,12 +986,38 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
       }
    }
 
+   // ATR (send-safe)
+   // - サーバ側は costR=spread/(atr*risk_atr_mult) を使うため、atr=0 だとコストが過小評価される。
+   // - 指標取得が不安定な場合もあるので、tf上のATRを優先しつつ、ダメなら引数 atr にフォールバック。
+   double atr_tf = ATRv(tf,14,0);
+   double atr_send = atr_tf;
+   if(!MathIsValidNumber(atr_send) || atr_send==EMPTY_VALUE || atr_send<=0.0)
+      atr_send = atr;
+   if(!MathIsValidNumber(atr_send) || atr_send==EMPTY_VALUE || atr_send<=0.0)
+      atr_send = 0.0;
+
    // 正規化ATR（ATR/価格）
-   double atr_norm=(price>0?atr/price:0);
+   double atr_norm=(price>0?atr_send/price:0);
    
-   // 価格情報
-   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
-   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   // 価格情報 (send-safe)
+   double bid=0.0, ask=0.0;
+   MqlTick tick;
+   if(SymbolInfoTick(_Symbol,tick))
+   {
+      bid=tick.bid;
+      ask=tick.ask;
+   }
+   if(!MathIsValidNumber(bid) || !MathIsValidNumber(ask) || bid<=0.0 || ask<=0.0 || ask<bid)
+   {
+      bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+      ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   }
+   if(!MathIsValidNumber(bid) || !MathIsValidNumber(ask) || bid<=0.0 || ask<=0.0 || ask<bid)
+   {
+      // 最後の保険（サーバ側で assumed cost に落ちる）
+      bid=0.0;
+      ask=0.0;
+   }
    
    // ★ すべての生データをAIに送信
    int dir_to_send = (UseAIForDirection ? 0 : dir);
@@ -886,7 +1042,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    
    // RSI & ATR
    "\"rsi\":"+DoubleToString(rsi,2)+","+
-   "\"atr\":"+DoubleToString(atr,5)+","+
+   "\"atr\":"+DoubleToString(atr_send,5)+","+
 
    // レジーム判定用（追加特徴量）
    "\"atr_norm\":"+DoubleToString(atr_norm,8)+","+
@@ -927,7 +1083,10 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    "\"version\":\""+JsonEscape(AI_EA_Version)+"\"}";
 
    string resp;
-   if(!HttpPostJson(AI_Endpoint_URL,AI_Bearer_Token,payload,resp,AI_Timeout_ms)) return false;
+   if(!HttpPostJson(AI_Endpoint_URL,AI_Bearer_Token,payload,resp,AI_Timeout_ms)){
+      SafePrint("[AI] HTTP request failed");
+      return false;
+   }
 
    ExtractJsonNumber(resp,"win_prob",out_ai.win_prob);
    ExtractJsonInt(resp,"action",out_ai.action);
@@ -967,6 +1126,13 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    ExtractJsonString(resp,"ml_pattern_name",out_ai.ml_pattern_name);
    double mlConf; if(ExtractJsonNumber(resp,"ml_pattern_confidence",mlConf)) out_ai.ml_pattern_confidence=mlConf; else out_ai.ml_pattern_confidence=0.0;
 
+   // response validation (safe-side skip)
+   string vwhy="";
+   if(!ValidateAIResponse(out_ai,vwhy)){
+      SafePrint(StringFormat("[AI] Invalid response: %s (prob=%.3f action=%d)", vwhy, out_ai.win_prob, out_ai.action));
+      return false;
+   }
+
    return true;
 }
 
@@ -1000,14 +1166,15 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
    "\"trade_decision\":\""+JsonEscape(trade_decision)+"\","+
    "\"threshold_met\":"+(threshold_met?"true":"false")+","+
    "\"current_positions\":"+IntegerToString(current_pos)+","+
-   (ticket>0?"\"order_ticket\":\""+IntegerToString(ticket)+"\",":"")+
+   (ticket>0?"\"order_ticket\":\""+ULongToString(ticket)+"\",":"")+
    "\"offset_factor\":"+DoubleToString(ai.offset_factor,3)+","+
    "\"expiry_minutes\":"+IntegerToString(ai.expiry_min)+","+
    "\"reason\":\""+JsonEscape(reason)+"\","+
    "\"instance\":\""+AI_EA_Instance+"\","+
    "\"version\":\""+AI_EA_Version+"\","+
    "\"caller\":\""+tf_label+"\"}";
-   string dummy; HttpPostJson(EA_Log_URL,AI_Bearer_Token,logPayload,dummy,3000);
+   const string bearer=(EA_Log_Bearer_Token!=""?EA_Log_Bearer_Token:AI_Bearer_Token);
+   string dummy; HttpPostJson(EA_Log_URL,bearer,logPayload,dummy,3000);
 }
 
 // ===== AI Signals記録（ML学習用） =====
@@ -1132,7 +1299,7 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    if(planned_order_type>=0) payload+=",\"planned_order_type\":"+IntegerToString(planned_order_type);
 
    if(ticket>0){
-      payload+=",\"order_ticket\":\""+IntegerToString(ticket)+"\"";
+      payload+=",\"order_ticket\":\""+ULongToString(ticket)+"\"";
       if(entry_price>0) payload+=",\"entry_price\":"+DoubleToString(entry_price,_Digits);
    }
    // Only mark FILLED when we have a real broker ticket.
@@ -1214,14 +1381,14 @@ void CheckVirtualWatches()
    }
 }
 
-void UpdateSignalResult(ulong ticket,double exit_price,double profit_loss,const string result,bool sl_hit,bool tp_hit,datetime opened_at)
+void UpdateSignalResultWithOpenTime(ulong ticket,double exit_price,double profit_loss,const string result,bool sl_hit,bool tp_hit,datetime open_time)
 {
    datetime now=TimeCurrent();
    int duration=0;
-   if(opened_at>0) duration=(int)((now-opened_at)/60);
+   if(open_time>0) duration=(int)((now-open_time)/60);
    
    string payload="{"+
-   "\"order_ticket\":\""+IntegerToString(ticket)+"\","+
+   "\"order_ticket\":\""+ULongToString(ticket)+"\","+
    "\"exit_price\":"+DoubleToString(exit_price,_Digits)+","+
    "\"profit_loss\":"+DoubleToString(profit_loss,2)+","+
    "\"actual_result\":\""+result+"\","+
@@ -1234,14 +1401,19 @@ void UpdateSignalResult(ulong ticket,double exit_price,double profit_loss,const 
    if(!HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000)){
       SafePrint("[AI_SIGNALS] Failed to update result");
    }else{
-      SafePrint(StringFormat("[AI_SIGNALS] Updated: ticket=%d result=%s P/L=%.2f",ticket,result,profit_loss));
+      SafePrint(StringFormat("[AI_SIGNALS] Updated: ticket=%s result=%s P/L=%.2f",ULongToString(ticket),result,profit_loss));
    }
+}
+
+void UpdateSignalResult(ulong ticket,double exit_price,double profit_loss,const string result,bool sl_hit,bool tp_hit)
+{
+   UpdateSignalResultWithOpenTime(ticket,exit_price,profit_loss,result,sl_hit,tp_hit,g_trackedPositionOpenTime);
 }
 
 void CancelSignal(ulong ticket,const string reason)
 {
    string payload="{"+
-   "\"order_ticket\":\""+IntegerToString(ticket)+"\","+
+   "\"order_ticket\":\""+ULongToString(ticket)+"\","+
    "\"actual_result\":\"CANCELLED\","+
    "\"cancelled_reason\":\""+JsonEscape(reason)+"\"}";
    
@@ -1304,7 +1476,7 @@ void Cancel(string why){if(g_pendingTicket==0)return;if(OrderSelect(g_pendingTic
    trade.OrderDelete(g_pendingTicket);SafePrint("[ORDER] canceled: "+why);}
    g_pendingTicket=0;g_pendingDir=0;g_pendingAt=0;}
 
-// ポジション数チェック（アクティブポジション + ペンディングオーダー）
+// ポジション数チェック（アクティブポジション + (任意) ペンディングオーダー）
 int CountPositions()
 {
    int count=0;
@@ -1319,22 +1491,25 @@ int CountPositions()
       count++;
    }
    
-   // ペンディングオーダーもカウント（約定待ちも含める）
-   for(int i=OrdersTotal()-1;i>=0;i--)
+   if(CountPendingOrdersInMaxPos)
    {
-      ulong ticket=OrderGetTicket(i);
-      if(ticket<=0) continue;
-      if(OrderGetString(ORDER_SYMBOL)!=_Symbol) continue;
-      if(OrderGetInteger(ORDER_MAGIC)!=Magic) continue;
-      
-      // ペンディングオーダーのみ（約定待ち）
-      long order_type=OrderGetInteger(ORDER_TYPE);
-      if(order_type==ORDER_TYPE_BUY_LIMIT || 
-         order_type==ORDER_TYPE_SELL_LIMIT ||
-         order_type==ORDER_TYPE_BUY_STOP || 
-         order_type==ORDER_TYPE_SELL_STOP)
+      // ペンディングオーダーもカウント（約定待ちも含める）
+      for(int i=OrdersTotal()-1;i>=0;i--)
       {
-         count++;
+         ulong ticket=OrderGetTicket(i);
+         if(ticket<=0) continue;
+         if(OrderGetString(ORDER_SYMBOL)!=_Symbol) continue;
+         if(OrderGetInteger(ORDER_MAGIC)!=Magic) continue;
+         
+         // ペンディングオーダーのみ（約定待ち）
+         long order_type=OrderGetInteger(ORDER_TYPE);
+         if(order_type==ORDER_TYPE_BUY_LIMIT || 
+            order_type==ORDER_TYPE_SELL_LIMIT ||
+            order_type==ORDER_TYPE_BUY_STOP || 
+            order_type==ORDER_TYPE_SELL_STOP)
+         {
+            count++;
+         }
       }
    }
    
@@ -1359,8 +1534,6 @@ void OnM15NewBar()
    int decision_dir = ai.action; // 0なら見送り
 
    int posCount=CountPositions();
-   int inflight=TrackedInFlightCount();
-   int effCount=posCount+inflight;
    // Dynamic threshold (lowering only) + EV gate
    double effectiveMin=MinWinProb;
    if(ai.recommended_min_win_prob>0.0 && ai.recommended_min_win_prob<effectiveMin) effectiveMin=ai.recommended_min_win_prob;
@@ -1380,13 +1553,27 @@ void OnM15NewBar()
       TechSignal t_exec=t; t_exec.dir=decision_dir;
       TechSignal t_plan=t; t_plan.dir=suggested_dir;
 
-      // ポジション数チェック（ペンディングオーダー含む）
-      if(effCount>=MaxPositions){
-         string code=(inflight>0?"SKIPPED_TRACKED_POS":"SKIPPED_MAX_POS");
-         LogAIDecision("M15",decision_dir,rsi,t.atr,t.ref,t.reason,ai,code,threshold_met,effCount,0,tech_dir);
-         SafePrint(StringFormat("[M15] skip: limit reached (pos/pending=%d inflight=%d max=%d)",posCount,inflight,MaxPositions));
-         MaybeRecordVirtualSkip(code,t_plan,rsi,ai,expiry_min);
+      // ポジション数チェック（ペンディングは設定で任意）
+      if(posCount>=MaxPositions){
+         LogAIDecision("M15",decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_MAX_POS",threshold_met,posCount,0,tech_dir);
+         if(CountPendingOrdersInMaxPos)
+            SafePrint(StringFormat("[M15] skip: already %d position(s) or pending order(s)",posCount));
+         else
+            SafePrint(StringFormat("[M15] skip: already %d position(s)",posCount));
+         MaybeRecordVirtualSkip("SKIPPED_MAX_POS",t_plan,rsi,ai,expiry_min);
          return;
+      }
+      
+      // 単一運用(MaxPositions<=1)のときだけ、追跡中ポジションがあれば新規を止める（重複防止）
+      // MaxPositions>1 の場合は複数追跡に切り替えるため、ここで止めない。
+      if(MaxPositions<=1)
+      {
+         if(g_trackedPositionTicket>0 && PositionSelectByTicket(g_trackedPositionTicket)){
+            LogAIDecision("M15",decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_TRACKED_POS",threshold_met,1,g_trackedPositionTicket,tech_dir);
+            SafePrint(StringFormat("[M15] skip: tracked position active (ticket=%s)",ULongToString(g_trackedPositionTicket)));
+            MaybeRecordVirtualSkip("SKIPPED_TRACKED_POS",t_plan,rsi,ai,expiry_min);
+            return;
+         }
       }
       
       if(OrderAlive(g_pendingTicket)){
@@ -1440,21 +1627,29 @@ void OnM15NewBar()
          }
       }
 
-      if(ok && ordTicket>0){
-         datetime ot=TimeCurrent();
-         if(posTicket>0 && PositionSelectByTicket(posTicket)) ot=(datetime)PositionGetInteger(POSITION_TIME);
-         UpsertTrackedTrade(posTicket,ordTicket,ot,entry);
+      if(ok && posTicket>0 && ordTicket>0){
+         datetime openTime=0;
+         if(PositionSelectByTicket(posTicket)) openTime=(datetime)PositionGetInteger(POSITION_TIME);
+         AddTrackedTrade(posTicket,ordTicket,openTime,entry);
 
-         // ai_signals.order_ticket is the update key; entry can be 0 right after OrderSend.
+         // legacy single-slot (last executed)
+         g_trackedPositionTicket=posTicket;
+         g_trackedOrderTicket=ordTicket;
+         g_trackedPositionOpenTime=openTime;
+         g_trackedPositionEntryPrice=entry;
+         g_trackedFillSent=false;
+         g_trackedFillLastTry=0;
+
+         // ai_signals.order_ticket is the order ticket key
          RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min);
-         LogAIDecision("M15",decision_dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,"EXECUTED_MARKET",threshold_met,effCount,ordTicket,tech_dir);
+         LogAIDecision("M15",decision_dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,"EXECUTED_MARKET",threshold_met,posCount,ordTicket,tech_dir);
          SafePrint(StringFormat("[M15] market executed dir=%d prob=%.0f%% lot=%.2f",t_exec.dir,ai.win_prob*100,finalLots));
       }else{
          SafePrint("[M15] market execution failed");
       }
    }else{
       TechSignal t_plan=t; t_plan.dir=(ai.suggested_dir!=0?ai.suggested_dir:tech_dir);
-      LogAIDecision("M15",ai.action,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_LOW_PROB",threshold_met,effCount,0,tech_dir);
+      LogAIDecision("M15",ai.action,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_LOW_PROB",threshold_met,posCount,0,tech_dir);
       if(ai.action==0){
          SafePrint(StringFormat("[M15] skip: server action=0 (prob=%.0f%% eff=%.0f%% ev=%.2f gate=%.2f method=%s reason=%s)",
             ai.win_prob*100,effectiveMin*100,ev_r,ev_gate,ai.entry_method,ai.skip_reason));
@@ -1524,114 +1719,131 @@ void OnH1NewBar()
 // ===== ポジション監視（ML学習用） =====
 void CheckPositionStatus()
 {
+   // Ensure entry_price is recorded for tracked positions (market orders can report entry_price=0 right after OrderSend)
    datetime now=TimeCurrent();
-
-   // 1) Attach position_ticket for in-flight market orders (order sent but position not yet visible)
-   for(int i=0;i<MAX_TRACKED_TRADES;i++)
+   for(int ti=0; ti<ArraySize(g_tracked); ti++)
    {
-      if(g_tracked[i].order_ticket==0 || g_tracked[i].position_ticket!=0) continue;
+      if(g_tracked[ti].order_ticket==0 || g_tracked[ti].position_ticket==0) continue;
+      if(g_tracked[ti].fill_sent) continue;
+      // try at most once per 60 seconds per trade
+      if(g_tracked[ti].fill_last_try!=0 && (now - g_tracked[ti].fill_last_try) < 60) continue;
+      g_tracked[ti].fill_last_try=now;
 
-      // Find newest untracked position for this symbol+magic.
-      ulong newest=0; datetime newestTime=0; double newestEntry=0;
-      for(int p=PositionsTotal()-1;p>=0;p--){
-         ulong t=PositionGetTicket(p);
-         if(t<=0) continue;
-         if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
-         if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
-         if(FindTrackedByPosition(t)>=0) continue;
-         datetime pt=(datetime)PositionGetInteger(POSITION_TIME);
-         if(newest==0 || pt>newestTime){
-            newest=t; newestTime=pt; newestEntry=PositionGetDouble(POSITION_PRICE_OPEN);
-         }
-      }
-      if(newest>0){
-         g_tracked[i].position_ticket=newest;
-         g_tracked[i].open_time=newestTime;
-         if(MathIsValidNumber(newestEntry) && newestEntry>0) g_tracked[i].entry_price=newestEntry;
-      }
-   }
-
-   // 2) Pending order filled -> bind to a position and track
-   if(g_pendingTicket>0 && !OrderAlive(g_pendingTicket)){
-      // Order ticket != Position ticket. Find the newest matching position.
-      ulong posTicket=0;
-      for(int i=PositionsTotal()-1;i>=0;i--){
-         ulong t=PositionGetTicket(i);
-         if(t<=0) continue;
-         if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
-         if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
-         posTicket=t;
-         break;
-      }
-
-      if(posTicket>0 && PositionSelectByTicket(posTicket)){
-         datetime ot=(datetime)PositionGetInteger(POSITION_TIME);
+      if(PositionSelectByTicket(g_tracked[ti].position_ticket))
+      {
          double ep=PositionGetDouble(POSITION_PRICE_OPEN);
-         int idx=UpsertTrackedTrade(posTicket,g_pendingTicket,ot,ep);
-
-         // Immediately try to update entry_price for the pending fill.
-         if(idx>=0){
-            string payload="{\"order_ticket\":\""+IntegerToString(g_tracked[idx].order_ticket)+"\""+
+         if(MathIsValidNumber(ep) && ep>0)
+         {
+            g_tracked[ti].entry_price=ep;
+            string payload="{\"order_ticket\":\""+ULongToString(g_tracked[ti].order_ticket)+"\""+
                            ",\"entry_price\":"+DoubleToString(ep,_Digits)+
                            ",\"actual_result\":\"FILLED\"}";
             string resp;
-            if(HttpPostJson(AI_Signals_Update_URL,AI_Bearer_Token,payload,resp,3000)){
-               g_tracked[idx].fill_sent=true;
-               SafePrint(StringFormat("[POSITION] Filled order=%d pos=%d at %.5f",g_tracked[idx].order_ticket,g_tracked[idx].position_ticket,ep));
+            if(HttpPostJson(AI_Signals_Update_URL,AI_Bearer_Token,payload,resp,3000))
+            {
+               g_tracked[ti].fill_sent=true;
+               SafePrint(StringFormat("[AI_SIGNALS_UPDATE] Filled confirmed order=%s entry=%.5f",ULongToString(g_tracked[ti].order_ticket),ep));
             }
          }
+      }
+   }
+
+   // ペンディングオーダーが約定したかチェック
+   if(g_pendingTicket>0 && !OrderAlive(g_pendingTicket)){
+      // NOTE: Order ticket != Position ticket. When the pending order is filled, find the new position by symbol+magic.
+      ulong posTicket=0;
+      datetime openTime=0;
+      double entryPrice=0.0;
+
+      // Prefer exact mapping via deals history: DEAL_ORDER == g_pendingTicket
+      datetime now=TimeCurrent();
+      if(HistorySelect(now-7*86400, now))
+      {
+         int total=HistoryDealsTotal();
+         for(int i=total-1;i>=0;i--)
+         {
+            ulong dealTicket=HistoryDealGetTicket(i);
+            if(dealTicket<=0) continue;
+            if((ulong)HistoryDealGetInteger(dealTicket,DEAL_ORDER) != g_pendingTicket) continue;
+            if(HistoryDealGetString(dealTicket,DEAL_SYMBOL) != _Symbol) continue;
+            if((long)HistoryDealGetInteger(dealTicket,DEAL_MAGIC) != Magic) continue;
+            if(HistoryDealGetInteger(dealTicket,DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+
+            posTicket=(ulong)HistoryDealGetInteger(dealTicket,DEAL_POSITION_ID);
+            openTime=(datetime)HistoryDealGetInteger(dealTicket,DEAL_TIME);
+            entryPrice=HistoryDealGetDouble(dealTicket,DEAL_PRICE);
+            break;
+         }
+      }
+
+      // Fallback: pick newest untracked position by symbol+magic
+      if(posTicket==0)
+      {
+         datetime newest=0;
+         for(int i=PositionsTotal()-1;i>=0;i--)
+         {
+            ulong t=PositionGetTicket(i);
+            if(t<=0) continue;
+            if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+            if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+            if(IsPositionTracked(t)) continue;
+            datetime ot=(datetime)PositionGetInteger(POSITION_TIME);
+            if(posTicket==0 || ot>newest){ posTicket=t; newest=ot; }
+         }
+         if(posTicket>0 && PositionSelectByTicket(posTicket))
+         {
+            openTime=(datetime)PositionGetInteger(POSITION_TIME);
+            entryPrice=PositionGetDouble(POSITION_PRICE_OPEN);
+         }
+      }
+
+      if(posTicket>0){
+         AddTrackedTrade(posTicket,g_pendingTicket,openTime,entryPrice);
+
+         // legacy single-slot (last filled)
+         g_trackedPositionTicket=posTicket;
+         g_trackedOrderTicket=g_pendingTicket;
+         g_trackedPositionOpenTime=openTime;
+         g_trackedPositionEntryPrice=entryPrice;
+         g_trackedFillSent=false;
+         g_trackedFillLastTry=0;
+
+         // シグナル更新（エントリー価格を記録） - order_ticketキーで更新
+         string payload="{\"order_ticket\":\""+ULongToString(g_trackedOrderTicket)+"\""+
+                        ",\"entry_price\":"+DoubleToString(g_trackedPositionEntryPrice,_Digits)+
+                        ",\"actual_result\":\"FILLED\"}";
+         string resp;
+         HttpPostJson(AI_Signals_Update_URL,AI_Bearer_Token,payload,resp,3000);
+
+         SafePrint(StringFormat("[POSITION] Filled order=%s pos=%s at %.5f",ULongToString(g_trackedOrderTicket),ULongToString(g_trackedPositionTicket),g_trackedPositionEntryPrice));
       }else{
          // Order disappeared but no position exists -> treat as cancelled to avoid stale PENDING rows.
          CancelSignal(g_pendingTicket,"filled_not_found");
       }
 
-      // Reset pending state
+      // ペンディングチケットをリセット（重複ログ防止）
       g_pendingTicket=0;
       g_pendingDir=0;
       g_pendingAt=0;
    }
-
-   // 3) Ensure entry_price is recorded for tracked positions
-   for(int i=0;i<MAX_TRACKED_TRADES;i++)
+   
+   // 追跡中のポジションがクローズされたかチェック
+   for(int ti=0; ti<ArraySize(g_tracked); ti++)
    {
-      if(g_tracked[i].order_ticket==0 || g_tracked[i].position_ticket==0) continue;
-      if(g_tracked[i].fill_sent) continue;
+      if(g_tracked[ti].position_ticket==0) continue;
+      if(PositionSelectByTicket(g_tracked[ti].position_ticket)) continue;
 
-      // try at most once per 60 seconds per slot
-      if(g_tracked[i].fill_last_try!=0 && (now - g_tracked[i].fill_last_try) < 60) continue;
-      g_tracked[i].fill_last_try=now;
-
-      if(PositionSelectByTicket(g_tracked[i].position_ticket)){
-         double ep=PositionGetDouble(POSITION_PRICE_OPEN);
-         if(MathIsValidNumber(ep) && ep>0){
-            g_tracked[i].entry_price=ep;
-            string payload="{\"order_ticket\":\""+IntegerToString(g_tracked[i].order_ticket)+"\""+
-                           ",\"entry_price\":"+DoubleToString(g_tracked[i].entry_price,_Digits)+
-                           ",\"actual_result\":\"FILLED\"}";
-            string resp;
-            if(HttpPostJson(AI_Signals_Update_URL,AI_Bearer_Token,payload,resp,3000)){
-               g_tracked[i].fill_sent=true;
-               SafePrint(StringFormat("[AI_SIGNALS_UPDATE] Filled confirmed order=%d entry=%.5f",g_tracked[i].order_ticket,g_tracked[i].entry_price));
-            }
-         }
-      }
-   }
-
-   // 4) Check tracked positions closed -> update ai_signals
-   for(int i=0;i<MAX_TRACKED_TRADES;i++)
-   {
-      if(g_tracked[i].position_ticket==0 && g_tracked[i].order_ticket==0) continue;
-      if(g_tracked[i].position_ticket==0) continue; // cannot resolve closure without a position ticket
-
-      if(PositionSelectByTicket(g_tracked[i].position_ticket)) continue;
-
-      // position closed -> fetch result from history
-      if(HistorySelectByPosition(g_tracked[i].position_ticket)){
+      // ポジションがクローズされた - 履歴から結果を取得
+      if(HistorySelectByPosition(g_tracked[ti].position_ticket))
+      {
          int total=HistoryDealsTotal();
-         for(int d=total-1; d>=0; d--){
-            ulong dealTicket=HistoryDealGetTicket(d);
-            if(dealTicket>0 && (ulong)HistoryDealGetInteger(dealTicket,DEAL_POSITION_ID)==g_tracked[i].position_ticket){
-               if(HistoryDealGetInteger(dealTicket,DEAL_ENTRY)==DEAL_ENTRY_OUT){
+         for(int i=total-1;i>=0;i--)
+         {
+            ulong dealTicket=HistoryDealGetTicket(i);
+            if(dealTicket>0 && (ulong)HistoryDealGetInteger(dealTicket,DEAL_POSITION_ID)==g_tracked[ti].position_ticket)
+            {
+               if(HistoryDealGetInteger(dealTicket,DEAL_ENTRY)==DEAL_ENTRY_OUT)
+               {
                   double exit_price=HistoryDealGetDouble(dealTicket,DEAL_PRICE);
                   double profit=HistoryDealGetDouble(dealTicket,DEAL_PROFIT);
                   long deal_reason=HistoryDealGetInteger(dealTicket,DEAL_REASON);
@@ -1643,24 +1855,31 @@ void CheckPositionStatus()
                   if(profit>0.01) result="WIN";
                   else if(profit<-0.01) result="LOSS";
 
-                  ulong keyTicket=(g_tracked[i].order_ticket>0?g_tracked[i].order_ticket:g_tracked[i].position_ticket);
-                  UpdateSignalResult(keyTicket,exit_price,profit,result,sl_hit,tp_hit,g_tracked[i].open_time);
+                  ulong keyTicket=(g_tracked[ti].order_ticket>0?g_tracked[ti].order_ticket:g_tracked[ti].position_ticket);
+                  UpdateSignalResultWithOpenTime(keyTicket,exit_price,profit,result,sl_hit,tp_hit,g_tracked[ti].open_time);
 
                   // ★ TP/SL時のみクールダウンを設定
                   if(sl_hit || tp_hit){
                      g_cooldownUntil = TimeCurrent() + (CooldownAfterCloseMin*60);
-                     SafePrint(StringFormat("[COOLDOWN] Start %d min after %s (pos=%d)",
-                        CooldownAfterCloseMin, (tp_hit?"TP":"SL"), g_tracked[i].position_ticket));
+                     SafePrint(StringFormat("[COOLDOWN] Start %d min after %s (pos=%s)",
+                        CooldownAfterCloseMin, (tp_hit?"TP":"SL"), ULongToString(g_tracked[ti].position_ticket)));
                   }
 
-                  ResetTrackedTrade(g_tracked[i]);
+                  // legacy single-slot reset if it matches
+                  if(g_trackedPositionTicket==g_tracked[ti].position_ticket){
+                     g_trackedPositionTicket=0;
+                     g_trackedOrderTicket=0;
+                     g_trackedPositionOpenTime=0;
+                     g_trackedPositionEntryPrice=0;
+                     g_trackedFillSent=false;
+                     g_trackedFillLastTry=0;
+                  }
+
+                  ClearTrackedSlot(ti);
                   break;
                }
             }
          }
-      }else{
-         // If history is unavailable, clear to avoid stuck slots.
-         ResetTrackedTrade(g_tracked[i]);
       }
    }
 
@@ -1671,7 +1890,20 @@ void CheckPositionStatus()
 // ===== メイン =====
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
-   for(int i=0;i<MAX_TRACKED_TRADES;i++) ResetTrackedTrade(g_tracked[i]);
+
+   if(RequireBearerToken && AI_Bearer_Token=="" && EA_Log_Bearer_Token==""){
+      Alert("ERROR: Bearer token is not set! (RequireBearerToken=true)");
+      Print("[INIT] ERROR: AI_Bearer_Token and EA_Log_Bearer_Token are empty");
+      return(INIT_FAILED);
+   }
+
+   int cap=(VirtualMaxWatches<10?10:VirtualMaxWatches);
+   ArrayResize(g_virtual,cap);
+
+   int tcap=(TrackedMaxTrades<1?1:TrackedMaxTrades);
+   ArrayResize(g_tracked,tcap);
+   for(int i=0;i<ArraySize(g_tracked);i++) ClearTrackedSlot(i);
+
    SafePrint(StringFormat("[INIT] AwajiSamurai_AI_2.0 %s start (build %s)", AI_EA_Version, __DATE__));
    SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",
       MinWinProb*100,RiskATRmult,RewardRR,Lots,MaxPositions));
@@ -1682,6 +1914,8 @@ int OnInit(){
       (VirtualTrack_SkippedMaxPos?"true":"false"),
       (VirtualTrack_SkippedTrackedPos?"true":"false")
    ));
+   SafePrint(StringFormat("[VIRTUAL] Watch capacity=%d", ArraySize(g_virtual)));
+   SafePrint(StringFormat("[TRACK] Multi tracking capacity=%d (CountPendingInMaxPos=%s)", ArraySize(g_tracked), (CountPendingOrdersInMaxPos?"true":"false")));
    return(INIT_SUCCEEDED);
 }
 void OnTick()

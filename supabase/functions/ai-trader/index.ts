@@ -1478,12 +1478,20 @@ ${(() => {
   const prompt = systemPrompt;
 
   try {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const openAiTimeoutRaw = Number(Deno.env.get("OPENAI_TIMEOUT_MS") ?? "12000");
+    const openAiTimeoutMs = Math.max(500, Math.min(60_000, Number.isFinite(openAiTimeoutRaw) ? openAiTimeoutRaw : 12000));
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), openAiTimeoutMs);
+
+    let response: Response;
+    try {
+      response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${OPENAI_API_KEY}`,
       },
+      signal: controller.signal,
       body: JSON.stringify({
         model: OPENAI_MODEL,  // 環境変数で設定可能 (デフォルト: gpt-4o-mini)
         messages: [
@@ -1524,7 +1532,10 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
         temperature: 0.2,  // より一貫性のある予測のため低めに設定
         max_tokens: 250,
       }),
-    });
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     if (!response.ok) {
       const errorText = await response.text();

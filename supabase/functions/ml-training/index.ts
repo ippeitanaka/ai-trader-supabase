@@ -574,16 +574,31 @@ function calculatePatternStats(
 async function savePatterns(patterns: Pattern[]): Promise<{ discovered: number; updated: number }> {
   let discovered = 0;
   let updated = 0;
+
+  const patternNames = Array.from(
+    new Set(patterns.map((p) => p.pattern_name).filter((n) => typeof n === "string" && n.trim() !== "")),
+  );
+
+  const existingByName = new Map<string, { id: any; pattern_name: string }>();
+  if (patternNames.length > 0) {
+    const { data: existingRows, error: existingErr } = await supabase
+      .from("ml_patterns")
+      .select("id, pattern_name")
+      .in("pattern_name", patternNames);
+
+    if (existingErr) {
+      console.warn("[ML] Failed to prefetch existing patterns:", existingErr.message);
+    } else {
+      for (const r of existingRows ?? []) {
+        if (r?.pattern_name) existingByName.set(r.pattern_name, r);
+      }
+    }
+  }
   
   for (const pattern of patterns) {
-    // 既存パターンをチェック
-    const { data: existing } = await supabase
-      .from("ml_patterns")
-      .select("id, total_trades")
-      .eq("pattern_name", pattern.pattern_name)
-      .single();
-    
-    if (existing) {
+    const existing = existingByName.get(pattern.pattern_name);
+
+    if (existing?.id) {
       // 更新
       const { error } = await supabase
         .from("ml_patterns")
@@ -825,11 +840,19 @@ async function runTraining(triggeredBy: string = "manual"): Promise<TrainingResu
   
   // 8. 推奨事項を保存
   if (trainingHistory) {
-    for (const rec of recommendations) {
-      await supabase.from("ml_recommendations").insert({
+    if (recommendations.length > 0) {
+      const rows = recommendations.map((rec) => ({
         ...rec,
         training_history_id: trainingHistory.id,
-      });
+      }));
+
+      const { error: recErr } = await supabase
+        .from("ml_recommendations")
+        .insert(rows);
+
+      if (recErr) {
+        console.warn("[ML] Failed to insert recommendations:", recErr.message);
+      }
     }
   }
   

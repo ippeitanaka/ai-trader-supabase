@@ -2,3 +2,15 @@
 
 [functions.ai-trader]
 verify_jwt = false
+
+[functions.ai-signals]
+verify_jwt = false
+
+[functions.ai-signals-update]
+verify_jwt = false
+
+[functions.ea-log]
+verify_jwt = false
+
+[functions.ml-training]
+verify_jwt = false

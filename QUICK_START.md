@@ -67,7 +67,7 @@ curl -X POST http://127.0.0.1:54321/functions/v1/test-openai \
 # ai-trader Functionテスト
 curl -X POST http://127.0.0.1:54321/functions/v1/ai-trader \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sb_secret_N7UND0UgjKTVK-Uodkm0Hg_xSvEMPvz" \
+  -H "Authorization: Bearer <YOUR_SUPABASE_ANON_OR_SERVICE_ROLE_KEY>" \
   -d @test_trade_request.json | jq
 ```
 
@@ -139,14 +139,21 @@ ls -la supabase/migrations/
 
 ### 1. MT5 EAとの接続テスト
 1. MT5でEAを起動
-2. EA設定でURLを設定:
+2. MT5の「ツール → オプション → エキスパートアドバイザ」
+  - 「WebRequestを許可するURL」に `https://nebphrnnpmuqbkymwefs.supabase.co` を追加
+3. EA設定でURLを設定:
    ```
    http://127.0.0.1:54321/functions/v1/ai-trader
    ```
-3. Bearerトークンを設定:
-   ```
-   sb_secret_N7UND0UgjKTVK-Uodkm0Hg_xSvEMPvz
-   ```
+4. Bearerトークンを設定（運用方針に合わせて選択）:
+  - `AI_Bearer_Token`: `anon key` または `service_role key`（どちらでも可）
+  - `EA_Log_Bearer_Token`: `ea-log` 専用トークン（推奨）
+
+  `ea-log` 専用トークンの作成例（本番プロジェクト）：
+  ```bash
+  supabase secrets set EA_LOG_BEARER_TOKEN="$(openssl rand -hex 24)" --project-ref nebphrnnpmuqbkymwefs
+  ```
+  その値をEAの `EA_Log_Bearer_Token` に設定してください（未設定だと `ea-log` は401になります）。
 
 ### 2. リアルタイムモニタリング
 ```bash
