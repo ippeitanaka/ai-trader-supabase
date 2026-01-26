@@ -121,6 +121,77 @@ struct TrackedTrade{
 };
 TrackedTrade g_tracked[];
 
+// ===== Tracking rehydrate (after restart) =====
+// EAの再起動/再アタッチで g_tracked が初期化されると、
+// 既存ポジションの WIN/LOSS 更新ができず ai_signals が FILLED で滞留することがある。
+// そこで、現在のポジションを履歴(deals)から order_ticket に紐付け直して tracked に復元する。
+void RehydrateTrackingFromExistingPositions()
+{
+   datetime now=TimeCurrent();
+   // 過去の履歴範囲は広すぎると重いので、十分な安全マージンで 30日
+   datetime from=now-(30*86400);
+   bool hs=HistorySelect(from,now);
+   int dealsTotal=(hs?HistoryDealsTotal():0);
+
+   int added=0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong posTicket=PositionGetTicket(i);
+      if(posTicket<=0) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+      if(IsPositionTracked(posTicket)) continue;
+
+      datetime openTime=(datetime)PositionGetInteger(POSITION_TIME);
+      double entryPrice=PositionGetDouble(POSITION_PRICE_OPEN);
+      ulong ordTicket=0;
+
+      // Find entry deal for this position to get original order ticket
+      if(hs && dealsTotal>0)
+      {
+         for(int d=dealsTotal-1; d>=0; d--)
+         {
+            ulong dealTicket=HistoryDealGetTicket(d);
+            if(dealTicket<=0) continue;
+            if((ulong)HistoryDealGetInteger(dealTicket,DEAL_POSITION_ID)!=posTicket) continue;
+            if(HistoryDealGetString(dealTicket,DEAL_SYMBOL)!=_Symbol) continue;
+            if((long)HistoryDealGetInteger(dealTicket,DEAL_MAGIC)!=Magic) continue;
+            if(HistoryDealGetInteger(dealTicket,DEAL_ENTRY)!=DEAL_ENTRY_IN) continue;
+
+            ordTicket=(ulong)HistoryDealGetInteger(dealTicket,DEAL_ORDER);
+            // Prefer deal time/price as they are definitive
+            openTime=(datetime)HistoryDealGetInteger(dealTicket,DEAL_TIME);
+            double dp=HistoryDealGetDouble(dealTicket,DEAL_PRICE);
+            if(MathIsValidNumber(dp) && dp>0) entryPrice=dp;
+            break;
+         }
+      }
+
+      if(ordTicket>0)
+      {
+         if(AddTrackedTrade(posTicket,ordTicket,openTime,entryPrice))
+         {
+            added++;
+            // legacy single-slot: set only if empty (MaxPositions<=1 前提での互換)
+            if(g_trackedPositionTicket==0)
+            {
+               g_trackedPositionTicket=posTicket;
+               g_trackedOrderTicket=ordTicket;
+               g_trackedPositionOpenTime=openTime;
+               g_trackedPositionEntryPrice=entryPrice;
+               g_trackedFillSent=false;
+               g_trackedFillLastTry=0;
+            }
+         }
+      }
+   }
+
+   if(added>0)
+   {
+      SafePrint(StringFormat("[TRACK] Rehydrated %d position(s) from existing positions",added));
+   }
+}
+
 void ClearTrackedSlot(const int idx)
 {
    if(idx<0 || idx>=ArraySize(g_tracked)) return;
@@ -1903,6 +1974,9 @@ int OnInit(){
    int tcap=(TrackedMaxTrades<1?1:TrackedMaxTrades);
    ArrayResize(g_tracked,tcap);
    for(int i=0;i<ArraySize(g_tracked);i++) ClearTrackedSlot(i);
+
+   // Rehydrate tracking so WIN/LOSS updates won't stall after restart.
+   RehydrateTrackingFromExistingPositions();
 
    SafePrint(StringFormat("[INIT] AwajiSamurai_AI_2.0 %s start (build %s)", AI_EA_Version, __DATE__));
    SafePrint(StringFormat("[CONFIG] Using EA properties -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f, Lots=%.2f, MaxPos=%d",

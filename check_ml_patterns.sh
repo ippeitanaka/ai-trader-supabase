@@ -96,17 +96,23 @@ RECOMMENDATIONS=$(curl -s -X GET "${SUPABASE_URL}/rest/v1/ml_recommendations?is_
   -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
 
 if [ -n "$RECOMMENDATIONS" ] && [ "$RECOMMENDATIONS" != "[]" ]; then
-  echo "$RECOMMENDATIONS" | jq -r '
-    if length > 0 then
-      .[] | 
-      "\n推奨タイプ: \(.recommendation_type)",
-      "内容: \(.recommendation_text)",
-      "重要度: \(.priority // "medium")",
-      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    else
-      "\nまだ推奨事項がありません"
-    end
-  '
+  if echo "$RECOMMENDATIONS" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    echo "$RECOMMENDATIONS" | jq -r '
+      if length > 0 then
+        .[] | 
+        "\n推奨タイプ: \(.recommendation_type)",
+        "内容: \(.recommendation_text)",
+        "重要度: \(.priority // "medium")",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      else
+        "\nまだ推奨事項がありません"
+      end
+    '
+  else
+    echo ""
+    echo "⚠️  推奨事項の取得に失敗しました（配列JSONではありません）"
+    echo "$RECOMMENDATIONS" | python3 -m json.tool 2>/dev/null || echo "$RECOMMENDATIONS"
+  fi
 else
   echo ""
   echo "まだ推奨事項がありません"

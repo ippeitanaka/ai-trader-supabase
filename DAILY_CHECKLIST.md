@@ -89,6 +89,24 @@ ORDER BY created_at DESC
 LIMIT 50;
 ```
 
+### 6️⃣ 滞留(PENDING / FILLED no-close)の監視
+
+市場成行(Market-only)運用では、`PENDING` が長時間滞留するのは通常異常です。
+また `FILLED` で `closed_at` が入らないケースは「保有中」の可能性があるため、自動で更新せず MT5 側で未保有確認ができたものだけを整理します。
+
+```bash
+# REST経由で滞留を検知（詳細を表示）
+python3 scripts/check_stuck_ai_signals.py \
+    --pending-max-age-hours 24 \
+    --filled-max-age-hours 24 \
+    --limit 50
+```
+
+**確認ポイント:**
+- ✅ `PENDING >24h` が 0（または例外が説明可能）
+- ✅ `FILLED & closed_at NULL` は「現在保有中」の件数と一致
+- ⚠️ `FILLED no-close` が増え続ける場合は EA のクローズ反映/追跡を優先調査
+
 **正常であれば:**
 - ✅ ERRORなし
 - ✅ 極端なentry_paramsなし
@@ -174,5 +192,5 @@ WHERE created_at >= NOW() - INTERVAL '7 days'
 
 ---
 
-**最終更新**: 2025-11-01
+**最終更新**: 2026-01-26
 **システムバージョン**: EA v1.5.1, ML Training v1.2
