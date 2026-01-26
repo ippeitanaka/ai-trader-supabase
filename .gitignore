@@ -6,5 +6,13 @@ dist/
 .idea/
 .vscode/
 
+# Supabase CLI temp files (do not commit)
+supabase/.temp/
+
 # Local/prod SQL dumps (do not commit)
 archive/*dump*.sql
+
+# Local analysis outputs (generated)
+scripts/*_report.csv
+scripts/*_candidates*.csv
+scripts/*_tickets*.txt
