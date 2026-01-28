@@ -71,19 +71,16 @@ jobs:
           PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         run: |
           echo "Setting Edge Function secrets..."
+          # NOTE: Supabase CLI currently rejects secrets whose names start with "SUPABASE_".
+          # Edge Functions already expose SUPABASE_URL by default; do not set it here.
+          # For service role key, set a non-reserved name and have functions read it.
           if [ -n "$SUPABASE_SERVICE_ROLE_KEY" ]; then
-            supabase secrets set SUPABASE_SERVICE_ROLE_KEY="$SUPABASE_SERVICE_ROLE_KEY" --project-ref "$PROJECT_REF"
-            echo "✅ SUPABASE_SERVICE_ROLE_KEY configured"
+            supabase secrets set SERVICE_ROLE_KEY="$SUPABASE_SERVICE_ROLE_KEY" --project-ref "$PROJECT_REF"
+            echo "✅ SERVICE_ROLE_KEY configured"
           else
-            echo "⚠️  WARNING: SUPABASE_SERVICE_ROLE_KEY not set, ml-training may fail"
-          fi
-
-          if [ -n "$SUPABASE_URL" ]; then
-            supabase secrets set SUPABASE_URL="$SUPABASE_URL" --project-ref "$PROJECT_REF"
-            echo "✅ SUPABASE_URL configured"
+            echo "⚠️  WARNING: SUPABASE_SERVICE_ROLE_KEY not set; SERVICE_ROLE_KEY will not be configured"
           fi
 
           if [ -n "$OPENAI_API_KEY" ]; then
