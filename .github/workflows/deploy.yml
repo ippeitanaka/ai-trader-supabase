@@ -70,8 +70,22 @@ jobs:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         run: |
           echo "Setting Edge Function secrets..."
+          if [ -n "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+            supabase secrets set SUPABASE_SERVICE_ROLE_KEY="$SUPABASE_SERVICE_ROLE_KEY" --project-ref "$PROJECT_REF"
+            echo "✅ SUPABASE_SERVICE_ROLE_KEY configured"
+          else
+            echo "⚠️  WARNING: SUPABASE_SERVICE_ROLE_KEY not set, ml-training may fail"
+          fi
+
+          if [ -n "$SUPABASE_URL" ]; then
+            supabase secrets set SUPABASE_URL="$SUPABASE_URL" --project-ref "$PROJECT_REF"
+            echo "✅ SUPABASE_URL configured"
+          fi
+
           if [ -n "$OPENAI_API_KEY" ]; then
             supabase secrets set OPENAI_API_KEY="$OPENAI_API_KEY" --project-ref "$PROJECT_REF"
             supabase secrets set OPENAI_MODEL="gpt-4o" --project-ref "$PROJECT_REF"

@@ -20,11 +20,19 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          set -euo pipefail
+          CURL_EXIT=0
+          RESPONSE=$(curl --retry 3 --retry-all-errors --retry-delay 10 --connect-timeout 10 --max-time 300 -sS -w "\n%{http_code}" -X POST \
             "${{ secrets.SUPABASE_URL }}/functions/v1/ml-training" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
-            -d '{"triggered_by": "github-actions"}')
+            -d '{"triggered_by": "github-actions"}' 2>&1) || CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "❌ curl failed (exit=$CURL_EXIT)"
+            echo "$RESPONSE"
+            exit 1
+          fi
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
           BODY=$(echo "$RESPONSE" | sed '$d')

@@ -1,10 +1,44 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
+let SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+// NOTE:
+// If required env is missing, creating the client with empty values can crash at runtime (WORKER_ERROR).
+// We initialize with safe placeholders and, if needed, can temporarily source the key from Authorization header.
+let supabase = createClient(
+  SUPABASE_URL || "http://127.0.0.1",
+  SUPABASE_SERVICE_ROLE_KEY || "invalid"
+);
+
+function missingSupabaseEnv(): string[] {
+  const missing: string[] = [];
+  if (!SUPABASE_URL) missing.push("SUPABASE_URL");
+  if (!SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
+  return missing;
+}
+
+function ensureSupabaseForRequest(req: Request): { ok: true; keySource: "env" | "authorization" } | { ok: false; missing: string[] } {
+  if (!SUPABASE_URL) {
+    return { ok: false, missing: missingSupabaseEnv() };
+  }
+
+  if (SUPABASE_SERVICE_ROLE_KEY) {
+    return { ok: true, keySource: "env" };
+  }
+
+  const auth = req.headers.get("authorization") ?? "";
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  if (!bearer) {
+    return { ok: false, missing: missingSupabaseEnv() };
+  }
+
+  // Use the Authorization bearer token as the Supabase key (GitHub Actions already sends the service role key).
+  SUPABASE_SERVICE_ROLE_KEY = bearer;
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  return { ok: true, keySource: "authorization" };
+}
 
 function corsHeaders() {
   return {
@@ -885,44 +919,71 @@ serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders() });
   }
+
+  const sb = ensureSupabaseForRequest(req);
+  if (!sb.ok) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        service: "ml-training",
+        error: "Missing required Supabase env",
+        missing: sb.missing,
+        hint: "Set Edge Function secrets (SUPABASE_SERVICE_ROLE_KEY) in Supabase, run the Deploy workflow, or call with Authorization: Bearer <service role key>.",
+      }),
+      { status: 500, headers: corsHeaders() }
+    );
+  }
   
   if (req.method === "GET") {
     // ヘルスチェック & 最新の学習状況
-    const { data: latestTraining } = await supabase
-      .from("ml_training_history")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .single();
-    
-    const { count: activePatterns } = await supabase
-      .from("ml_patterns")
-      .select("*", { count: "exact", head: true })
-      .eq("is_active", true);
-    
-    const { count: activeRecommendations } = await supabase
-      .from("ml_recommendations")
-      .select("*", { count: "exact", head: true })
-      .eq("status", "active");
-    
-    return new Response(
-      JSON.stringify({
-        ok: true,
-        service: "ml-training",
-        version: "1.0.0",
-        active_patterns: activePatterns || 0,
-        active_recommendations: activeRecommendations || 0,
-        latest_training: latestTraining
-          ? {
-              date: latestTraining.created_at,
-              complete_trades: latestTraining.complete_trades_count,
-              patterns_discovered: latestTraining.patterns_discovered,
-              overall_win_rate: latestTraining.overall_win_rate,
-            }
-          : null,
-      }),
-      { status: 200, headers: corsHeaders() }
-    );
+    try {
+      const { data: latestTraining } = await supabase
+        .from("ml_training_history")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .single();
+      
+      const { count: activePatterns } = await supabase
+        .from("ml_patterns")
+        .select("*", { count: "exact", head: true })
+        .eq("is_active", true);
+      
+      const { count: activeRecommendations } = await supabase
+        .from("ml_recommendations")
+        .select("*", { count: "exact", head: true })
+        .eq("status", "active");
+      
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          service: "ml-training",
+          version: "1.0.0",
+          active_patterns: activePatterns || 0,
+          active_recommendations: activeRecommendations || 0,
+          latest_training: latestTraining
+            ? {
+                date: latestTraining.created_at,
+                complete_trades: latestTraining.complete_trades_count,
+                patterns_discovered: latestTraining.patterns_discovered,
+                overall_win_rate: latestTraining.overall_win_rate,
+              }
+            : null,
+        }),
+        { status: 200, headers: corsHeaders() }
+      );
+    } catch (error) {
+      console.error("[ML] GET health error:", error);
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          service: "ml-training",
+          error: "Health check failed",
+          message: error instanceof Error ? error.message : String(error),
+        }),
+        { status: 500, headers: corsHeaders() }
+      );
+    }
   }
   
   if (req.method === "POST") {
@@ -940,12 +1001,16 @@ serve(async (req: Request) => {
       console.error("[ML] Training error:", error);
       
       // エラーを履歴に記録
-      await supabase.from("ml_training_history").insert({
-        training_type: "pattern_extraction",
-        status: "failed",
-        error_message: error instanceof Error ? error.message : String(error),
-        triggered_by: "manual",
-      });
+      try {
+        await supabase.from("ml_training_history").insert({
+          training_type: "pattern_extraction",
+          status: "failed",
+          error_message: error instanceof Error ? error.message : String(error),
+          triggered_by: "manual",
+        });
+      } catch (insertError) {
+        console.error("[ML] Failed to write training history:", insertError);
+      }
       
       return new Response(
         JSON.stringify({

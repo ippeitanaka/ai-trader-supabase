@@ -37,8 +37,9 @@ jobs:
 
           # Fail fast and avoid hanging
           set -euo pipefail
-          
-          RESPONSE=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" -X POST \
+
+          CURL_EXIT=0
+          RESPONSE=$(curl --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 10 --max-time 90 -sS -w "\n%{http_code}" -X POST \
             "${{ secrets.SUPABASE_URL }}/functions/v1/ai-trader" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
@@ -78,7 +79,13 @@ jobs:
                 "ichimoku_score": 0.5
               },
               "test_mode": true
-            }')
+            }' 2>&1) || CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "❌ curl failed (exit=$CURL_EXIT)"
+            echo "$RESPONSE"
+            exit 1
+          fi
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -104,7 +111,8 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           
           set -euo pipefail
-          RESPONSE=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" -X POST \
+          CURL_EXIT=0
+          RESPONSE=$(curl --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 10 --max-time 120 -sS -w "\n%{http_code}" -X POST \
             "${{ secrets.SUPABASE_URL }}/functions/v1/ai-trader" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
@@ -144,7 +152,13 @@ jobs:
                 "ichimoku_score": -0.5
               },
               "test_mode": true
-            }')
+            }' 2>&1) || CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "❌ curl failed (exit=$CURL_EXIT)"
+            echo "$RESPONSE"
+            exit 1
+          fi
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -174,10 +188,17 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           
           set -euo pipefail
-          RESPONSE=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" -X GET \
+          CURL_EXIT=0
+          RESPONSE=$(curl --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 10 --max-time 60 -sS -w "\n%{http_code}" -X GET \
             "${{ secrets.SUPABASE_URL }}/functions/v1/ml-training" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
-            -H "Content-Type: application/json")
+            -H "Content-Type: application/json" 2>&1) || CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "❌ curl failed (exit=$CURL_EXIT)"
+            echo "$RESPONSE"
+            exit 1
+          fi
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -206,7 +227,8 @@ jobs:
 
           # ea-log requires: sym, and at least one of (action/trade_decision/win_prob)
           set -euo pipefail
-          RESPONSE=$(curl --connect-timeout 10 --max-time 30 -s -w "\n%{http_code}" -X POST \
+          CURL_EXIT=0
+          RESPONSE=$(curl --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 10 --max-time 60 -sS -w "\n%{http_code}" -X POST \
             "${{ secrets.SUPABASE_URL }}/functions/v1/ea-log" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
             -H "Content-Type: application/json" \
@@ -220,7 +242,13 @@ jobs:
               \"ai_reasoning\": \"Health check from GitHub Actions\",\
               \"caller\": \"system-health-check\",\
               \"instance\": \"github-actions\"\
-            }")
+            }" 2>&1) || CURL_EXIT=$?
+
+          if [ "$CURL_EXIT" -ne 0 ]; then
+            echo "❌ curl failed (exit=$CURL_EXIT)"
+            echo "$RESPONSE"
+            exit 1
+          fi
           
           HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
           BODY=$(echo "$RESPONSE" | sed '$d')
