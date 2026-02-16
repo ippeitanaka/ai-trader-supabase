@@ -1210,7 +1210,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
 // ea-logに詳細記録（トレード判定情報含む）
 // dir: 実行方向（ai.action など）
 // tech_dir: テクニカル起点の方向（検証用）
-void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,const string trade_decision,bool threshold_met,int current_pos,ulong ticket=0,int tech_dir=0)
+void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,const string trade_decision,bool threshold_met,int current_pos,ulong ticket=0,int tech_dir=0,double executed_lot=0.0)
 {
    string logPayload="{"+
    "\"at\":\""+TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS)+"\","+
@@ -1237,7 +1237,11 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
    "\"trade_decision\":\""+JsonEscape(trade_decision)+"\","+
    "\"threshold_met\":"+(threshold_met?"true":"false")+","+
    "\"current_positions\":"+IntegerToString(current_pos)+","+
+   "\"lot_multiplier\":"+DoubleToString(ai.lot_multiplier,2)+","+
+   "\"lot_level\":"+(ai.lot_level!=""?"\""+JsonEscape(ai.lot_level)+"\"":"null")+","+
+   "\"lot_reason\":"+(ai.lot_reason!=""?"\""+JsonEscape(ai.lot_reason)+"\"":"null")+","+
    (ticket>0?"\"order_ticket\":\""+ULongToString(ticket)+"\",":"")+
+   (executed_lot>0?"\"executed_lot\":"+DoubleToString(executed_lot,2)+",":"")+
    "\"offset_factor\":"+DoubleToString(ai.offset_factor,3)+","+
    "\"expiry_minutes\":"+IntegerToString(ai.expiry_min)+","+
    "\"reason\":\""+JsonEscape(reason)+"\","+
@@ -1249,7 +1253,7 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
 }
 
 // ===== AI Signals記録（ML学習用） =====
-long RecordSignal(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,ulong ticket=0,double entry_price=0,bool mark_filled=false,bool is_virtual=false,double planned_entry=0,double planned_sl=0,double planned_tp=0,int planned_order_type=-1,int expiry_minutes=0)
+long RecordSignal(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,ulong ticket=0,double entry_price=0,bool mark_filled=false,bool is_virtual=false,double planned_entry=0,double planned_sl=0,double planned_tp=0,int planned_order_type=-1,int expiry_minutes=0,double lot_multiplier=1.0,const string lot_level="",const string lot_reason="",double executed_lot=0.0)
 {
    // レジーム判定用の追加特徴量（QueryAIと同様にEA側で計算して保存する）
    ENUM_TIMEFRAMES tf=(tf_label=="M15")?TF_Entry:TF_Recheck;
@@ -1362,6 +1366,10 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"ml_pattern_id\":"+(ai.ml_pattern_id>0?IntegerToString(ai.ml_pattern_id):"null")+","+
    "\"ml_pattern_name\":\""+(ai.ml_pattern_name!=""?JsonEscape(ai.ml_pattern_name):"null")+"\","+
    "\"ml_pattern_confidence\":"+(ai.ml_pattern_confidence>0?DoubleToString(ai.ml_pattern_confidence,2):"null")+","+
+   "\"lot_multiplier\":"+DoubleToString(lot_multiplier,2)+","+
+   "\"lot_level\":"+(lot_level!=""?"\""+JsonEscape(lot_level)+"\"":"null")+","+
+   "\"lot_reason\":"+(lot_reason!=""?"\""+JsonEscape(lot_reason)+"\"":"null")+","+
+   "\"executed_lot\":"+(executed_lot>0?DoubleToString(executed_lot,2):"null")+","+
    "\"is_virtual\":"+(is_virtual?"true":"false")+"";
 
    if(planned_entry>0) payload+=",\"planned_entry_price\":"+DoubleToString(planned_entry,_Digits);
@@ -1712,8 +1720,8 @@ void OnM15NewBar()
          g_trackedFillLastTry=0;
 
          // ai_signals.order_ticket is the order ticket key
-         RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min);
-         LogAIDecision("M15",decision_dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,"EXECUTED_MARKET",threshold_met,posCount,ordTicket,tech_dir);
+         RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,ai.lot_multiplier,ai.lot_level,ai.lot_reason,finalLots);
+         LogAIDecision("M15",decision_dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai,"EXECUTED_MARKET",threshold_met,posCount,ordTicket,tech_dir,finalLots);
          SafePrint(StringFormat("[M15] market executed dir=%d prob=%.0f%% lot=%.2f",t_exec.dir,ai.win_prob*100,finalLots));
       }else{
          SafePrint("[M15] market execution failed");

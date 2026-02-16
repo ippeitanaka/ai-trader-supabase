@@ -329,6 +329,12 @@ interface AISignalEntry {
   // manual trade
   lot_size?: number;
 
+  // lot sizing telemetry
+  lot_multiplier?: number | null;
+  lot_level?: string | null;
+  lot_reason?: string | null;
+  executed_lot?: number | null;
+
   // Virtual (paper/shadow) trade support
   is_virtual?: boolean | null;
   planned_entry_price?: number | null;
@@ -676,6 +682,12 @@ serve(async (req: Request) => {
         // NOTE: lot_size is numeric(10,2) in some schemas
         lot_size: pgNumeric10_2(body.lot_size) ?? undefined,
 
+        // lot sizing telemetry
+        lot_multiplier: pgNumeric5_2(body.lot_multiplier) ?? null,
+        lot_level: safeText(body.lot_level),
+        lot_reason: safeText(body.lot_reason),
+        executed_lot: pgNumeric10_2(body.executed_lot) ?? null,
+
         // Virtual (paper/shadow) trade support
         is_virtual: body.is_virtual ?? false,
         planned_entry_price: body.planned_entry_price ?? null,
@@ -716,6 +728,10 @@ serve(async (req: Request) => {
           delete legacyEntry.regime;
           delete legacyEntry.strategy;
           delete legacyEntry.regime_confidence;
+          delete legacyEntry.lot_multiplier;
+          delete legacyEntry.lot_level;
+          delete legacyEntry.lot_reason;
+          delete legacyEntry.executed_lot;
 
           const { data: legacyData, error: legacyError } = await supabase
             .from("ai_signals")

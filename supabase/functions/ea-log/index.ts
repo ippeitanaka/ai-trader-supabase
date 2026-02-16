@@ -21,6 +21,10 @@ interface EALogEntry {
   sell_win_prob?: number;        // dir=0両方向評価のSELL勝率（0-1）
   trade_decision?: string;       // 実際の取引状況
   win_prob?: number;             // AIの算出した勝率
+  lot_multiplier?: number;       // AI/ML suggested lot multiplier
+  lot_level?: string;            // Lot sizing level label
+  lot_reason?: string;           // Reason for lot multiplier
+  executed_lot?: number;         // Final lot sent to broker
   ai_reasoning?: string;         // AIの判断根拠
   order_ticket?: number;         // 注文番号
 }
@@ -56,6 +60,10 @@ interface EALogInput {
   trade_decision?: string;
   threshold_met?: boolean;
   current_positions?: number;
+  lot_multiplier?: number;
+  lot_level?: string;
+  lot_reason?: string;
+  executed_lot?: number;
   order_ticket?: number;
   ema25s2?: number;
   ma100?: number;
@@ -310,6 +318,10 @@ serve(async (req: Request) => {
       sell_win_prob: body.sell_win_prob !== undefined ? Number(body.sell_win_prob) : undefined,
       trade_decision: body.trade_decision || undefined,
       win_prob: body.win_prob !== undefined ? Number(body.win_prob) : undefined,
+      lot_multiplier: body.lot_multiplier !== undefined ? Number(body.lot_multiplier) : undefined,
+      lot_level: body.lot_level || undefined,
+      lot_reason: body.lot_reason || undefined,
+      executed_lot: body.executed_lot !== undefined ? Number(body.executed_lot) : undefined,
       ai_reasoning: normalizedReasoning,
       order_ticket: body.order_ticket !== undefined ? Number(body.order_ticket) : undefined,
     };

@@ -50,6 +50,31 @@ select
 from ai_signals
 where created_at >= now() - interval '24 hours';
 
+-- 0.4) Lot sizing telemetry (last 24h)
+-- Requires migration: 20260215_001_add_lot_sizing_telemetry.sql
+select
+  count(*) as executed_events,
+  count(*) filter (where lot_multiplier is not null) as with_lot_multiplier,
+  count(*) filter (where lot_multiplier > 1.0) as boosted_events,
+  round(avg(lot_multiplier)::numeric, 3) as avg_lot_multiplier,
+  round(avg(executed_lot)::numeric, 3) as avg_executed_lot,
+  max(created_at) as last_seen
+from "ea-log"
+where created_at >= now() - interval '24 hours'
+  and trade_decision in ('EXECUTED','EXECUTED_MARKET');
+
+select
+  count(*) as real_signals,
+  count(*) filter (where lot_multiplier is not null) as with_lot_multiplier,
+  count(*) filter (where lot_multiplier > 1.0) as boosted_signals,
+  round(avg(lot_multiplier)::numeric, 3) as avg_lot_multiplier,
+  round(avg(executed_lot)::numeric, 3) as avg_executed_lot,
+  max(created_at) as last_seen
+from ai_signals
+where created_at >= now() - interval '24 hours'
+  and coalesce(is_virtual,false)=false
+  and actual_result in ('FILLED','WIN','LOSS');
+
 -- 0.3) ai_signals: if you persist GATE suffix into reason, you can verify it here (optional)
 select
   count(*) as signals,
