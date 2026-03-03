@@ -243,6 +243,11 @@ function getMlMode(): MlMode {
   return "log_only";
 }
 
+function isEmergencyStopEnabled(): boolean {
+  const raw = (Deno.env.get("AI_TRADER_EMERGENCY_STOP") ?? "off").toLowerCase().trim();
+  return raw === "on" || raw === "true" || raw === "1" || raw === "enabled";
+}
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 export interface TradeRequest {
@@ -1787,6 +1792,7 @@ serve(async (req: Request) => {
       : "NOT SET";
 
     const mlMode = getMlMode();
+    const emergencyStopEnabled = isEmergencyStopEnabled();
 
     // Compute learning phase in the same way as POST (lightweight count query)
     const { count: completedTradesCount } = await supabase
@@ -1815,6 +1821,7 @@ serve(async (req: Request) => {
         ml_mode: mlMode,
         ml_phase: learningPhase,
         ml_applied_to_decisions: mlAppliedToDecisions,
+        emergency_stop_enabled: emergencyStopEnabled,
         ml_completed_trades: totalCompletedTrades,
         openai_key_status: keyStatus,
         fallback_available: true,
@@ -1885,6 +1892,31 @@ serve(async (req: Request) => {
     }
     
     const tradeReq: TradeRequest = body;
+
+    // Emergency stop: force no-new-position behavior regardless of model output.
+    // Existing positions are not closed here; this guard only blocks new execution decisions.
+    if (isEmergencyStopEnabled()) {
+      const requestedDir = tradeReq?.ea_suggestion?.dir;
+      const suggested_dir = requestedDir === 1 || requestedDir === -1 ? requestedDir : undefined;
+      const methodReason = "EMERGENCY_STOP: forced action=0 by AI_TRADER_EMERGENCY_STOP";
+
+      const response: TradeResponse = {
+        win_prob: 0.5,
+        action: 0,
+        suggested_dir,
+        offset_factor: 0.2,
+        expiry_minutes: 90,
+        confidence: "low",
+        reasoning: methodReason,
+        skip_reason: "emergency_stop",
+        entry_method: "market",
+        entry_params: null,
+        method_selected_by: "Manual",
+        method_reason: methodReason,
+      };
+
+      return new Response(JSON.stringify(response), { status: 200, headers: corsHeaders() });
+    }
 
     // Input sanity guard: if EA payload is corrupted (missing/zeroed indicators), never execute.
     // Return a normal 200 response (action=0) so EA can continue operating without hard failures.

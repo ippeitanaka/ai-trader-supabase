@@ -20,7 +20,21 @@ AI駆動の自動トレーディングシステム（MT5 EA + Supabase Edge Func
 ./check_winrate_improvement.sh # 勝率確認
 ./verify_sma_working.sh        # SMA200/800確認
 ./ml_training.sh               # ML学習実行
+DRY_RUN=true RETENTION_DAYS=120 SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... bash scripts/monthly_cleanup_ea_log.sh # ea-log月次削除の事前確認
 ```
+
+## 🧹 月次クリーンアップ（ea-logのみ）
+
+- GitHub Actions: `.github/workflows/ea-log-monthly-cleanup.yml`
+- 既定: 毎月1日 UTC 02:15（JST 11:15）に `public."ea-log"` の120日超のみ削除
+- `ai_signals` は対象外（ML学習・確定申告用の実取引データを保持）
+
+## 🚨 緊急停止（新規ポジション停止/再開）
+
+- GitHub Actions: `.github/workflows/emergency-stop.yml`
+- 手動実行で `mode=stop` を選ぶと、新規発注判定を停止（`ai-trader` が `action=0` を返却）
+- `mode=resume` で通常運用に復帰
+- 注: 既存ポジションの強制クローズは対象外（新規停止専用）
 
 ## 📁 ディレクトリ構造
 

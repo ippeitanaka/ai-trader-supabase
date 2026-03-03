@@ -1,0 +1,46 @@
+name: EA Log Monthly Cleanup
+
+on:
+  schedule:
+    - cron: '15 2 1 * *' # 毎月1日 UTC 02:15 (JST 11:15)
+  workflow_dispatch:
+    inputs:
+      retention_days:
+        description: 'Delete ea-log rows older than this many days (>=30)'
+        required: false
+        default: '120'
+      dry_run:
+        description: 'If true, only report counts without deleting'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ea-log-monthly-cleanup
+      cancel-in-progress: false
+    steps:
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🧹 Cleanup ea-log only
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RETENTION_DAYS: ${{ github.event.inputs.retention_days || '120' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          bash scripts/monthly_cleanup_ea_log.sh
+
+      - name: ✅ Summary
+        if: success()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ EA Log Monthly Cleanup completed"
+          echo "実行時刻: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "実行時刻 (JST): $(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S JST')"
+          echo "対象: public.\"ea-log\" のみ"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

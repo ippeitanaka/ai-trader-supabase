@@ -88,6 +88,25 @@ GitHub Repository → Settings → Secrets and variables → Actions → New rep
 - **機能**: ML学習の自動実行
 - **必要なシークレット**: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
 
+### 4. EA Log Monthly Cleanup (`.github/workflows/ea-log-monthly-cleanup.yml`)
+- **トリガー**: 毎月1日 UTC 2:15（JST 11:15）、または手動実行
+- **機能**: `public."ea-log"` のみを保持期間（既定120日）で自動削除
+- **安全設計**:
+   - `ai_signals` には触れない（ML学習・確定申告用データ保護）
+   - `RETENTION_DAYS < 30` は実行拒否
+   - 手動実行時は `dry_run=true` で件数確認のみ可能
+- **必要なシークレット**: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
+
+### 5. Emergency Stop Control (`.github/workflows/emergency-stop.yml`)
+- **トリガー**: 手動実行のみ（`workflow_dispatch`）
+- **機能**: 新規ポジション停止（`stop`）/再開（`resume`）を即時切替
+- **動作**:
+   - Supabase Secret `AI_TRADER_EMERGENCY_STOP` を `on/off` に更新
+   - 反映を確実にするため `ai-trader` Function を再デプロイ
+   - `stop` 時: `ai-trader` は `action=0` を返し新規発注を停止
+   - `resume` 時: 通常判定へ復帰
+- **必要なシークレット**: `SUPABASE_ACCESS_TOKEN`, `SUPABASE_PROJECT_REF`
+
 ---
 
 ## トラブルシューティング
