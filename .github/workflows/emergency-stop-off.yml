@@ -1,22 +1,10 @@
-name: Emergency Stop Control
+name: Emergency Stop OFF (Mobile)
 
 on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Select operation: stop or resume'
-        required: true
-        type: choice
-        options:
-          - stop
-          - resume
-      reason:
-        description: 'Optional operation note (audit purpose)'
-        required: false
-        default: ''
 
 jobs:
-  emergency-stop-control:
+  emergency-stop-off:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
@@ -56,29 +44,16 @@ jobs:
           set -euo pipefail
           supabase link --project-ref "$PROJECT_REF"
 
-      - name: 🚨 Toggle emergency stop
+      - name: ✅ Disable emergency stop (resume)
         env:
-          MODE: ${{ github.event.inputs.mode }}
-          REASON: ${{ github.event.inputs.reason }}
           PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: |
           set -euo pipefail
 
-          case "$MODE" in
-            stop)
-              FLAG="on"
-              LABEL="EMERGENCY STOP ENABLED"
-              ;;
-            resume)
-              FLAG="off"
-              LABEL="EMERGENCY STOP DISABLED (RESUMED)"
-              ;;
-            *)
-              echo "❌ Invalid mode: $MODE"
-              exit 1
-              ;;
-          esac
+          FLAG="off"
+          LABEL="EMERGENCY STOP DISABLED (RESUMED)"
+          REASON="mobile-no-input-resume"
 
           supabase secrets set AI_TRADER_EMERGENCY_STOP="$FLAG" --project-ref "$PROJECT_REF"
 
@@ -87,7 +62,7 @@ jobs:
 
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "${LABEL}"
-          echo "mode=${MODE}"
+          echo "mode=resume"
           echo "AI_TRADER_EMERGENCY_STOP=${FLAG}"
           echo "reason=${REASON}"
           echo "time_utc=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
