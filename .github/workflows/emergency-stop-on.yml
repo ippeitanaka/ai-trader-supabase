@@ -68,3 +68,29 @@ jobs:
           echo "time_utc=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "time_jst=$(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S JST')"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: 🔍 Verify emergency stop status
+        env:
+          PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+        run: |
+          set -euo pipefail
+
+          EXPECTED=true
+          URL="https://${PROJECT_REF}.supabase.co/functions/v1/ai-trader"
+
+          for i in $(seq 1 12); do
+            RESP=$(curl -fsS "$URL") || true
+            FLAG=$(printf '%s' "$RESP" | jq -r '.emergency_stop_enabled // "unknown"' 2>/dev/null || echo "unknown")
+
+            if [ "$FLAG" = "$EXPECTED" ]; then
+              echo "✅ emergency_stop_enabled=${FLAG} verified (attempt=${i})"
+              exit 0
+            fi
+
+            echo "⏳ waiting for runtime refresh (attempt=${i}, got=${FLAG})"
+            sleep 5
+          done
+
+          echo "❌ emergency stop verification failed. expected=${EXPECTED}, got=${FLAG}"
+          echo "Last response: ${RESP}"
+          exit 1

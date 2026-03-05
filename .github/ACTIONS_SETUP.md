@@ -97,12 +97,13 @@ GitHub Repository → Settings → Secrets and variables → Actions → New rep
    - 手動実行時は `dry_run=true` で件数確認のみ可能
 - **必要なシークレット**: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
 
-### 5. Emergency Stop Control (`.github/workflows/emergency-stop.yml`)
+### 5. Emergency Stop Control (`.github/workflows/emergency-stop-on.yml`, `.github/workflows/emergency-stop-off.yml`)
 - **トリガー**: 手動実行のみ（`workflow_dispatch`）
 - **機能**: 新規ポジション停止（`stop`）/再開（`resume`）を即時切替
 - **動作**:
    - Supabase Secret `AI_TRADER_EMERGENCY_STOP` を `on/off` に更新
    - 反映を確実にするため `ai-trader` Function を再デプロイ
+   - 再デプロイ後に `GET /functions/v1/ai-trader` の `emergency_stop_enabled` を自動検証
    - `stop` 時: `ai-trader` は `action=0` を返し新規発注を停止
    - `resume` 時: 通常判定へ復帰
 - **必要なシークレット**: `SUPABASE_ACCESS_TOKEN`, `SUPABASE_PROJECT_REF`

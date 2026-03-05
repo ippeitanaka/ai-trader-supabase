@@ -431,6 +431,61 @@ type InputSanityIssue = {
   value?: unknown;
 };
 
+function normalizeTradeRequest(body: any): TradeRequest {
+  const req = (body ?? {}) as TradeRequest;
+
+  const isFiniteNumber = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+  const isSide = (v: unknown): v is -1 | 0 | 1 => v === -1 || v === 0 || v === 1;
+  const fallbackPrice = isFiniteNumber(req.price) && req.price > 0 ? req.price : 1;
+
+  const macdRaw: any = req.macd ?? {};
+  const macd = {
+    main: isFiniteNumber(macdRaw.main) ? macdRaw.main : 0,
+    signal: isFiniteNumber(macdRaw.signal) ? macdRaw.signal : 0,
+    histogram: isFiniteNumber(macdRaw.histogram) ? macdRaw.histogram : 0,
+    cross: isSide(macdRaw.cross) ? macdRaw.cross : 0,
+  };
+
+  const ichRaw: any = req.ichimoku ?? {};
+  const ichimoku = {
+    tenkan: isFiniteNumber(ichRaw.tenkan) && ichRaw.tenkan > 0 ? ichRaw.tenkan : fallbackPrice,
+    kijun: isFiniteNumber(ichRaw.kijun) && ichRaw.kijun > 0 ? ichRaw.kijun : fallbackPrice,
+    senkou_a: isFiniteNumber(ichRaw.senkou_a) && ichRaw.senkou_a > 0 ? ichRaw.senkou_a : fallbackPrice,
+    senkou_b: isFiniteNumber(ichRaw.senkou_b) && ichRaw.senkou_b > 0 ? ichRaw.senkou_b : fallbackPrice,
+    chikou: isFiniteNumber(ichRaw.chikou) && ichRaw.chikou > 0 ? ichRaw.chikou : fallbackPrice,
+    tk_cross: isSide(ichRaw.tk_cross) ? ichRaw.tk_cross : 0,
+    cloud_color: isSide(ichRaw.cloud_color) ? ichRaw.cloud_color : 0,
+    price_vs_cloud: isSide(ichRaw.price_vs_cloud) ? ichRaw.price_vs_cloud : 0,
+  };
+
+  // Optional regime fields: drop invalid values instead of hard-failing.
+  const atr_norm =
+    isFiniteNumber(req.atr_norm) && req.atr_norm > 0 && req.atr_norm <= 0.2
+      ? req.atr_norm
+      : undefined;
+  const adx =
+    isFiniteNumber(req.adx) && req.adx >= 0 && req.adx <= 100
+      ? req.adx
+      : undefined;
+  const di_plus = isFiniteNumber(req.di_plus) ? req.di_plus : undefined;
+  const di_minus = isFiniteNumber(req.di_minus) ? req.di_minus : undefined;
+  const bb_width =
+    isFiniteNumber(req.bb_width) && req.bb_width > 0 && req.bb_width <= 0.5
+      ? req.bb_width
+      : undefined;
+
+  return {
+    ...req,
+    macd,
+    ichimoku,
+    atr_norm,
+    adx,
+    di_plus,
+    di_minus,
+    bb_width,
+  };
+}
+
 function assessInputSanity(req: TradeRequest): InputSanityIssue[] {
   const issues: InputSanityIssue[] = [];
 
@@ -1891,32 +1946,8 @@ serve(async (req: Request) => {
       );
     }
     
-    const tradeReq: TradeRequest = body;
-
-    // Emergency stop: force no-new-position behavior regardless of model output.
-    // Existing positions are not closed here; this guard only blocks new execution decisions.
-    if (isEmergencyStopEnabled()) {
-      const requestedDir = tradeReq?.ea_suggestion?.dir;
-      const suggested_dir = requestedDir === 1 || requestedDir === -1 ? requestedDir : undefined;
-      const methodReason = "EMERGENCY_STOP: forced action=0 by AI_TRADER_EMERGENCY_STOP";
-
-      const response: TradeResponse = {
-        win_prob: 0.5,
-        action: 0,
-        suggested_dir,
-        offset_factor: 0.2,
-        expiry_minutes: 90,
-        confidence: "low",
-        reasoning: methodReason,
-        skip_reason: "emergency_stop",
-        entry_method: "market",
-        entry_params: null,
-        method_selected_by: "Manual",
-        method_reason: methodReason,
-      };
-
-      return new Response(JSON.stringify(response), { status: 200, headers: corsHeaders() });
-    }
+    const tradeReq: TradeRequest = normalizeTradeRequest(body);
+    const emergencyStopEnabled = isEmergencyStopEnabled();
 
     // Input sanity guard: if EA payload is corrupted (missing/zeroed indicators), never execute.
     // Return a normal 200 response (action=0) so EA can continue operating without hard failures.
@@ -1985,6 +2016,22 @@ serve(async (req: Request) => {
 
     // Apply hard guards (double-safety with EA-side rules)
     response = applyExecutionGuards(tradeReq, response);
+
+    // Emergency stop: keep AI inference (win_prob/reasoning) for monitoring/learning,
+    // but force execution decision to no-trade.
+    if (emergencyStopEnabled) {
+      const stopReason = "EMERGENCY_STOP: forced action=0 by AI_TRADER_EMERGENCY_STOP";
+      const prevSkip = typeof (response as any).skip_reason === "string" ? (response as any).skip_reason : "";
+      const prevReasoning = typeof (response as any).reasoning === "string" ? (response as any).reasoning : "";
+      const prevMethodReason = typeof (response as any).method_reason === "string" ? (response as any).method_reason : "";
+
+      (response as any).action = 0;
+      (response as any).skip_reason = prevSkip ? `${prevSkip}|emergency_stop` : "emergency_stop";
+      (response as any).reasoning = prevReasoning ? `${prevReasoning} | ${stopReason}` : stopReason;
+      (response as any).method_reason = prevMethodReason ? `${prevMethodReason} | ${stopReason}` : stopReason;
+
+      console.warn(`[ai-trader] 🚨 ${stopReason}`);
+    }
 
     // Attach market regime classification for logging/analysis.
     // Keep this deterministic so it exists even when OpenAI is unavailable.
