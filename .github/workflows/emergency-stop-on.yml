@@ -80,7 +80,8 @@ jobs:
 
           for i in $(seq 1 12); do
             RESP=$(curl -fsS "$URL") || true
-            FLAG=$(printf '%s' "$RESP" | jq -r '.emergency_stop_enabled // "unknown"' 2>/dev/null || echo "unknown")
+            FLAG=$(printf '%s' "$RESP" | sed -n 's/.*"emergency_stop_enabled"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -n 1)
+            if [ -z "$FLAG" ]; then FLAG="unknown"; fi
 
             if [ "$FLAG" = "$EXPECTED" ]; then
               echo "✅ emergency_stop_enabled=${FLAG} verified (attempt=${i})"
