@@ -670,13 +670,15 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
   const calibrationOk = !calibrationRequired || debug.applied;
 
   const dir = (base.action === 1 || base.action === -1) ? base.action : 0;
-  const expected_value_r = computeExpectedValueR(calibrated, rt.rewardRR, rt.costR);
+  const rsiGuard = applyExtremeRsiPenalty({ req, dir, winProb: calibrated, costR: rt.costR });
+  const winProbFinal = rsiGuard.winProb;
+  const expected_value_r = computeExpectedValueR(winProbFinal, rt.rewardRR, rt.costR);
   const costOk = rt.costR <= maxCostR;
   const action =
     dir !== 0 &&
       costOk &&
       calibrationOk &&
-      calibrated >= action_gate_min_win_prob &&
+      winProbFinal >= action_gate_min_win_prob &&
       expected_value_r >= minEvR
       ? dir
       : 0;
@@ -687,7 +689,8 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     if (!calibrationOk) parts.push("calibration_not_applied");
     if (!costOk) parts.push("cost_too_high");
     if (expected_value_r < minEvR) parts.push("ev_below_min");
-    if (calibrated < action_gate_min_win_prob) parts.push("winprob_below_gate");
+    if (winProbFinal < action_gate_min_win_prob) parts.push("winprob_below_gate");
+    if (rsiGuard.applied) parts.push("extreme_rsi_penalty");
     if (parts.length > 0) skip_reason = skip_reason ? `${skip_reason}|${parts.join("+")}` : parts.join("+");
   }
 
@@ -700,14 +703,15 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
   const calTag = debug.applied
     ? `CAL(${debug.method}/${debug.scope} n=${debug.n}): raw=${round3(raw)}→${round3(calibrated)}`
     : "";
+  const rsiGuardTag = rsiGuard.guardTag;
 
   const baseReasoning = typeof base.reasoning === "string" ? base.reasoning.trim() : "";
-  const tags = [gateTag, calTag].filter((s) => s && s.trim().length > 0).join(" | ");
+  const tags = [gateTag, calTag, rsiGuardTag].filter((s) => s && s.trim().length > 0).join(" | ");
   const reasoning = baseReasoning ? `${tags} | ${baseReasoning}` : tags;
 
   return {
     ...base,
-    win_prob: round3(calibrated),
+    win_prob: round3(winProbFinal),
     action,
     expected_value_r,
     cost_r: round3(rt.costR),
@@ -755,6 +759,94 @@ function getAssumedCostR(): number {
   const v = Number(Deno.env.get("AI_TRADER_ASSUMED_COST_R") ?? 0.02);
   if (!Number.isFinite(v)) return 0.02;
   return Math.max(0.0, Math.min(0.5, Math.round(v * 1000) / 1000));
+}
+
+function getExtremeRsiLongThreshold(): number {
+  const v = Number(Deno.env.get("AI_TRADER_EXTREME_RSI_LONG") ?? 75);
+  if (!Number.isFinite(v)) return 75;
+  return Math.max(60, Math.min(95, Math.round(v)));
+}
+
+function getExtremeRsiShortThreshold(): number {
+  const v = Number(Deno.env.get("AI_TRADER_EXTREME_RSI_SHORT") ?? 25);
+  if (!Number.isFinite(v)) return 25;
+  return Math.max(5, Math.min(40, Math.round(v)));
+}
+
+function getExtremeRsiAdxThreshold(): number {
+  const v = Number(Deno.env.get("AI_TRADER_EXTREME_RSI_ADX_MIN") ?? 30);
+  if (!Number.isFinite(v)) return 30;
+  return Math.max(10, Math.min(60, Math.round(v)));
+}
+
+function getExtremeRsiLowCostRThreshold(): number {
+  const v = Number(Deno.env.get("AI_TRADER_EXTREME_RSI_COSTR_MAX") ?? 0.05);
+  if (!Number.isFinite(v)) return 0.05;
+  return Math.max(0.0, Math.min(0.2, Math.round(v * 1000) / 1000));
+}
+
+function getExtremeRsiPenalty(): number {
+  // Soft guard: reduce win_prob before gate check instead of hard-forcing action=0.
+  const v = Number(Deno.env.get("AI_TRADER_EXTREME_RSI_PENALTY") ?? 0.12);
+  if (!Number.isFinite(v)) return 0.12;
+  return Math.max(0.0, Math.min(0.5, Math.round(v * 1000) / 1000));
+}
+
+function applyExtremeRsiPenalty(opts: {
+  req: TradeRequest;
+  dir: number;
+  winProb: number;
+  costR: number;
+}): {
+  winProb: number;
+  applied: boolean;
+  allowByException: boolean;
+  guardTag: string;
+} {
+  const { req, dir } = opts;
+  const rsi = typeof req.rsi === "number" && Number.isFinite(req.rsi) ? req.rsi : null;
+  if (rsi === null || (dir !== 1 && dir !== -1)) {
+    return { winProb: opts.winProb, applied: false, allowByException: false, guardTag: "" };
+  }
+
+  const longExtreme = getExtremeRsiLongThreshold();
+  const shortExtreme = getExtremeRsiShortThreshold();
+  const contrarianExtreme = (dir === 1 && rsi >= longExtreme) || (dir === -1 && rsi <= shortExtreme);
+  if (!contrarianExtreme) {
+    return { winProb: opts.winProb, applied: false, allowByException: false, guardTag: "" };
+  }
+
+  const adxMin = getExtremeRsiAdxThreshold();
+  const adx = typeof req.adx === "number" && Number.isFinite(req.adx) ? req.adx : null;
+  const adxHigh = adx !== null && adx >= adxMin;
+
+  const pvc = req.ichimoku?.price_vs_cloud;
+  const cloudAligned = (dir === 1 && pvc === 1) || (dir === -1 && pvc === -1);
+
+  const lowCostMax = getExtremeRsiLowCostRThreshold();
+  const costLow = Number.isFinite(opts.costR) && opts.costR <= lowCostMax;
+
+  const allowByException = adxHigh && cloudAligned && costLow;
+  if (allowByException) {
+    return {
+      winProb: opts.winProb,
+      applied: false,
+      allowByException: true,
+      guardTag: `RSI_GUARD(exception rsi=${round3(rsi)} adx=${adx !== null ? round3(adx) : "na"} cloud=${pvc ?? "na"} costR=${round3(opts.costR)})`,
+    };
+  }
+
+  const penalty = getExtremeRsiPenalty();
+  const penalized = clampWinProb(opts.winProb - penalty);
+  return {
+    winProb: penalized,
+    applied: true,
+    allowByException: false,
+    guardTag:
+      `RSI_GUARD(penalized ${round3(opts.winProb)}→${round3(penalized)} ` +
+      `rsi=${round3(rsi)} dir=${dir} adx=${adx !== null ? round3(adx) : "na"} ` +
+      `cloud=${pvc ?? "na"} costR=${round3(opts.costR)})`,
+  };
 }
 
 type AiConfigRuntimeRow = {
@@ -1669,6 +1761,8 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     const maxCostR = getMaxCostR();
     // Respect EA/configured minimum, never execute below it.
     const action_gate_min_win_prob = Math.max(minWinProbFloor, client_min_win_prob);
+    const rsiGuard = applyExtremeRsiPenalty({ req, dir, winProb: win_prob, costR: rt.costR });
+    win_prob = rsiGuard.winProb;
     const expected_value_r = computeExpectedValueR(win_prob, rt.rewardRR, rt.costR);
     let skip_reason = typeof aiResult.skip_reason === "string" ? aiResult.skip_reason : "";
     const entry_method: "market" = "market";
@@ -1691,8 +1785,9 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     const calTag = cal.debug.applied
       ? `CAL(${cal.debug.method}/${cal.debug.scope} n=${cal.debug.n}): raw=${round3(raw_win_prob)}→${round3(win_prob)}`
       : "";
+    const rsiGuardTag = rsiGuard.guardTag;
 
-    const tags = [gateTag, calTag].filter((s) => s && s.trim().length > 0).join(" | ");
+    const tags = [gateTag, calTag, rsiGuardTag].filter((s) => s && s.trim().length > 0).join(" | ");
 
     const costOk = rt.costR <= maxCostR;
     const willExecute =
@@ -1706,6 +1801,7 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       if (!costOk) parts.push("cost_too_high");
       if (expected_value_r < minEvR) parts.push("ev_below_min");
       if (win_prob < action_gate_min_win_prob) parts.push("winprob_below_gate");
+      if (rsiGuard.applied) parts.push("extreme_rsi_penalty");
       if (parts.length > 0) skip_reason = skip_reason ? `${skip_reason}|${parts.join("+")}` : parts.join("+");
     }
 
