@@ -48,6 +48,13 @@ input bool   DebugLogs           = true;
 input int    LogCooldownSec      = 30;  // 0=全出力, >0=間引き, -1=完全OFF
 input int    CooldownAfterCloseMin = 30; // TP/SL後のクールダウン（分）
 
+// ===== H1 precheck tuning (market-only) =====
+// 0=OFF, 1=SOFT(逆方向かつ高確度のみブロック), 2=STRICT(方向/閾値を必須)
+input int    H1PrecheckMode      = 1;
+input double H1PrecheckMinProb   = 0.65;
+input double H1OppositeBlockProb = 0.78;
+input bool   H1FailOpen          = true;
+
 // ===== Virtual (paper/shadow) learning =====
 input bool   UseAIForDirection = false;   // true: dirはAIに委譲（サーバでBUY/SELL両方向評価）
 // Track selected SKIP reasons as paper trades and label TP/SL outcomes.
@@ -1631,6 +1638,52 @@ void OnM15NewBar()
       // 以降の注文・仮想・記録は方向を統一
       TechSignal t_exec=t; t_exec.dir=decision_dir;
       TechSignal t_plan=t; t_plan.dir=suggested_dir;
+
+      // market-only 運用向け H1 事前チェック（約定数を落としすぎないよう調整可能）
+      if(H1PrecheckMode>0)
+      {
+         TechSignal h1t=Evaluate(TF_Recheck);
+         int h1_tech_dir=(h1t.dir!=0?h1t.dir:decision_dir);
+         double h1_rsi=RSIv(PERIOD_H1,14,PRICE_CLOSE,0);
+         AIOut h1ai;
+         bool h1_ok=QueryAI("H1",h1_tech_dir,h1_rsi,h1t.atr,h1t.ref,h1t.reason,h1t.ichimoku_score,h1ai);
+         if(!h1_ok){
+            LogAIDecision("H1",0,h1_rsi,h1t.atr,h1t.ref,h1t.reason,h1ai,"H1_QUERY_FAIL",false,posCount,0,h1_tech_dir);
+            if(!H1FailOpen){
+               SafePrint("[M15] skip: H1 precheck query failed (fail-open=false)");
+               return;
+            }
+            SafePrint("[M15] H1 precheck query failed -> continue (fail-open)");
+         }
+         else
+         {
+            int h1_suggested_dir=(h1ai.suggested_dir!=0?h1ai.suggested_dir:h1ai.action);
+            bool h1_opposite=(h1_suggested_dir!=0 && h1_suggested_dir!=decision_dir);
+            bool h1_prob_ok=(h1ai.win_prob>=H1PrecheckMinProb);
+            bool block=false;
+
+            if(H1PrecheckMode==1)
+            {
+               // SOFT: 強い逆方向シグナルのときだけブロック
+               if(h1_opposite && h1ai.action!=0 && h1ai.win_prob>=H1OppositeBlockProb) block=true;
+            }
+            else
+            {
+               // STRICT: H1の方向一致 + 最低確率を必須化
+               if(h1ai.action==0 || !h1_prob_ok || h1_opposite) block=true;
+            }
+
+            if(block)
+            {
+               LogAIDecision("H1",h1ai.action,h1_rsi,h1t.atr,h1t.ref,h1t.reason,h1ai,"SKIPPED_H1_PRECHECK",h1_prob_ok,posCount,0,h1_tech_dir);
+               SafePrint(StringFormat("[M15] skip: H1 precheck blocked (mode=%d h1_action=%d h1_prob=%.0f%% h1_dir=%d m15_dir=%d)",
+                  H1PrecheckMode,h1ai.action,h1ai.win_prob*100,h1_suggested_dir,decision_dir));
+               return;
+            }
+
+            LogAIDecision("H1",h1ai.action,h1_rsi,h1t.atr,h1t.ref,h1t.reason,h1ai,"H1_PRECHECK_OK",h1_prob_ok,posCount,0,h1_tech_dir);
+         }
+      }
 
       // ポジション数チェック（ペンディングは設定で任意）
       if(posCount>=MaxPositions){
