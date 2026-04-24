@@ -134,6 +134,15 @@ const MA_CROSS_STATES = [
   { name: "bearish_ma", value: -1 },
 ];
 
+const STRICT_PATTERN_DEFS = [
+  { flag: "strict_macd_rsi_setup", patternType: "strict_macd_rsi", label: "STRICT_MACD_RSI", useBuckets: true },
+  { flag: "strict_ma_rsi_setup", patternType: "strict_ma_rsi", label: "STRICT_MA_RSI", useBuckets: true },
+  { flag: "strict_ichimoku_tk_rsi_setup", patternType: "strict_ichimoku_tk_rsi", label: "STRICT_ICHIMOKU_TK_RSI", useBuckets: true },
+  { flag: "strict_cloud_macd_setup", patternType: "strict_cloud_macd", label: "STRICT_CLOUD_MACD", useBuckets: true },
+  { flag: "strict_engulfing_setup", patternType: "strict_engulfing", label: "STRICT_ENGULFING", useBuckets: false },
+  { flag: "strict_inside_breakout_setup", patternType: "strict_inside_breakout", label: "STRICT_INSIDE_BREAKOUT", useBuckets: false },
+] as const;
+
 // 一目均衡表スコア範囲
 const ICHIMOKU_RANGES = [
   { name: "excellent", min: 0.9, max: 1.0 },   // MA+一目の両方が一致
@@ -160,6 +169,21 @@ function bucketAtrNorm(v: number | null | undefined): string | null {
   if (v < 0.0005) return "low";
   if (v < 0.0012) return "mid";
   return "high";
+}
+
+function getStrictPatternRsiBounds(patternType: string, direction: number): { min: number; max: number } {
+  switch (patternType) {
+    case "strict_macd_rsi":
+      return direction > 0 ? { min: 45, max: 65 } : { min: 35, max: 55 };
+    case "strict_ma_rsi":
+      return direction > 0 ? { min: 45, max: 60 } : { min: 40, max: 55 };
+    case "strict_ichimoku_tk_rsi":
+      return direction > 0 ? { min: 45, max: 65 } : { min: 35, max: 55 };
+    case "strict_engulfing":
+      return direction > 0 ? { min: 0, max: 50 } : { min: 50, max: 100 };
+    default:
+      return { min: 0, max: 100 };
+  }
 }
 
 async function extractPatterns(): Promise<Pattern[]> {
@@ -379,8 +403,86 @@ async function extractPatterns(): Promise<Pattern[]> {
   // 複合パターン発見（MACD x RSI, 一目 x RSI, MA x RSI など）
   const compositePatterns = await extractCompositePatterns(completeTrades);
   patterns.push(...compositePatterns);
+
+  const strictPatterns = await extractStrictPatterns(completeTrades);
+  patterns.push(...strictPatterns);
   
   console.log(`[ML] Total patterns (including composite): ${patterns.length}`);
+  return patterns;
+}
+
+async function extractStrictPatterns(completeTrades: any[]): Promise<Pattern[]> {
+  const patterns: Pattern[] = [];
+
+  console.log(`[ML] Extracting strict patterns from ${completeTrades.length} trades...`);
+
+  const groupedTrades = new Map<string, any[]>();
+  for (const trade of completeTrades) {
+    const key = `${trade.symbol}_${trade.timeframe}_${trade.dir}`;
+    if (!groupedTrades.has(key)) groupedTrades.set(key, []);
+    groupedTrades.get(key)!.push(trade);
+  }
+
+  for (const [groupKey, trades] of groupedTrades.entries()) {
+    const [symbol, timeframe, dirStr] = groupKey.split("_");
+    const direction = parseInt(dirStr);
+    if (trades.length < 3) continue;
+
+    for (const def of STRICT_PATTERN_DEFS) {
+      const matchingTrades = trades.filter((t) => t?.[def.flag] === true);
+      if (matchingTrades.length < 3) continue;
+
+      const rsiBounds = getStrictPatternRsiBounds(def.patternType, direction);
+
+      if (!def.useBuckets) {
+        const pattern = calculatePatternStats(
+          matchingTrades,
+          `${symbol}_${timeframe}_${direction > 0 ? "BUY" : "SELL"}_${def.label}`,
+          def.patternType,
+          symbol,
+          timeframe,
+          direction,
+          rsiBounds.min,
+          rsiBounds.max,
+        );
+        if (pattern) patterns.push(pattern);
+        continue;
+      }
+
+      const bucketGroups = new Map<string, { adx: string | null; bb: string | null; atrn: string | null; rows: any[] }>();
+      for (const t of matchingTrades) {
+        const adxB = bucketAdx(t.adx);
+        const bbB = bucketBbWidth(t.bb_width);
+        const atrnB = bucketAtrNorm(t.atr_norm);
+        const bucketKey = `${adxB ?? "na"}|${bbB ?? "na"}|${atrnB ?? "na"}`;
+        if (!bucketGroups.has(bucketKey)) {
+          bucketGroups.set(bucketKey, { adx: adxB, bb: bbB, atrn: atrnB, rows: [] });
+        }
+        bucketGroups.get(bucketKey)!.rows.push(t);
+      }
+
+      for (const group of bucketGroups.values()) {
+        if (group.rows.length < 3) continue;
+        const pattern = calculatePatternStats(
+          group.rows,
+          `${symbol}_${timeframe}_${direction > 0 ? "BUY" : "SELL"}_${def.label}_${group.adx ?? "na"}_${group.bb ?? "na"}_${group.atrn ?? "na"}`,
+          def.patternType,
+          symbol,
+          timeframe,
+          direction,
+          rsiBounds.min,
+          rsiBounds.max,
+        );
+        if (!pattern) continue;
+        pattern.adx_bucket = group.adx;
+        pattern.bb_width_bucket = group.bb;
+        pattern.atr_norm_bucket = group.atrn;
+        patterns.push(pattern);
+      }
+    }
+  }
+
+  console.log(`[ML] Extracted ${patterns.length} strict patterns`);
   return patterns;
 }
 

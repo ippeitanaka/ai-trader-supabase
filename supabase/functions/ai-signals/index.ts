@@ -312,6 +312,18 @@ interface AISignalEntry {
   ichimoku_tk_cross?: number; // 1=tenkan>kijun, -1=tenkan<kijun
   ichimoku_cloud_color?: number; // 1=bullish, -1=bearish
   ichimoku_price_vs_cloud?: number; // 1=above, -1=below, 0=in
+
+  // Strict pattern tracking
+  bull_engulfing?: number;
+  bear_engulfing?: number;
+  inside_bar?: number;
+  inside_break_dir?: number;
+  strict_macd_rsi_setup?: boolean | null;
+  strict_ma_rsi_setup?: boolean | null;
+  strict_ichimoku_tk_rsi_setup?: boolean | null;
+  strict_cloud_macd_setup?: boolean | null;
+  strict_engulfing_setup?: boolean | null;
+  strict_inside_breakout_setup?: boolean | null;
   
   // エントリー手法情報（任意）
   entry_method?: string | null; // 'pullback' | 'breakout' | 'mtf_confirm' | 'none'
@@ -662,6 +674,18 @@ serve(async (req: Request) => {
         ichimoku_tk_cross: body.ichimoku?.tk_cross,
         ichimoku_cloud_color: body.ichimoku?.cloud_color,
         ichimoku_price_vs_cloud: body.ichimoku?.price_vs_cloud,
+
+        // Strict pattern tracking
+        bull_engulfing: body.bull_engulfing,
+        bear_engulfing: body.bear_engulfing,
+        inside_bar: body.inside_bar,
+        inside_break_dir: body.inside_break_dir,
+        strict_macd_rsi_setup: body.strict_macd_rsi_setup ?? null,
+        strict_ma_rsi_setup: body.strict_ma_rsi_setup ?? null,
+        strict_ichimoku_tk_rsi_setup: body.strict_ichimoku_tk_rsi_setup ?? null,
+        strict_cloud_macd_setup: body.strict_cloud_macd_setup ?? null,
+        strict_engulfing_setup: body.strict_engulfing_setup ?? null,
+        strict_inside_breakout_setup: body.strict_inside_breakout_setup ?? null,
         
         // エントリー手法
         order_ticket: orderTicket ?? undefined,
@@ -732,6 +756,16 @@ serve(async (req: Request) => {
           delete legacyEntry.lot_level;
           delete legacyEntry.lot_reason;
           delete legacyEntry.executed_lot;
+          delete legacyEntry.bull_engulfing;
+          delete legacyEntry.bear_engulfing;
+          delete legacyEntry.inside_bar;
+          delete legacyEntry.inside_break_dir;
+          delete legacyEntry.strict_macd_rsi_setup;
+          delete legacyEntry.strict_ma_rsi_setup;
+          delete legacyEntry.strict_ichimoku_tk_rsi_setup;
+          delete legacyEntry.strict_cloud_macd_setup;
+          delete legacyEntry.strict_engulfing_setup;
+          delete legacyEntry.strict_inside_breakout_setup;
 
           const { data: legacyData, error: legacyError } = await supabase
             .from("ai_signals")
@@ -782,6 +816,7 @@ serve(async (req: Request) => {
       const {
         signal_id,
         order_ticket,
+        entry_price,
         // regime fields (optional)
         atr_norm,
         adx,
@@ -821,6 +856,7 @@ serve(async (req: Request) => {
       }
 
       const updateData: any = {};
+  if (entry_price !== undefined) updateData.entry_price = pgNumeric20_5(entry_price);
   if (atr_norm !== undefined) updateData.atr_norm = atr_norm;
   if (adx !== undefined) updateData.adx = adx;
   if (di_plus !== undefined) updateData.di_plus = di_plus;

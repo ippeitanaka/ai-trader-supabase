@@ -299,6 +299,35 @@ export interface TradeRequest {
     cloud_color: number;    // 雲の色
     price_vs_cloud: number; // 価格 vs 雲の位置
   };
+
+  // ローソク足パターン（任意）
+  candle_features?: {
+    bull_engulfing?: number;
+    bear_engulfing?: number;
+    bull_pinbar?: number;
+    bear_pinbar?: number;
+    inside_bar?: number;
+    inside_break_dir?: number;
+    three_up?: number;
+    three_down?: number;
+    bull_reversal_score?: number;
+    bear_reversal_score?: number;
+    bull_continuation_score?: number;
+    bear_continuation_score?: number;
+  };
+
+  // 生OHLC（確定足、古い→新しい順）
+  candle_bars?: Array<{
+    t?: string;
+    o: number;
+    h: number;
+    l: number;
+    c: number;
+    tv?: number;
+    rv?: number;
+    body?: number;
+    range?: number;
+  }>;
   
   // EA側の判断（参考情報として）
   ea_suggestion: {
@@ -474,6 +503,63 @@ function normalizeTradeRequest(body: any): TradeRequest {
       ? req.bb_width
       : undefined;
 
+  const cfRaw: any = req.candle_features ?? {};
+  const to01 = (v: unknown): number => {
+    if (v === 1 || v === true) return 1;
+    if (v === 0 || v === false) return 0;
+    return 0;
+  };
+  const toSide = (v: unknown): number => (v === 1 || v === -1 ? Number(v) : 0);
+  const toScore = (v: unknown): number => {
+    if (typeof v !== "number" || !Number.isFinite(v)) return 0;
+    if (v < 0) return 0;
+    if (v > 10) return 10;
+    return Math.round(v);
+  };
+
+  const candle_features = {
+    bull_engulfing: to01(cfRaw.bull_engulfing),
+    bear_engulfing: to01(cfRaw.bear_engulfing),
+    bull_pinbar: to01(cfRaw.bull_pinbar),
+    bear_pinbar: to01(cfRaw.bear_pinbar),
+    inside_bar: to01(cfRaw.inside_bar),
+    inside_break_dir: toSide(cfRaw.inside_break_dir),
+    three_up: to01(cfRaw.three_up),
+    three_down: to01(cfRaw.three_down),
+    bull_reversal_score: toScore(cfRaw.bull_reversal_score),
+    bear_reversal_score: toScore(cfRaw.bear_reversal_score),
+    bull_continuation_score: toScore(cfRaw.bull_continuation_score),
+    bear_continuation_score: toScore(cfRaw.bear_continuation_score),
+  };
+
+  const barsRaw = Array.isArray((req as any).candle_bars) ? (req as any).candle_bars : [];
+  const candle_bars = barsRaw
+    .slice(-32)
+    .map((b: any) => {
+      const o = typeof b?.o === "number" && Number.isFinite(b.o) ? b.o : NaN;
+      const h = typeof b?.h === "number" && Number.isFinite(b.h) ? b.h : NaN;
+      const l = typeof b?.l === "number" && Number.isFinite(b.l) ? b.l : NaN;
+      const c = typeof b?.c === "number" && Number.isFinite(b.c) ? b.c : NaN;
+      if (!Number.isFinite(o) || !Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c)) return null;
+      if (o <= 0 || h <= 0 || l <= 0 || c <= 0 || h < l) return null;
+      const tv = typeof b?.tv === "number" && Number.isFinite(b.tv) ? b.tv : undefined;
+      const rv = typeof b?.rv === "number" && Number.isFinite(b.rv) ? b.rv : undefined;
+      const body = typeof b?.body === "number" && Number.isFinite(b.body) ? b.body : Math.abs(c - o);
+      const range = typeof b?.range === "number" && Number.isFinite(b.range) ? b.range : Math.abs(h - l);
+      return {
+        t: typeof b?.t === "string" ? b.t : undefined,
+        o,
+        h,
+        l,
+        c,
+        tv,
+        rv,
+        body,
+        range,
+      };
+    })
+    .filter((v: any) => v !== null) as TradeRequest["candle_bars"];
+
   return {
     ...req,
     macd,
@@ -483,6 +569,8 @@ function normalizeTradeRequest(body: any): TradeRequest {
     di_plus,
     di_minus,
     bb_width,
+    candle_features,
+    candle_bars,
   };
 }
 
@@ -978,6 +1066,80 @@ function bucketAtrNorm(v: number | undefined): string | null {
   return "high";
 }
 
+type StrictPatternFlags = {
+  strict_macd_rsi: boolean;
+  strict_ma_rsi: boolean;
+  strict_ichimoku_tk_rsi: boolean;
+  strict_cloud_macd: boolean;
+  strict_engulfing: boolean;
+  strict_inside_breakout: boolean;
+};
+
+function computeStrictPatternFlags(req: TradeRequest): StrictPatternFlags {
+  const dir = req.ea_suggestion.dir;
+  const rsi = typeof req.rsi === "number" ? req.rsi : NaN;
+  const ema25 = typeof req.ema_25 === "number" ? req.ema_25 : NaN;
+  const sma100 = typeof req.sma_100 === "number" ? req.sma_100 : NaN;
+  const price = typeof req.price === "number" ? req.price : NaN;
+  const macdCross = req.macd?.cross;
+  const tkCross = req.ichimoku?.tk_cross;
+  const cloudColor = req.ichimoku?.cloud_color;
+  const priceVsCloud = req.ichimoku?.price_vs_cloud;
+  const kijun = typeof req.ichimoku?.kijun === "number" ? req.ichimoku.kijun : NaN;
+  const cf = req.candle_features;
+
+  if (dir !== 1 && dir !== -1) {
+    return {
+      strict_macd_rsi: false,
+      strict_ma_rsi: false,
+      strict_ichimoku_tk_rsi: false,
+      strict_cloud_macd: false,
+      strict_engulfing: false,
+      strict_inside_breakout: false,
+    };
+  }
+
+  return {
+    strict_macd_rsi: dir > 0
+      ? macdCross === 1 && Number.isFinite(ema25) && Number.isFinite(sma100) && ema25 >= sma100 && rsi >= 45 && rsi <= 65
+      : macdCross === -1 && Number.isFinite(ema25) && Number.isFinite(sma100) && ema25 <= sma100 && rsi >= 35 && rsi <= 55,
+    strict_ma_rsi: dir > 0
+      ? req.ma_cross === 1 && rsi >= 45 && rsi <= 60
+      : req.ma_cross === -1 && rsi >= 40 && rsi <= 55,
+    strict_ichimoku_tk_rsi: dir > 0
+      ? tkCross === 1 && Number.isFinite(price) && Number.isFinite(kijun) && price >= kijun && rsi >= 45 && rsi <= 65
+      : tkCross === -1 && Number.isFinite(price) && Number.isFinite(kijun) && price <= kijun && rsi >= 35 && rsi <= 55,
+    strict_cloud_macd: dir > 0
+      ? cloudColor === 1 && priceVsCloud === 1 && macdCross === 1
+      : cloudColor === -1 && priceVsCloud === -1 && macdCross === -1,
+    strict_engulfing: dir > 0
+      ? cf?.bull_engulfing === 1 && rsi <= 50
+      : cf?.bear_engulfing === 1 && rsi >= 50,
+    strict_inside_breakout: dir > 0
+      ? cf?.inside_break_dir === 1
+      : cf?.inside_break_dir === -1,
+  };
+}
+
+function patternMatchesCurrentSetup(pattern: any, flags: StrictPatternFlags): boolean {
+  switch (pattern?.pattern_type) {
+    case "strict_macd_rsi":
+      return flags.strict_macd_rsi;
+    case "strict_ma_rsi":
+      return flags.strict_ma_rsi;
+    case "strict_ichimoku_tk_rsi":
+      return flags.strict_ichimoku_tk_rsi;
+    case "strict_cloud_macd":
+      return flags.strict_cloud_macd;
+    case "strict_engulfing":
+      return flags.strict_engulfing;
+    case "strict_inside_breakout":
+      return flags.strict_inside_breakout;
+    default:
+      return true;
+  }
+}
+
 /**
  * ML学習データに基づいてロット倍率を計算
  * レベル1: 通常 (1.0倍) - ML未学習 or 勝率60-70%
@@ -1080,6 +1242,18 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
   const diPlus = typeof req.di_plus === "number" ? req.di_plus : undefined;
   const diMinus = typeof req.di_minus === "number" ? req.di_minus : undefined;
   const bbWidth = typeof req.bb_width === "number" ? req.bb_width : undefined;
+  const cf = req.candle_features;
+  const strictFlags = computeStrictPatternFlags(req);
+  const candleBarsSummary = Array.isArray(req.candle_bars) && req.candle_bars.length > 0
+    ? req.candle_bars
+        .slice(-8)
+        .map((b, i) => {
+          const dirLabel = b.c > b.o ? "UP" : b.c < b.o ? "DOWN" : "DOJI";
+          const stamp = b.t ?? `bar-${i + 1}`;
+          return `${i + 1}. ${stamp} O=${b.o.toFixed(5)} H=${b.h.toFixed(5)} L=${b.l.toFixed(5)} C=${b.c.toFixed(5)} ${dirLabel}`;
+        })
+        .join("\n")
+    : "N/A";
   
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 🔄 ハイブリッド学習システム（3段階）
@@ -1152,7 +1326,7 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
       .gte("real_trades", mlThresholds.minSamples) // 実トレードのサンプル数で判定
       .gte("confidence_score", mlThresholds.minConfidence) // フェーズ別閾値
       .order("confidence_score", { ascending: false })
-      .limit(3);
+      .limit(20);
 
     // レジームの一致を優先（ただし旧パターン互換のため NULL は許容）
     if (adxBucket) patternQuery = patternQuery.or(`adx_bucket.is.null,adx_bucket.eq.${adxBucket}`);
@@ -1160,7 +1334,9 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
     if (atrNormBucket) patternQuery = patternQuery.or(`atr_norm_bucket.is.null,atr_norm_bucket.eq.${atrNormBucket}`);
 
     const { data: patterns } = await patternQuery;
-    matchedPatterns = patterns || [];
+    matchedPatterns = (patterns || [])
+      .filter((pattern: any) => patternMatchesCurrentSetup(pattern, strictFlags))
+      .slice(0, 3);
   }
 
   // MLを実判断に組み込むときだけ、推奨事項や類似トレードもプロンプト用に取得する。
@@ -1541,6 +1717,17 @@ ${(() => {
 • 雲の色: ${req.ichimoku.cloud_color > 0 ? "陽転（青雲、上昇トレンド）" : "陰転（赤雲、下降トレンド）"}
 • 価格 vs 雲: ${req.ichimoku.price_vs_cloud > 0 ? "雲の上（強気相場）" : req.ichimoku.price_vs_cloud < 0 ? "雲の下（弱気相場）" : "雲の中（不確実、レンジ）"}
 
+【ローソク足パターン（直近確定足）】
+• Bull Engulfing: ${cf?.bull_engulfing ? "あり" : "なし"}, Bear Engulfing: ${cf?.bear_engulfing ? "あり" : "なし"}
+• Bull Pinbar: ${cf?.bull_pinbar ? "あり" : "なし"}, Bear Pinbar: ${cf?.bear_pinbar ? "あり" : "なし"}
+• Inside Bar: ${cf?.inside_bar ? "あり" : "なし"}, Inside Break Dir: ${cf?.inside_break_dir ?? 0}
+• 3-bar up/down: ${cf?.three_up ? "up" : "-"} / ${cf?.three_down ? "down" : "-"}
+• 反転スコア（Bull/Bear）: ${cf?.bull_reversal_score ?? 0} / ${cf?.bear_reversal_score ?? 0}
+• 継続スコア（Bull/Bear）: ${cf?.bull_continuation_score ?? 0} / ${cf?.bear_continuation_score ?? 0}
+
+【生OHLC（直近、古い→新しい）】
+${candleBarsSummary}
+
 【EA総合判断】
 • 判定: ${reason}
 • 一目スコア: ${ichimoku_score?.toFixed(2) || "N/A"} ${ichimokuContext}
@@ -1597,6 +1784,16 @@ ${(() => {
    - moderate (0.4-0.6) → 基準勝率 55-65%
    - weak (0.0-0.4) → 基準勝率 45-55%
    - conflicting (<0.0) → 基準勝率 30-45%
+
+9. **ローソク足パターン（反転/継続）** ⭐⭐⭐
+  - 反転スコアが高い + RSI過熱/売られすぎ + 指標の過熱感 → 逆張り候補
+  - 継続スコアが高い + MA/一目と同方向 → 順張り優先
+  - ローソク足が他指標と矛盾する場合は過信せず勝率を抑制
+
+10. **生OHLCの並び（文脈判断）** ⭐⭐⭐
+  - 連続高値切り上げ/安値切り上げは順張りを優先
+  - 長い上ヒゲ連発+上昇鈍化、または長い下ヒゲ連発+下落鈍化は反転候補
+  - 単発シグナルより、複数本での整合性を優先
 
 **勝率範囲: 0%～90%**
 - 最悪のシナリオ（全指標矛盾、高リスク）→ 0-20%
