@@ -43,10 +43,206 @@ function getCalibrationMinBinN(): number {
   return Math.min(50, Math.floor(v));
 }
 
+// When enabled, includes virtual trades in calibration data.
+// Useful when virtual trading volume dominates and represents current market conditions.
+function isCalibrationIncludeVirtual(): boolean {
+  const raw = (Deno.env.get("AI_TRADER_CALIBRATION_INCLUDE_VIRTUAL") ?? "off").toLowerCase().trim();
+  return raw === "on" || raw === "true" || raw === "1";
+}
+
+// Maximum absolute calibration shift (±). Prevents extreme corrections from polluted data.
+// Default 0.20: allows up to ±0.20 adjustment (e.g. 0.65 → 0.45 at most).
+function getCalibrationMaxShift(): number {
+  const v = Number(Deno.env.get("AI_TRADER_CALIBRATION_MAX_SHIFT") ?? "0.20");
+  if (!Number.isFinite(v) || v <= 0) return 0.20;
+  return Math.min(0.50, v);
+}
+
+// Recent performance soft guard parameters
+function getRecentPerfLookback(): number {
+  const v = Number(Deno.env.get("AI_TRADER_RECENT_PERF_LOOKBACK") ?? 30);
+  if (!Number.isFinite(v) || v < 5) return 30;
+  return Math.min(100, Math.floor(v));
+}
+
+function getRecentPerfThreshold(): number {
+  // Win_rate below this triggers a penalty.
+  const v = Number(Deno.env.get("AI_TRADER_RECENT_PERF_THRESHOLD") ?? 0.40);
+  if (!Number.isFinite(v)) return 0.40;
+  return Math.max(0.20, Math.min(0.60, v));
+}
+
+function getRecentPerfPenalty(): number {
+  // Max penalty applied to win_prob when recent win_rate is 0.
+  const v = Number(Deno.env.get("AI_TRADER_RECENT_PERF_PENALTY") ?? 0.10);
+  if (!Number.isFinite(v)) return 0.10;
+  return Math.max(0.0, Math.min(0.30, v));
+}
+
+function getRecentPerfMinN(): number {
+  const v = Number(Deno.env.get("AI_TRADER_RECENT_PERF_MIN_N") ?? 10);
+  if (!Number.isFinite(v) || v < 3) return 10;
+  return Math.min(50, Math.floor(v));
+}
+
+function includeVirtualInPerfGuards(): boolean {
+  // Default off: avoid dragging real-trade win_prob by noisy virtual outcomes.
+  const raw = (Deno.env.get("AI_TRADER_PERF_GUARDS_INCLUDE_VIRTUAL") ?? "off").toLowerCase().trim();
+  return raw === "on" || raw === "true" || raw === "1";
+}
+
+type RecentPerfResult = {
+  applied: boolean;
+  winProb: number;
+  guardTag: string;
+};
+
+async function applyRecentPerfGuard(
+  req: TradeRequest,
+  dir: number,
+  winProb: number,
+): Promise<RecentPerfResult> {
+  const lookback = getRecentPerfLookback();
+  const minN = getRecentPerfMinN();
+  const threshold = getRecentPerfThreshold();
+  const maxPenalty = getRecentPerfPenalty();
+
+  if (maxPenalty <= 0) return { applied: false, winProb, guardTag: "" };
+
+  let q = supabase
+    .from("ai_signals")
+    .select("actual_result")
+    .eq("symbol", req.symbol)
+    .eq("timeframe", req.timeframe)
+    .eq("dir", dir)
+    .in("actual_result", ["WIN", "LOSS"])
+    .order("created_at", { ascending: false })
+    .limit(lookback);
+
+  if (!includeVirtualInPerfGuards()) {
+    q = q.eq("is_virtual", false);
+  }
+
+  const { data, error } = await q;
+  if (error || !data || data.length < minN) {
+    return { applied: false, winProb, guardTag: "" };
+  }
+
+  const wins = data.filter((r: any) => r.actual_result === "WIN").length;
+  const recentWr = wins / data.length;
+
+  if (recentWr >= threshold) {
+    return { applied: false, winProb, guardTag: "" };
+  }
+
+  // Apply penalty proportional to how far below threshold we are.
+  const shortfall = threshold - recentWr;
+  const penalty = Math.min(maxPenalty, shortfall * maxPenalty / threshold);
+  const penalized = clampWinProb(winProb - penalty);
+
+  const guardTag =
+    `RECENT_PERF(penalized ${round3(winProb)}→${round3(penalized)}` +
+    ` recentWr=${round3(recentWr)} n=${data.length} threshold=${round3(threshold)})`;
+
+  return { applied: true, winProb: penalized, guardTag };
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Consecutive Loss Streak Guard (v2.7.0)
+// RECENT_PERF measures aggregate win rate over N trades (can miss current losing streaks).
+// STREAK_GUARD fires immediately when the most-recent K trades are all LOSS.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function getStreakLookback(): number {
+  const v = Number(Deno.env.get("AI_TRADER_STREAK_LOOKBACK") ?? 10);
+  if (!Number.isFinite(v) || v < 3) return 10;
+  return Math.min(20, Math.floor(v));
+}
+
+function getStreakMaxConsecutive(): number {
+  // Trigger penalty when consecutive LOSS count >= this value.
+  const v = Number(Deno.env.get("AI_TRADER_STREAK_MAX_CONSECUTIVE") ?? 3);
+  if (!Number.isFinite(v) || v < 2) return 3;
+  return Math.min(10, Math.floor(v));
+}
+
+function getStreakPenalty(): number {
+  // Max penalty applied when all lookback trades are LOSS.
+  const v = Number(Deno.env.get("AI_TRADER_STREAK_PENALTY") ?? 0.10);
+  if (!Number.isFinite(v)) return 0.10;
+  return Math.max(0.0, Math.min(0.30, Math.round(v * 1000) / 1000));
+}
+
+type StreakGuardResult = {
+  applied: boolean;
+  streak: number;
+  winProb: number;
+  guardTag: string;
+};
+
+async function applyStreakGuard(
+  req: TradeRequest,
+  dir: number,
+  winProb: number,
+): Promise<StreakGuardResult> {
+  const lookback = getStreakLookback();
+  const maxConsecutive = getStreakMaxConsecutive();
+  const maxPenalty = getStreakPenalty();
+
+  if (maxPenalty <= 0 || maxConsecutive <= 0) {
+    return { applied: false, streak: 0, winProb, guardTag: "" };
+  }
+
+  let q = supabase
+    .from("ai_signals")
+    .select("actual_result")
+    .eq("symbol", req.symbol)
+    .eq("timeframe", req.timeframe)
+    .eq("dir", dir)
+    .in("actual_result", ["WIN", "LOSS"])
+    .order("created_at", { ascending: false })
+    .limit(lookback);
+
+  if (!includeVirtualInPerfGuards()) {
+    q = q.eq("is_virtual", false);
+  }
+
+  const { data, error } = await q;
+
+  if (error || !data || data.length < maxConsecutive) {
+    return { applied: false, streak: 0, winProb, guardTag: "" };
+  }
+
+  // Count consecutive LOSS from the most-recent end.
+  let streak = 0;
+  for (const row of data) {
+    if ((row as any).actual_result === "LOSS") {
+      streak++;
+    } else {
+      break;
+    }
+  }
+
+  if (streak < maxConsecutive) {
+    return { applied: false, streak, winProb, guardTag: "" };
+  }
+
+  // Scale penalty proportional to streak length, amplified when streak exceeds trigger.
+  const ratio = streak / lookback;
+  const amplifier = Math.min(2.0, 1 + (streak - maxConsecutive) / maxConsecutive);
+  const penalty = Math.min(maxPenalty, ratio * maxPenalty * amplifier);
+  const penalized = clampWinProb(winProb - penalty);
+
+  const guardTag =
+    `STREAK_GUARD(penalized ${round3(winProb)}→${round3(penalized)}` +
+    ` streak=${streak} lookback=${data.length} maxConsec=${maxConsecutive})`;
+
+  return { applied: true, streak, winProb: penalized, guardTag };
+}
+
 function clampWinProb(v: number): number {
-  // Policy in this project: win_prob is within [0.00, 0.90]
+  // Policy in this project: win_prob is within [0.00, 1.00]
   const minProb = 0.0;
-  const maxProb = 0.9;
+  const maxProb = 1.0;
   return Math.max(minProb, Math.min(maxProb, v));
 }
 
@@ -92,14 +288,21 @@ async function fetchCalibrationRows(
   const limit = getCalibrationLimit();
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
 
+  const includeVirtual = isCalibrationIncludeVirtual();
+
   let q = supabase
     .from("ai_signals")
     .select("win_prob,actual_result")
     .gte("created_at", since)
     .in("actual_result", ["WIN", "LOSS"])
-    .eq("is_virtual", false)
     .order("created_at", { ascending: false })
     .limit(limit);
+
+  // By default use only real trades for calibration to avoid virtual-mode bias.
+  // Set AI_TRADER_CALIBRATION_INCLUDE_VIRTUAL=on when virtual trades dominate.
+  if (!includeVirtual) {
+    q = q.eq("is_virtual", false);
+  }
 
   if (scope === "symbol_tf_dir") {
     q = q.eq("symbol", req.symbol).eq("timeframe", req.timeframe).eq("dir", req.ea_suggestion.dir);
@@ -206,15 +409,19 @@ async function calibrateWinProb(req: TradeRequest, rawWinProb: number): Promise<
   let bin_n = bin?.n ?? 0;
   let bin_wr = bin?.winRate;
 
+  const maxShift = getCalibrationMaxShift();
+
   if (bin && bin.n >= minBinN) {
     // Blend raw with empirical bin win rate. Weight grows with bin sample size.
     const w = Math.min(0.8, bin.n / 30);
-    calibrated = raw * (1 - w) + bin.winRate * w;
+    const blended = raw * (1 - w) + bin.winRate * w;
+    // Cap the total shift to prevent extreme corrections from noisy data.
+    calibrated = raw + Math.max(-maxShift, Math.min(maxShift, blended - raw));
     method = "bin_smoothed";
   } else {
     // Fallback: align mean prediction to realized mean in-scope (stable under small bins)
     const shift = entry.winRate - entry.avgP;
-    calibrated = raw + shift;
+    calibrated = raw + Math.max(-maxShift, Math.min(maxShift, shift));
     method = "mean_shift";
   }
 
@@ -759,14 +966,36 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
 
   const dir = (base.action === 1 || base.action === -1) ? base.action : 0;
   const rsiGuard = applyExtremeRsiPenalty({ req, dir, winProb: calibrated, costR: rt.costR });
-  const winProbFinal = rsiGuard.winProb;
+  const afterRsi = rsiGuard.winProb;
+
+  // RSI Mean-Reversion Bonus: SHORT@RSI>=70 / LONG@RSI<=30 has ~63% win rate historically.
+  const rsiMrBonus = applyRsiMrBonus({ req, dir, winProb: afterRsi });
+  const afterRsiMr = rsiMrBonus.winProb;
+
+  // Recent performance soft guard (fallback path)
+  // Skip for RSI MR trades: recent perf history is trend-follow signals, not MR.
+  const recentPerfResult = rsiMrBonus.skipsRecentPerf
+    ? { winProb: afterRsiMr, applied: false, guardTag: "" }
+    : await applyRecentPerfGuard(req, dir, afterRsiMr);
+  const afterRecentPerf = recentPerfResult.winProb;
+
+  // Consecutive loss streak guard (fallback path)
+  // Skip for RSI MR trades (same rationale as RECENT_PERF).
+  const streakResult = rsiMrBonus.skipsStreakGuard
+    ? { winProb: afterRecentPerf, applied: false, streak: 0, guardTag: "" }
+    : await applyStreakGuard(req, dir, afterRecentPerf);
+  const winProbFinal = streakResult.winProb;
+
+  // Effective gate: lower slightly for confirmed RSI mean-reversion setups.
+  const effective_gate = action_gate_min_win_prob - rsiMrBonus.gateReduction;
+
   const expected_value_r = computeExpectedValueR(winProbFinal, rt.rewardRR, rt.costR);
   const costOk = rt.costR <= maxCostR;
   const action =
     dir !== 0 &&
       costOk &&
       calibrationOk &&
-      winProbFinal >= action_gate_min_win_prob &&
+      winProbFinal >= effective_gate &&
       expected_value_r >= minEvR
       ? dir
       : 0;
@@ -777,24 +1006,30 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     if (!calibrationOk) parts.push("calibration_not_applied");
     if (!costOk) parts.push("cost_too_high");
     if (expected_value_r < minEvR) parts.push("ev_below_min");
-    if (winProbFinal < action_gate_min_win_prob) parts.push("winprob_below_gate");
+    if (winProbFinal < effective_gate) parts.push("winprob_below_gate");
     if (rsiGuard.applied) parts.push("extreme_rsi_penalty");
+    if (rsiMrBonus.applied) parts.push("rsi_mr_bonus");
+    if (recentPerfResult.applied) parts.push("recent_perf_penalty");
+    if (streakResult.applied) parts.push("streak_guard");
     if (parts.length > 0) skip_reason = skip_reason ? `${skip_reason}|${parts.join("+")}` : parts.join("+");
   }
 
   // Put diagnostics first so they survive EA-side truncation.
   const gateTag =
     `GATE(EV>=${minEvR.toFixed(2)}R rr=${round3(rt.rewardRR)} costR=${round3(rt.costR)} ` +
-    `costSrc=${rt.costRSource} maxCostR=${round3(maxCostR)} gateP=${round3(action_gate_min_win_prob)} ` +
+    `costSrc=${rt.costRSource} maxCostR=${round3(maxCostR)} gateP=${round3(effective_gate)} ` +
     `calReq=${calibrationRequired ? 1 : 0} calApplied=${debug.applied ? 1 : 0})`;
 
   const calTag = debug.applied
     ? `CAL(${debug.method}/${debug.scope} n=${debug.n}): raw=${round3(raw)}→${round3(calibrated)}`
     : "";
   const rsiGuardTag = rsiGuard.guardTag;
+  const rsiMrBonusTag = rsiMrBonus.guardTag;
+  const recentPerfTag = recentPerfResult.guardTag;
+  const streakTag = streakResult.guardTag;
 
   const baseReasoning = typeof base.reasoning === "string" ? base.reasoning.trim() : "";
-  const tags = [gateTag, calTag, rsiGuardTag].filter((s) => s && s.trim().length > 0).join(" | ");
+  const tags = [gateTag, calTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
   const reasoning = baseReasoning ? `${tags} | ${baseReasoning}` : tags;
 
   return {
@@ -934,6 +1169,73 @@ function applyExtremeRsiPenalty(opts: {
       `RSI_GUARD(penalized ${round3(opts.winProb)}→${round3(penalized)} ` +
       `rsi=${round3(rsi)} dir=${dir} adx=${adx !== null ? round3(adx) : "na"} ` +
       `cloud=${pvc ?? "na"} costR=${round3(opts.costR)})`,
+  };
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// RSI Mean-Reversion Bonus
+// Analysis shows SHORT@RSI>=70 / LONG@RSI<=30 achieves ~63% win rate
+// vs 23-25% for trend-following. Boost win_prob for these setups and
+// skip RECENT_PERF guard (which is based on trend-follow signal history).
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function getRsiMrBonusThresholdHigh(): number {
+  const v = Number(Deno.env.get("AI_TRADER_RSI_MR_THRESHOLD_HIGH") ?? 70);
+  if (!Number.isFinite(v)) return 70;
+  return Math.max(60, Math.min(90, Math.round(v)));
+}
+
+function getRsiMrBonusThresholdLow(): number {
+  const v = Number(Deno.env.get("AI_TRADER_RSI_MR_THRESHOLD_LOW") ?? 30);
+  if (!Number.isFinite(v)) return 30;
+  return Math.max(10, Math.min(40, Math.round(v)));
+}
+
+function getRsiMrBonusAmount(): number {
+  const v = Number(Deno.env.get("AI_TRADER_RSI_MR_BONUS") ?? 0.20);
+  if (!Number.isFinite(v)) return 0.20;
+  return Math.max(0.0, Math.min(0.5, Math.round(v * 1000) / 1000));
+}
+
+function getRsiMrGateReduction(): number {
+  const v = Number(Deno.env.get("AI_TRADER_RSI_MR_GATE_REDUCTION") ?? 0.05);
+  if (!Number.isFinite(v)) return 0.05;
+  return Math.max(0.0, Math.min(0.3, Math.round(v * 1000) / 1000));
+}
+
+function applyRsiMrBonus(opts: {
+  req: TradeRequest;
+  dir: number;
+  winProb: number;
+}): {
+  winProb: number;
+  applied: boolean;
+  skipsRecentPerf: boolean;
+  skipsStreakGuard: boolean;
+  gateReduction: number;
+  guardTag: string;
+} {
+  const { req, dir } = opts;
+  const rsi = typeof req.rsi === "number" && Number.isFinite(req.rsi) ? req.rsi : null;
+  if (rsi === null || (dir !== 1 && dir !== -1)) {
+    return { winProb: opts.winProb, applied: false, skipsRecentPerf: false, skipsStreakGuard: false, gateReduction: 0, guardTag: "" };
+  }
+  const highThresh = getRsiMrBonusThresholdHigh();
+  const lowThresh = getRsiMrBonusThresholdLow();
+  // Mean reversion: SHORT when overbought, LONG when oversold
+  const isMeanReversion = (dir === -1 && rsi >= highThresh) || (dir === 1 && rsi <= lowThresh);
+  if (!isMeanReversion) {
+    return { winProb: opts.winProb, applied: false, skipsRecentPerf: false, skipsStreakGuard: false, gateReduction: 0, guardTag: "" };
+  }
+  const bonus = getRsiMrBonusAmount();
+  const gateReduction = getRsiMrGateReduction();
+  const boosted = clampWinProb(opts.winProb + bonus);
+  return {
+    winProb: boosted,
+    applied: true,
+    skipsRecentPerf: true,    // Recent perf is trend-follow history; MR trades are different
+    skipsStreakGuard: true,   // Streak history is also trend-follow; skip for MR trades
+    gateReduction,
+    guardTag: `RSI_MR_BONUS(+${round3(bonus)} ${round3(opts.winProb)}→${round3(boosted)} rsi=${round3(rsi)} dir=${dir} gate-${round3(gateReduction)})`,
   };
 }
 
@@ -1795,12 +2097,22 @@ ${candleBarsSummary}
   - 長い上ヒゲ連発+上昇鈍化、または長い下ヒゲ連発+下落鈍化は反転候補
   - 単発シグナルより、複数本での整合性を優先
 
-**勝率範囲: 0%～90%**
+**勝率範囲: 0%～100%**
 - 最悪のシナリオ（全指標矛盾、高リスク）→ 0-20%
-- 不確実性が高い（指標分散）→ 30-45%
-- 中程度の確信（一部一致）→ 50-65%
-- 高い確信（多数一致）→ 70-80%
-- 最高のシナリオ（パーフェクトオーダー、全指標完全一致）→ 85-90%`;
+- 不確実性が高い（指標分散）→ 25-40%
+- 中程度の確信（一部一致）→ 40-55%
+- 高い確信（多数一致）→ 55-68%
+- 最高のシナリオ（パーフェクトオーダー、全指標完全一致）→ 65-78%
+
+⭐ **RSI極値での逆張りセットアップ（実績上の高勝率条件）**:
+過去データの分析から、以下の条件で実際の勝率が約63%と高くなります:
+- **SHORT with RSI >= 70** (買われすぎからの反転): win_prob = 0.68-0.80 を推奨
+- **LONG with RSI <= 30** (売られすぎからの反転): win_prob = 0.68-0.80 を推奨
+これはトレンドフォローの25%勝率に対して、平均回帰（逆張り）が優位な現在の相場環境を反映しています。
+RSIが極値の場合は積極的に高い win_prob を設定してください。
+
+⚠️ **キャリブレーション注記**: 実績データによると、AIの予測には系統的な過信が見られます。
+「高い確信」シグナルでも実際の勝率は50-65%程度です（RSI逆張りを除く）。保守的な予測（-5〜-10%調整）を心がけてください。`;
   }
   
   // 共通の回答形式指示
@@ -1811,7 +2123,7 @@ ${candleBarsSummary}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 以下のJSON形式で回答してください:
 {
-  "win_prob": 0.XX,  // 0.00～0.90の範囲で動的に設定
+  "win_prob": 0.XX,  // 0.00～1.00の範囲で動的に設定
   "recommended_min_win_prob": 0.70, // 0.60～0.75（重要: 0.75を超えない＝取引機会を減らさない）
   "skip_reason": "", // 見送りなら理由（例: "range", "conflict", "news"）
   "confidence": "high" | "medium" | "low",
@@ -1821,7 +2133,8 @@ ${candleBarsSummary}
   重要: 
 • 上記の優先順位に従って判断してください
 • ${ENABLE_ML_CONTEXT_FOR_OPENAI ? (learningPhase === "PHASE3_FULL_ML" ? "ML学習データの過去勝率を最重視" : learningPhase === "PHASE2_HYBRID" && matchedPatterns.length > 0 ? "ML学習データとテクニカル指標をバランス良く総合判断" : "すべてのテクニカル指標を総合的に評価") : "すべてのテクニカル指標を総合的に評価"}してください
-• 0%～90%の幅広い範囲で動的に算出してください`;
+• 0%～90%の幅広い範囲で動的に算出してください
+• 実績ベースのキャリブレーション注記を参考に、過信を避けてください`;
 
   // 学習データ収集フェーズ用の総合判断プロンプト（廃止：上記に統合）
   const prompt = systemPrompt;
@@ -1866,13 +2179,13 @@ JSON形式で簡潔に回答してください。過度に楽観的な予測は�
 ⭐ 参考: EA側の一目スコア（総合判定の信頼度）
 
 💡 判断基準:
-• 全指標が一致 → 高勝率（70-90%）
+• 全指標が一致 → 高勝率（70-95%）
 • 大半が一致 → 中高勝率（60-75%）
 • 指標が分散 → 中勝率（50-65%）
 • 指標が矛盾 → 低勝率（30-45%）
 • 最悪の条件 → 極低勝率（0-20%）
 
-0%～90%の幅広い範囲で動的に算出し、JSON形式で簡潔に回答してください。指標間の矛盾が多いほど低勝率、一致が多いほど高勝率を設定してください。
+0%～100%の幅広い範囲で動的に算出し、JSON形式で簡潔に回答してください。指標間の矛盾が多いほど低勝率、一致が多いほど高勝率を設定してください。
 
 JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_reason": "", "confidence": "high|medium|low", "reasoning": "…"}`
           },
@@ -1960,6 +2273,32 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     const action_gate_min_win_prob = Math.max(minWinProbFloor, client_min_win_prob);
     const rsiGuard = applyExtremeRsiPenalty({ req, dir, winProb: win_prob, costR: rt.costR });
     win_prob = rsiGuard.winProb;
+
+    // RSI Mean-Reversion Bonus: SHORT@RSI>=70 / LONG@RSI<=30 has ~63% win rate historically.
+    const rsiMrBonus = applyRsiMrBonus({ req, dir, winProb: win_prob });
+    win_prob = rsiMrBonus.winProb;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ✅ Recent performance soft guard
+    // Skip for RSI MR trades: recent perf is trend-follow history, not MR trades.
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const recentPerfResult = rsiMrBonus.skipsRecentPerf
+      ? { winProb: win_prob, applied: false, guardTag: "" }
+      : await applyRecentPerfGuard(req, dir, win_prob);
+    win_prob = recentPerfResult.winProb;
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // ✅ Consecutive loss streak guard (v2.7.0)
+    // Skip for RSI MR trades (same rationale as RECENT_PERF).
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    const streakResult = rsiMrBonus.skipsStreakGuard
+      ? { winProb: win_prob, applied: false, streak: 0, guardTag: "" }
+      : await applyStreakGuard(req, dir, win_prob);
+    win_prob = streakResult.winProb;
+
+    // Effective gate: lower slightly for RSI mean-reversion setups.
+    const effective_gate = action_gate_min_win_prob - rsiMrBonus.gateReduction;
+
     const expected_value_r = computeExpectedValueR(win_prob, rt.rewardRR, rt.costR);
     let skip_reason = typeof aiResult.skip_reason === "string" ? aiResult.skip_reason : "";
     const entry_method: "market" = "market";
@@ -1976,29 +2315,35 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     // Put diagnostics first so they survive EA-side truncation.
     const gateTag =
       `GATE(EV>=${minEvR.toFixed(2)}R rr=${round3(rt.rewardRR)} costR=${round3(rt.costR)} ` +
-      `costSrc=${rt.costRSource} maxCostR=${round3(maxCostR)} gateP=${round3(action_gate_min_win_prob)} ` +
+      `costSrc=${rt.costRSource} maxCostR=${round3(maxCostR)} gateP=${round3(effective_gate)} ` +
       `calReq=${calibrationRequired ? 1 : 0} calApplied=${cal.debug.applied ? 1 : 0})`;
 
     const calTag = cal.debug.applied
-      ? `CAL(${cal.debug.method}/${cal.debug.scope} n=${cal.debug.n}): raw=${round3(raw_win_prob)}→${round3(win_prob)}`
+      ? `CAL(${cal.debug.method}/${cal.debug.scope} n=${cal.debug.n}): raw=${round3(raw_win_prob)}→${round3(cal.winProb)}`
       : "";
     const rsiGuardTag = rsiGuard.guardTag;
+    const rsiMrBonusTag = rsiMrBonus.guardTag;
+    const recentPerfTag = recentPerfResult.guardTag;
+    const streakTag = streakResult.guardTag;
 
-    const tags = [gateTag, calTag, rsiGuardTag].filter((s) => s && s.trim().length > 0).join(" | ");
+    const tags = [gateTag, calTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
 
     const costOk = rt.costR <= maxCostR;
     const willExecute =
       costOk &&
       calibrationOk &&
-      win_prob >= action_gate_min_win_prob &&
+      win_prob >= effective_gate &&
       expected_value_r >= minEvR;
     if (!willExecute && dir !== 0) {
       const parts: string[] = [];
       if (!calibrationOk) parts.push("calibration_not_applied");
       if (!costOk) parts.push("cost_too_high");
       if (expected_value_r < minEvR) parts.push("ev_below_min");
-      if (win_prob < action_gate_min_win_prob) parts.push("winprob_below_gate");
+      if (win_prob < effective_gate) parts.push("winprob_below_gate");
       if (rsiGuard.applied) parts.push("extreme_rsi_penalty");
+      if (rsiMrBonus.applied) parts.push("rsi_mr_bonus");
+      if (recentPerfResult.applied) parts.push("recent_perf_penalty");
+      if (streakResult.applied) parts.push("streak_guard");
       if (parts.length > 0) skip_reason = skip_reason ? `${skip_reason}|${parts.join("+")}` : parts.join("+");
     }
 
@@ -2162,7 +2507,7 @@ serve(async (req: Request) => {
       JSON.stringify({ 
         ok: true, 
         service: "ai-trader with OpenAI + Comprehensive Technical Analysis", 
-        version: "2.4.0-learning-phase",
+        version: "2.8.0-calib-robust",
         mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
         ml_learning_enabled: mlLearningEnabled,
@@ -2173,7 +2518,7 @@ serve(async (req: Request) => {
         ml_completed_trades: totalCompletedTrades,
         openai_key_status: keyStatus,
         fallback_available: true,
-        win_prob_range: "0% - 90%",
+        win_prob_range: "0% - 100%",
         features: [
           "comprehensive_technical_analysis",
           "all_indicators_integrated",
