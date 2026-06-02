@@ -49,7 +49,7 @@ DRY_RUN=true RETENTION_DAYS=120 SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... b
 
 ## 🎯 AI・ML機能
 
-- GPT-4o-mini市場分析
+- GPT-4.1-mini市場分析
 - 複数時間足テクニカル分析（M5/M15/M30/H1/H4/D1）
 - 移動平均トレンド判断（SMA5/25/75/200/800）
 - ハイブリッド学習システム（現在PHASE 2: 31-1000取引）

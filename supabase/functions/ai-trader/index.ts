@@ -4,7 +4,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
-const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") || "gpt-4o"; // デフォルト: gpt-4o (高精度)
+const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") || "gpt-4.1-mini"; // デフォルト: gpt-4.1-mini
 
 type CalibrationMode = "off" | "on";
 
@@ -2155,7 +2155,7 @@ RSIが極値の場合は積極的に高い win_prob を設定してください�
       },
       signal: controller.signal,
       body: JSON.stringify({
-        model: OPENAI_MODEL,  // 環境変数で設定可能 (デフォルト: gpt-4o-mini)
+        model: OPENAI_MODEL,  // 環境変数で設定可能 (デフォルト: gpt-4.1-mini)
         messages: [
           { 
             role: "system", 
