@@ -2517,6 +2517,7 @@ serve(async (req: Request) => {
         emergency_stop_enabled: emergencyStopEnabled,
         ml_completed_trades: totalCompletedTrades,
         openai_key_status: keyStatus,
+        openai_model: OPENAI_MODEL,
         fallback_available: true,
         win_prob_range: "0% - 100%",
         features: [
