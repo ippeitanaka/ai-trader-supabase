@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| AwajiSamurai_AI_2.0.mq5  (ver 1.5.6)                            |
+//| AwajiSamurai_AI_2.0.mq5  (ver 1.6.0)                            |
 //| - Supabase: ai-signals(AI側) / ea-log                            |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
@@ -14,93 +14,127 @@
 //|          Level 1-4の4段階評価で高勝率パターンは自動的にロット増加|
 //| - v1.5.1: 🔧 重複ポジション完全防止パッチ（レースコンディション対策）|
 //|          ペンディングオーダーもカウント、追跡中ポジション二重チェック|
+//| - v1.6.0: サーバー v2.7.0 対応 (STREAK_GUARD / RECENT_PERF /    |
+//|          RSI_MR_BONUS / CALIBRATION)。skip_reasonに streak_guard  |
+//|          タグが追加される。AI_EA_Versionを1.6.0に更新。          |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
 CTrade trade;
 
 // ===== 入力パラメータ =====
-input bool   LockToChartSymbol = true;
-input ENUM_TIMEFRAMES TF_Entry   = PERIOD_M15;
-input ENUM_TIMEFRAMES TF_Recheck = PERIOD_H1;
+input group "01 基本設定"
+input bool   ChartSymbolOnly         = true;
+input ENUM_TIMEFRAMES EntryTimeframe = PERIOD_M15;
+input ENUM_TIMEFRAMES RecheckTimeframe = PERIOD_H1;
 
-input double MinWinProb          = 0.75;  // 🚨 0.75 = 75% (品質重視だが取引頻度も維持)
-input double RiskATRmult         = 2.0;   // 🚨 ストップロス拡大（大損失防止）
-input double RewardRR            = 1.5;   // 🚨 リスクリワード比改善
-input bool   UsePullbackEntry    = true;  // 成り行きではなく浅い押し/戻りを待つ
-input double PendingOffsetATR    = 0.2;
-input int    PendingExpiryMin    = 90;
-input double Lots                = 0.10;
-input double MaxLots             = 0.30;  // ロット倍率適用時の最大値（リスク管理）
-input int    SlippagePoints      = 1000;
-input long   Magic               = 26091501;
-input int    MaxPositions        = 1;      // 同一銘柄の最大ポジション数
+input group "02 売買条件"
+input double TradeMinWinProbFloor    = 0.50;  // EA側の最終安全網。通常は固定推奨。
+input double ServerDecisionMinWinProb = 0.55; // サーバー判定の基準。0.50-0.70の範囲で調整。
+input double StopLossATRMultiplier   = 2.0;
+input double TakeProfitRewardRisk    = 1.5;
+input bool   UsePullbackOrders       = true;
+input double PullbackOffsetATR       = 0.2;
+input int    PullbackExpiryMinutes   = 90;
 
-// MaxPositions のカウントに「ペンディングオーダー(約定待ち)」も含めるか
-// true: 重複/レース抑止を優先（デフォルト）
-// false: 同時保有を優先（pendingが残っていても新規が通る）
-input bool   CountPendingOrdersInMaxPos = true;
+input group "03 ロット・建玉管理"
+input double BaseLotSize             = 0.10;
+input double MaxLotSize              = 0.30;
+input int    MaxSlippagePoints       = 1000;
+input long   ExpertMagicNumber       = 26091501;
+input int    MaxOpenTrades           = 1;
+input bool   CountPendingInMaxOpenTrades = true;
+input int    TrackedTradeCapacity    = 10;
 
-// 複数ポジション運用時の追跡枠（ai_signals の更新・結果反映に必要）
-// MaxPositions>1 の場合は、この数が小さすぎると一部が結果更新できず PENDING/FILLED が残り得る。
-input int    TrackedMaxTrades    = 10;
+input group "04 ログ・クールダウン"
+input bool   EnableDebugLogs         = true;
+input int    LogThrottleSeconds      = 30;  // 0=全出力, >0=間引き, -1=完全OFF
+input int    CooldownMinutesAfterExit = 30;
 
-input bool   DebugLogs           = true;
-input int    LogCooldownSec      = 30;  // 0=全出力, >0=間引き, -1=完全OFF
-input int    CooldownAfterCloseMin = 30; // TP/SL後のクールダウン（分）
+input group "05 H1 事前チェック"
+input int    H1PrecheckLevel         = 1;   // 0=OFF, 1=SOFT, 2=STRICT
+input double H1PrecheckMinWinProb    = 0.65;
+input double H1OppositeBlockWinProb  = 0.78;
+input bool   H1PrecheckFailOpen      = true;
 
-// ===== H1 precheck tuning (market-only) =====
-// 0=OFF, 1=SOFT(逆方向かつ高確度のみブロック), 2=STRICT(方向/閾値を必須)
-input int    H1PrecheckMode      = 1;
-input double H1PrecheckMinProb   = 0.65;
-input double H1OppositeBlockProb = 0.78;
-input bool   H1FailOpen          = true;
+input group "06 仮想トレード学習"
+input bool   LetAIDecideDirection    = false;
+input int    AICandleBarsToSend      = 12;
+input bool   EnableVirtualTradeLearning = true;
+input bool   TrackVirtualForMaxPosSkip = true;
+input bool   TrackVirtualForTrackedPosSkip = true;
+input bool   TrackVirtualLowProbBand = true;
+input double VirtualLowBandMinWinProb = 0.60;
+input double VirtualLowBandMaxWinProb = 0.69;
+input int    VirtualWatchCapacity    = 2000;
 
-// ===== Virtual (paper/shadow) learning =====
-input bool   UseAIForDirection = false;   // true: dirはAIに委譲（サーバでBUY/SELL両方向評価）
-input int    CandleBarsToSend = 12;       // AIへ送る生OHLC本数（確定足のみ）
-// Track selected SKIP reasons as paper trades and label TP/SL outcomes.
-// This reduces learning blind spots without increasing real risk.
-input bool   EnableVirtualLearning = true;
-input bool   VirtualTrack_SkippedMaxPos = true;
-input bool   VirtualTrack_SkippedTrackedPos = true;
-// 60-69%帯は実行しないが、検証材料として仮想トレードを記録
-input bool   VirtualTrack_LowBand = true;
-input double VirtualLowBandMinProb = 0.60;
-input double VirtualLowBandMaxProb = 0.69;
+input group "07 API 接続"
+input string AIEndpointUrl           = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-trader";
+input string EALogEndpointUrl        = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ea-log";
+input string AISignalsEndpointUrl    = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals";
+input string AISignalsUpdateEndpointUrl = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals-update";
+input string AIBearerToken           = "";
+input string EALogBearerToken        = "";
+input bool   RequireBearerToken      = true;
 
-// Virtual watch capacity (too small => many is_virtual rows remain PENDING)
-input int    VirtualMaxWatches     = 2000;
+input group "08 EA 識別情報"
+input string EAInstanceName          = "main";
+input string EAVersionTag            = "1.6.0";
+input int    AITimeoutMs             = 10000;
 
-// ★ URLは自分のプロジェクトに合わせて設定
-input string AI_Endpoint_URL     = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-trader";
-input string EA_Log_URL          = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ea-log";
-input string AI_Signals_URL      = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals";
-input string AI_Signals_Update_URL = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals-update";
+input group "09 一目均衡表"
+input bool   EnableIchimoku          = true;
+input int    IchimokuTenkanPeriod    = 9;
+input int    IchimokuKijunPeriod     = 26;
+input int    IchimokuSenkouPeriod    = 52;
 
-// ★ Supabase Functions 呼び出し用 (Bearer)
-// - Dashboard の Project Settings -> API で取得
-// - anon key / service_role key のどちらでも動くが、運用方針に合わせて設定
-input string AI_Bearer_Token     = "";
-
-// ★ ea-log は不正投稿防止のため、別トークン運用も可能
-// - 空なら AI_Bearer_Token を使う
-// - 推奨: ea-log専用のEA_LOG_BEARER_TOKENをSupabase secretsに設定し、EA側はパラメータで設定
-//   （このソースにはトークンを直書きしない）
-input string EA_Log_Bearer_Token = "";
-
-// Bearerが未設定のまま誤って稼働させるのを防ぐ
-input bool   RequireBearerToken  = true;
-
-input string AI_EA_Instance      = "main";
-input string AI_EA_Version       = "1.5.7";
-input int    AI_Timeout_ms       = 10000;
-
-// ===== 一目均衡表設定 =====
-input bool   UseIchimoku         = true;   // 一目均衡表を使用
-input int    Ichimoku_Tenkan     = 9;      // 転換線期間
-input int    Ichimoku_Kijun      = 26;     // 基準線期間
-input int    Ichimoku_Senkou     = 52;     // 先行スパン期間
+// 既存コード互換 alias
+#define LockToChartSymbol ChartSymbolOnly
+#define TF_Entry EntryTimeframe
+#define TF_Recheck RecheckTimeframe
+#define MinWinProb TradeMinWinProbFloor
+#define ServerMinWinProb ServerDecisionMinWinProb
+#define RiskATRmult StopLossATRMultiplier
+#define RewardRR TakeProfitRewardRisk
+#define UsePullbackEntry UsePullbackOrders
+#define PendingOffsetATR PullbackOffsetATR
+#define PendingExpiryMin PullbackExpiryMinutes
+#define Lots BaseLotSize
+#define MaxLots MaxLotSize
+#define SlippagePoints MaxSlippagePoints
+#define Magic ExpertMagicNumber
+#define MaxPositions MaxOpenTrades
+#define CountPendingOrdersInMaxPos CountPendingInMaxOpenTrades
+#define TrackedMaxTrades TrackedTradeCapacity
+#define DebugLogs EnableDebugLogs
+#define LogCooldownSec LogThrottleSeconds
+#define CooldownAfterCloseMin CooldownMinutesAfterExit
+#define H1PrecheckMode H1PrecheckLevel
+#define H1PrecheckMinProb H1PrecheckMinWinProb
+#define H1OppositeBlockProb H1OppositeBlockWinProb
+#define H1FailOpen H1PrecheckFailOpen
+#define UseAIForDirection LetAIDecideDirection
+#define CandleBarsToSend AICandleBarsToSend
+#define EnableVirtualLearning EnableVirtualTradeLearning
+#define VirtualTrack_SkippedMaxPos TrackVirtualForMaxPosSkip
+#define VirtualTrack_SkippedTrackedPos TrackVirtualForTrackedPosSkip
+#define VirtualTrack_LowBand TrackVirtualLowProbBand
+#define VirtualLowBandMinProb VirtualLowBandMinWinProb
+#define VirtualLowBandMaxProb VirtualLowBandMaxWinProb
+#define VirtualMaxWatches VirtualWatchCapacity
+#define AI_Endpoint_URL AIEndpointUrl
+#define EA_Log_URL EALogEndpointUrl
+#define AI_Signals_URL AISignalsEndpointUrl
+#define AI_Signals_Update_URL AISignalsUpdateEndpointUrl
+#define AI_Bearer_Token AIBearerToken
+#define EA_Log_Bearer_Token EALogBearerToken
+#define AI_EA_Instance EAInstanceName
+#define AI_EA_Version EAVersionTag
+#define AI_Timeout_ms AITimeoutMs
+#define UseIchimoku EnableIchimoku
+#define Ichimoku_Tenkan IchimokuTenkanPeriod
+#define Ichimoku_Kijun IchimokuKijunPeriod
+#define Ichimoku_Senkou IchimokuSenkouPeriod
 
 // ===== 内部変数 =====
 datetime g_lastBar_M15=0, g_lastBar_H1=0;
@@ -1047,6 +1081,7 @@ TechSignal Evaluate(ENUM_TIMEFRAMES tf)
 // ===== AI連携 =====
 struct AIOut{
    double win_prob;int action;double offset_factor;int expiry_min;string reasoning;string confidence;
+   string decision_summary;
    int suggested_dir;            // action=0でも、AIがより良いと見た方向（1/-1）
    double buy_win_prob;          // dir=0（両方向評価）でのBUY勝率（0-1）。未提供時は-1
    double sell_win_prob;         // dir=0（両方向評価）でのSELL勝率（0-1）。未提供時は-1
@@ -1176,6 +1211,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    out_ai.expiry_min=0;
    out_ai.reasoning="";
    out_ai.confidence="";
+   out_ai.decision_summary="";
    out_ai.suggested_dir=0;
    out_ai.buy_win_prob=-1.0;
    out_ai.sell_win_prob=-1.0;
@@ -1300,8 +1336,8 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    "\"symbol\":\""+JsonEscape(_Symbol)+"\","+
    "\"timeframe\":\""+JsonEscape(tf_label)+"\","+
 
-   // EA設定（サーバ側の action 判定がEAの最小勝率より厳しくならないように共有）
-   "\"min_win_prob\":"+DoubleToString(MinWinProb,3)+","+
+   // EA設定（ServerMinWinProbをサーバ側ゲートの指示値として送信。MinWinProbはEA側フロアのみ）
+   "\"min_win_prob\":"+DoubleToString(ServerMinWinProb,3)+","+
    
    // 価格情報
    "\"price\":"+DoubleToString(price,_Digits)+","+
@@ -1392,6 +1428,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    ExtractJsonString(resp,"reasoning",out_ai.reasoning);
    ExtractJsonString(resp,"reasoning",out_ai.reasoning);
    ExtractJsonString(resp,"confidence",out_ai.confidence);
+   ExtractJsonString(resp,"decision_summary",out_ai.decision_summary);
 
    // Dynamic gating / EV
    double rmin; if(ExtractJsonNumber(resp,"recommended_min_win_prob",rmin)) out_ai.recommended_min_win_prob=rmin; else out_ai.recommended_min_win_prob=0.0;
@@ -1435,6 +1472,8 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
 // tech_dir: テクニカル起点の方向（検証用）
 void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,const string trade_decision,bool threshold_met,int current_pos,ulong ticket=0,int tech_dir=0,double executed_lot=0.0)
 {
+   string ai_reasoning=(ai.reasoning!=""?JsonEscape(ai.reasoning):"N/A");
+   if(ai.decision_summary!="") ai_reasoning=JsonEscape(ai.decision_summary)+(ai_reasoning!="N/A"?" | "+ai_reasoning:"");
    string logPayload="{"+
    "\"at\":\""+TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS)+"\","+
    "\"sym\":\""+_Symbol+"\","+
@@ -1452,8 +1491,9 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
    "\"recommended_min_win_prob\":"+DoubleToString(ai.recommended_min_win_prob,3)+","+
    "\"expected_value_r\":"+DoubleToString(ai.expected_value_r,3)+","+
    "\"skip_reason\":\""+JsonEscape(ai.skip_reason)+"\","+
+   "\"decision_summary\":"+(ai.decision_summary!=""?"\""+JsonEscape(ai.decision_summary)+"\"":"null")+","+
    "\"ai_confidence\":\""+(ai.confidence!=""?JsonEscape(ai.confidence):"unknown")+"\","+
-   "\"ai_reasoning\":\""+(ai.reasoning!=""?JsonEscape(ai.reasoning):"N/A")+"\","+
+   "\"ai_reasoning\":\""+ai_reasoning+"\","+
    "\"entry_method\":\""+JsonEscape(ai.entry_method)+"\","+
    "\"method_selected_by\":\""+JsonEscape(ai.method_selected_by)+"\","+
    "\"method_reason\":\""+JsonEscape(ai.method_reason)+"\","+
@@ -1617,6 +1657,7 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"reason\":\""+JsonEscape(reason)+"\","+
    "\"instance\":\""+JsonEscape(AI_EA_Instance)+"\","+
    "\"model_version\":\""+JsonEscape(AI_EA_Version)+"\","+
+   "\"decision_summary\":"+(ai.decision_summary!=""?"\""+JsonEscape(ai.decision_summary)+"\"":"null")+","+
    "\"entry_method\":\""+JsonEscape(ai.entry_method)+"\","+
    "\"method_selected_by\":\""+JsonEscape(ai.method_selected_by)+"\","+
    "\"method_reason\":\""+JsonEscape(ai.method_reason)+"\","+
@@ -1876,9 +1917,10 @@ void OnM15NewBar()
    if(ai.recommended_min_win_prob>0.0 && ai.recommended_min_win_prob<effectiveMin) effectiveMin=ai.recommended_min_win_prob;
    double ev_r = (ai.expected_value_r>-100.0 ? ai.expected_value_r : (ai.win_prob*RewardRR - (1.0-ai.win_prob)*1.0));
    double ev_gate = (effectiveMin*RewardRR - (1.0-effectiveMin)*1.0);
-   // 二重ガード:
-   // 1) Functions側が action=0 を返した場合は必ず見送る
-   // 2) EA設定の MinWinProb 未満では絶対に発注しない（誤作動防止）
+   // ガード:
+   // 1) Functions側が action=0 を返した場合は必ず見送る（サーバが主要ゲート）
+   // 2) EA設定の MinWinProb はフロア（誤作動防止）。サーバ側で既にキャリブレーション・
+   //    RECENT_PERF・RSI_MR_BONUS等を適用済みなので MinWinProb=0.55 で十分。
    bool threshold_met=(ai.action!=0 && ai.win_prob>=MinWinProb);
 
    // derive expiry minutes for virtual tracking
@@ -1988,7 +2030,8 @@ void OnM15NewBar()
       bool ok=false; double entry=0.0; ulong posTicket=0; ulong ordTicket=0;
       AIOut ai_exec=ai;
 
-      bool usePullbackEntry=(UsePullbackEntry && PendingOffsetATR>0.0 && t_exec.atr>0.0);
+      bool serverAllowsPullback=(ai.entry_method=="pullback");
+      bool usePullbackEntry=(UsePullbackEntry && serverAllowsPullback && PendingOffsetATR>0.0 && t_exec.atr>0.0);
 
       if(usePullbackEntry)
       {
@@ -2134,7 +2177,7 @@ void OnH1NewBar()
    if(ai.recommended_min_win_prob>0.0 && ai.recommended_min_win_prob<effectiveMin) effectiveMin=ai.recommended_min_win_prob;
    double ev_r = (ai.expected_value_r>-100.0 ? ai.expected_value_r : (ai.win_prob*RewardRR - (1.0-ai.win_prob)*1.0));
    double ev_gate = (effectiveMin*RewardRR - (1.0-effectiveMin)*1.0);
-   // 二重ガード（H1再判定でも同様）
+   // H1再判定フロアガード（サーバ側ゲートが主要判定）
    bool threshold_met=(ai.action!=0 && ai.win_prob>=MinWinProb);
    int suggested_dir = (ai.suggested_dir!=0?ai.suggested_dir:tech_dir);
    bool rev=(suggested_dir!=0 && suggested_dir!=g_pendingDir);

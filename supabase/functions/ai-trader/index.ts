@@ -552,6 +552,7 @@ export interface TradeRequest {
 export interface TradeResponse {
   win_prob: number;
   action: number;
+  decision_summary?: string;
   // action=0 の場合でも「AIがより良いと見た方向」を返す（検証/学習用）
   suggested_dir?: number;
   // dir=0（両方向評価）のとき、EAが簡単に表示/保存できるように top-level で返す
@@ -659,6 +660,35 @@ function attachRegimePrefixToReasoning(
   // Avoid duplicating if the model already included regime info.
   if (/\bregime\s*=\s*/i.test(text) || text.startsWith(prefix)) return text || prefix;
   return text ? `${prefix} ${text}` : prefix;
+}
+
+function buildDecisionSummary(opts: {
+  willExecute: boolean;
+  dir: number;
+  winProb: number;
+  effectiveGate: number;
+  expectedValueR: number;
+  minEvR: number;
+  costR: number;
+  maxCostR: number;
+  calibrationRequired: boolean;
+  calibrationApplied: boolean;
+  skipReason?: string;
+}): string {
+  const dirLabel = opts.dir === 1 ? "BUY" : opts.dir === -1 ? "SELL" : "HOLD";
+  const status = opts.willExecute ? "実行" : "見送り";
+  const calLabel = opts.calibrationRequired ? (opts.calibrationApplied ? "ok" : "required_not_applied") : "off";
+  const parts = [
+    `${status} ${dirLabel}`,
+    `p=${round3(opts.winProb)}`,
+    `gate=${round3(opts.effectiveGate)}`,
+    `ev=${round3(opts.expectedValueR)}R`,
+    `minEv=${round3(opts.minEvR)}R`,
+    `cost=${round3(opts.costR)}/${round3(opts.maxCostR)}`,
+    `cal=${calLabel}`,
+  ];
+  if (!opts.willExecute && opts.skipReason) parts.push(`skip=${opts.skipReason}`);
+  return parts.join(" | ");
 }
 
 type InputSanityIssue = {
@@ -847,12 +877,19 @@ function assessInputSanity(req: TradeRequest): InputSanityIssue[] {
 function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): TradeResponse {
   const symbol = (tradeReq.symbol || "").toUpperCase();
   const utcHour = new Date().getUTCHours();
+  const hasMlSupport = (response as any).ml_pattern_used === true;
 
   const reasons: string[] = [];
 
   // BTCUSD: avoid observed loss cluster at UTC19
   if (symbol === "BTCUSD" && utcHour === 19) {
     reasons.push("BTCUSD disabled at UTC19");
+  }
+
+  // XAGUSD has recently traded without any ML-backed pattern support and degraded sharply.
+  // Block execution until the symbol has an active matched ML pattern again.
+  if (symbol === "XAGUSD" && !hasMlSupport) {
+    reasons.push("XAGUSD requires ML-backed pattern support");
   }
 
   // Emergency guard: cap XAUUSD lot scaling.
@@ -1031,11 +1068,25 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
   const baseReasoning = typeof base.reasoning === "string" ? base.reasoning.trim() : "";
   const tags = [gateTag, calTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
   const reasoning = baseReasoning ? `${tags} | ${baseReasoning}` : tags;
+  const decision_summary = buildDecisionSummary({
+    willExecute: action !== 0,
+    dir,
+    winProb: winProbFinal,
+    effectiveGate: effective_gate,
+    expectedValueR: expected_value_r,
+    minEvR,
+    costR: rt.costR,
+    maxCostR,
+    calibrationRequired,
+    calibrationApplied: debug.applied,
+    skipReason: skip_reason,
+  });
 
   return {
     ...base,
     win_prob: round3(winProbFinal),
     action,
+    decision_summary,
     expected_value_r,
     cost_r: round3(rt.costR),
     cost_r_source: rt.costRSource,
@@ -2347,9 +2398,24 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       if (parts.length > 0) skip_reason = skip_reason ? `${skip_reason}|${parts.join("+")}` : parts.join("+");
     }
 
+    const decision_summary = buildDecisionSummary({
+      willExecute,
+      dir,
+      winProb: win_prob,
+      effectiveGate: effective_gate,
+      expectedValueR: expected_value_r,
+      minEvR,
+      costR: rt.costR,
+      maxCostR,
+      calibrationRequired,
+      calibrationApplied: cal.debug.applied,
+      skipReason: skip_reason,
+    });
+
     return {
       win_prob: round3(win_prob),
       action: willExecute ? dir : 0,
+      decision_summary,
       suggested_dir: dir,
       offset_factor: atr > 0.001 ? 0.25 : 0.2,
       expiry_minutes: 90,
