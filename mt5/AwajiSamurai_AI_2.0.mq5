@@ -34,6 +34,7 @@ input double ServerDecisionMinWinProb = 0.55; // サーバー判定の基準。0
 input double StopLossATRMultiplier   = 2.0;
 input double TakeProfitRewardRisk    = 1.5;
 input bool   UsePullbackOrders       = true;
+input bool   ReverseExecutionTrades  = false;
 input double PullbackOffsetATR       = 0.2;
 input int    PullbackExpiryMinutes   = 90;
 
@@ -97,6 +98,7 @@ input int    IchimokuSenkouPeriod    = 52;
 #define RiskATRmult StopLossATRMultiplier
 #define RewardRR TakeProfitRewardRisk
 #define UsePullbackEntry UsePullbackOrders
+#define ReverseExecution ReverseExecutionTrades
 #define PendingOffsetATR PullbackOffsetATR
 #define PendingExpiryMin PullbackExpiryMinutes
 #define Lots BaseLotSize
@@ -1516,7 +1518,7 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
 }
 
 // ===== AI Signals記録（ML学習用） =====
-long RecordSignal(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,const CandleFeatures &candle,ulong ticket=0,double entry_price=0,bool mark_filled=false,bool is_virtual=false,double planned_entry=0,double planned_sl=0,double planned_tp=0,int planned_order_type=-1,int expiry_minutes=0,double lot_multiplier=1.0,const string lot_level="",const string lot_reason="",double executed_lot=0.0)
+long RecordSignal(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,const CandleFeatures &candle,ulong ticket=0,double entry_price=0,bool mark_filled=false,bool is_virtual=false,double planned_entry=0,double planned_sl=0,double planned_tp=0,int planned_order_type=-1,int expiry_minutes=0,double lot_multiplier=1.0,const string lot_level="",const string lot_reason="",double executed_lot=0.0,bool reverse_execution=false,int original_dir=0)
 {
    // レジーム判定用の追加特徴量（QueryAIと同様にEA側で計算して保存する）
    ENUM_TIMEFRAMES tf=(tf_label=="M15")?TF_Entry:TF_Recheck;
@@ -1669,7 +1671,9 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"lot_level\":"+(lot_level!=""?"\""+JsonEscape(lot_level)+"\"":"null")+","+
    "\"lot_reason\":"+(lot_reason!=""?"\""+JsonEscape(lot_reason)+"\"":"null")+","+
    "\"executed_lot\":"+(executed_lot>0?DoubleToString(executed_lot,2):"null")+","+
-   "\"is_virtual\":"+(is_virtual?"true":"false")+"";
+   "\"is_virtual\":"+(is_virtual?"true":"false")+","+
+   "\"reverse_execution\":"+(reverse_execution?"true":"false")+","+
+   "\"original_dir\":"+IntegerToString(original_dir!=0?original_dir:dir);
 
    if(planned_entry>0) payload+=",\"planned_entry_price\":"+DoubleToString(planned_entry,_Digits);
    if(planned_sl>0) payload+=",\"planned_sl\":"+DoubleToString(planned_sl,_Digits);
@@ -1910,6 +1914,8 @@ void OnM15NewBar()
 
    int suggested_dir = (ai.suggested_dir!=0?ai.suggested_dir:tech_dir);
    int decision_dir = ai.action; // 0なら見送り
+   bool reverse_execution = (ReverseExecution && decision_dir!=0);
+   int execution_dir = (reverse_execution ? -decision_dir : decision_dir);
 
    int posCount=CountPositions();
    // Dynamic threshold (lowering only) + EV gate
@@ -1929,7 +1935,7 @@ void OnM15NewBar()
    
    if(threshold_met){
       // 以降の注文・仮想・記録は方向を統一
-      TechSignal t_exec=t; t_exec.dir=decision_dir;
+      TechSignal t_exec=t; t_exec.dir=execution_dir;
       TechSignal t_plan=t; t_plan.dir=suggested_dir;
 
       // market-only 運用向け H1 事前チェック（約定数を落としすぎないよう調整可能）
@@ -2063,10 +2069,10 @@ void OnM15NewBar()
 
             ai_exec.entry_method="pullback";
             ai_exec.method_selected_by="Manual";
-            ai_exec.method_reason=StringFormat("pullback limit offset=%.2f ATR",PendingOffsetATR);
+            ai_exec.method_reason=StringFormat("pullback limit offset=%.2f ATR%s",PendingOffsetATR,(reverse_execution?" | reverse_execution":""));
 
-            RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,0,false,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,ai.lot_multiplier,ai.lot_level,ai.lot_reason,finalLots);
-            LogAIDecision("M15",decision_dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,"PLACED_PULLBACK",threshold_met,posCount,ordTicket,tech_dir,finalLots);
+            RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,0,false,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,ai.lot_multiplier,ai.lot_level,ai.lot_reason,finalLots,reverse_execution,decision_dir);
+            LogAIDecision("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,(reverse_execution?"PLACED_PULLBACK_REVERSED":"PLACED_PULLBACK"),threshold_met,posCount,ordTicket,tech_dir,finalLots);
             SafePrint(StringFormat("[M15] pullback placed dir=%d prob=%.0f%% entry=%.5f lot=%.2f",t_exec.dir,ai.win_prob*100,planned_entry,finalLots));
          }else{
             SafePrint("[M15] pullback placement failed");
@@ -2077,7 +2083,7 @@ void OnM15NewBar()
          // Fallback path: immediate market execution.
          ai_exec.entry_method="market";
          ai_exec.method_selected_by="Manual";
-         ai_exec.method_reason="market-only execution";
+         ai_exec.method_reason=(reverse_execution?"market-only execution | reverse_execution":"market-only execution");
 
          if(t_exec.dir>0){ planned_entry=ask; planned_sl=ask-slDist; planned_tp=ask+tpDist; planned_type=ORDER_TYPE_BUY; }
          else{ planned_entry=bid; planned_sl=bid+slDist; planned_tp=bid-tpDist; planned_type=ORDER_TYPE_SELL; }
@@ -2116,8 +2122,8 @@ void OnM15NewBar()
             g_trackedFillLastTry=0;
 
             // ai_signals.order_ticket is the order ticket key
-            RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,ai.lot_multiplier,ai.lot_level,ai.lot_reason,finalLots);
-            LogAIDecision("M15",decision_dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,"EXECUTED_MARKET",threshold_met,posCount,ordTicket,tech_dir,finalLots);
+            RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,ai.lot_multiplier,ai.lot_level,ai.lot_reason,finalLots,reverse_execution,decision_dir);
+            LogAIDecision("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,(reverse_execution?"EXECUTED_MARKET_REVERSED":"EXECUTED_MARKET"),threshold_met,posCount,ordTicket,tech_dir,finalLots);
             SafePrint(StringFormat("[M15] market executed dir=%d prob=%.0f%% lot=%.2f",t_exec.dir,ai.win_prob*100,finalLots));
          }else{
             SafePrint("[M15] market execution failed");

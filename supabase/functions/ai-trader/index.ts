@@ -115,6 +115,7 @@ async function applyRecentPerfGuard(
     .eq("symbol", req.symbol)
     .eq("timeframe", req.timeframe)
     .eq("dir", dir)
+    .eq("reverse_execution", false)
     .in("actual_result", ["WIN", "LOSS"])
     .order("created_at", { ascending: false })
     .limit(lookback);
@@ -198,6 +199,7 @@ async function applyStreakGuard(
     .eq("symbol", req.symbol)
     .eq("timeframe", req.timeframe)
     .eq("dir", dir)
+    .eq("reverse_execution", false)
     .in("actual_result", ["WIN", "LOSS"])
     .order("created_at", { ascending: false })
     .limit(lookback);
@@ -294,6 +296,7 @@ async function fetchCalibrationRows(
     .from("ai_signals")
     .select("win_prob,actual_result")
     .gte("created_at", since)
+    .eq("reverse_execution", false)
     .in("actual_result", ["WIN", "LOSS"])
     .order("created_at", { ascending: false })
     .limit(limit);
@@ -878,6 +881,12 @@ function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): 
   const symbol = (tradeReq.symbol || "").toUpperCase();
   const utcHour = new Date().getUTCHours();
   const hasMlSupport = (response as any).ml_pattern_used === true;
+  const adx = typeof tradeReq.adx === "number" && Number.isFinite(tradeReq.adx) ? tradeReq.adx : null;
+  const diPlus = typeof tradeReq.di_plus === "number" && Number.isFinite(tradeReq.di_plus) ? tradeReq.di_plus : null;
+  const diMinus = typeof tradeReq.di_minus === "number" && Number.isFinite(tradeReq.di_minus) ? tradeReq.di_minus : null;
+  const macdCross = typeof tradeReq.macd?.cross === "number" && Number.isFinite(tradeReq.macd.cross)
+    ? tradeReq.macd.cross
+    : null;
 
   const reasons: string[] = [];
 
@@ -903,6 +912,18 @@ function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): 
       (response as any).lot_reason = prevReason
         ? `${prevReason} | GUARD: XAUUSD cap lot_multiplier=1.0`
         : "GUARD: XAUUSD cap lot_multiplier=1.0";
+    }
+
+    const actionDir = typeof response.action === "number" ? response.action : 0;
+    const lowAdx = adx !== null && adx < 18;
+    const bearishMomentum = (macdCross !== null && macdCross < 0) || (diPlus !== null && diMinus !== null && diMinus > diPlus);
+    const bullishMomentum = (macdCross !== null && macdCross > 0) || (diPlus !== null && diMinus !== null && diPlus > diMinus);
+
+    if (lowAdx && actionDir > 0 && bearishMomentum) {
+      reasons.push(`XAUUSD long blocked in weak trend (adx=${round3(adx)} macdCross=${macdCross ?? "na"} di+=${diPlus ?? "na"} di-=${diMinus ?? "na"})`);
+    }
+    if (lowAdx && actionDir < 0 && bullishMomentum) {
+      reasons.push(`XAUUSD short blocked in weak trend (adx=${round3(adx)} macdCross=${macdCross ?? "na"} di+=${diPlus ?? "na"} di-=${diMinus ?? "na"})`);
     }
   }
 
@@ -1621,6 +1642,7 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
     .from("ai_signals")
     .select("*", { count: "exact", head: true })
     .in("actual_result", ["WIN", "LOSS"])
+    .eq("reverse_execution", false)
     .eq("is_virtual", false);
   
   const totalCompletedTrades = completedTradesCount || 0;
@@ -1710,6 +1732,7 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
       .eq("dir", dir)
       .not("actual_result", "is", null)
       .in("actual_result", ["WIN", "LOSS"])
+      .eq("reverse_execution", false)
       .eq("is_virtual", false)
       .order("created_at", { ascending: false })
       .limit(30);
@@ -2558,6 +2581,7 @@ serve(async (req: Request) => {
       .from("ai_signals")
       .select("*", { count: "exact", head: true })
       .in("actual_result", ["WIN", "LOSS"])
+      .eq("reverse_execution", false)
       .eq("is_virtual", false);
     const totalCompletedTrades = completedTradesCount || 0;
     const learningPhase = totalCompletedTrades < 80

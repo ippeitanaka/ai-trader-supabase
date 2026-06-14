@@ -280,6 +280,7 @@ interface AISignalEntry {
   rsi?: number;
   price?: number;
   reason?: string;
+  decision_summary?: string | null;
   instance?: string;
   model_version?: string;
 
@@ -349,6 +350,8 @@ interface AISignalEntry {
 
   // Virtual (paper/shadow) trade support
   is_virtual?: boolean | null;
+  reverse_execution?: boolean | null;
+  original_dir?: number | null;
   planned_entry_price?: number | null;
   planned_sl?: number | null;
   planned_tp?: number | null;
@@ -643,6 +646,7 @@ serve(async (req: Request) => {
         rsi: body.rsi,
         price: body.price,
         reason: body.reason,
+        decision_summary: safeText(body.decision_summary),
         instance: body.instance,
         model_version: body.model_version,
 
@@ -714,6 +718,8 @@ serve(async (req: Request) => {
 
         // Virtual (paper/shadow) trade support
         is_virtual: body.is_virtual ?? false,
+        reverse_execution: body.reverse_execution ?? false,
+        original_dir: body.original_dir ?? null,
         planned_entry_price: body.planned_entry_price ?? null,
         planned_sl: body.planned_sl ?? null,
         planned_tp: body.planned_tp ?? null,
@@ -766,6 +772,8 @@ serve(async (req: Request) => {
           delete legacyEntry.strict_cloud_macd_setup;
           delete legacyEntry.strict_engulfing_setup;
           delete legacyEntry.strict_inside_breakout_setup;
+          delete legacyEntry.reverse_execution;
+          delete legacyEntry.original_dir;
 
           const { data: legacyData, error: legacyError } = await supabase
             .from("ai_signals")

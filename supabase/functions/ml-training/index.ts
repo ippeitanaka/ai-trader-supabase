@@ -193,6 +193,7 @@ async function extractPatterns(): Promise<Pattern[]> {
   const { data: completeTrades, error } = await supabase
     .from("ai_signals")
     .select("*")
+    .eq("reverse_execution", false)
     // 手動トレードは学習に含めない（EA/AIのみ学習）
     .or("is_manual_trade.is.null,is_manual_trade.eq.false")
     .in("actual_result", ["WIN", "LOSS"])
@@ -899,12 +900,14 @@ async function runTraining(triggeredBy: string = "manual"): Promise<TrainingResu
   const { count: totalSignalsEaOnly } = await supabase
     .from("ai_signals")
     .select("*", { count: "exact", head: true })
+    .eq("reverse_execution", false)
     .or("is_manual_trade.is.null,is_manual_trade.eq.false");
   
   // 2. 完結した取引数を取得（ビューではなく直接クエリ）
   const { count: completeTrades } = await supabase
     .from("ai_signals")
     .select("*", { count: "exact", head: true })
+    .eq("reverse_execution", false)
     .or("is_manual_trade.is.null,is_manual_trade.eq.false")
     .in("actual_result", ["WIN", "LOSS"])
     .not("closed_at", "is", null);
@@ -939,6 +942,7 @@ async function runTraining(triggeredBy: string = "manual"): Promise<TrainingResu
   const { data: allTrades } = await supabase
     .from("ai_signals")
     .select("actual_result")
+    .eq("reverse_execution", false)
     .or("is_manual_trade.is.null,is_manual_trade.eq.false")
     .in("actual_result", ["WIN", "LOSS"])
     .not("closed_at", "is", null);
