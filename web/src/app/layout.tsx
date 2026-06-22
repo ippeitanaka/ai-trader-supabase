@@ -20,6 +20,21 @@ const orbitron = Orbitron({
 export const metadata: Metadata = {
   title: "Awaji Samurai AI Trader Dashboard",
   description: "AIトレーダーの推奨ペア、EAログ、実トレード結果を確認する運用ダッシュボード",
+  manifest: "/manifest.webmanifest",
+  icons: {
+    icon: [
+      { url: "/icon.png", type: "image/png", sizes: "1254x1254" },
+    ],
+    apple: [
+      { url: "/apple-icon.png", type: "image/png", sizes: "1254x1254" },
+    ],
+    shortcut: ["/icon.png"],
+  },
+  appleWebApp: {
+    capable: true,
+    title: "Awaji Samurai AI Trader",
+    statusBarStyle: "black-translucent",
+  },
 };
 
 export default function RootLayout({
