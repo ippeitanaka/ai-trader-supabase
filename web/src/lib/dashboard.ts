@@ -261,7 +261,12 @@ function directionLabel(dir: number | null) {
 }
 
 function tradeStatusLabel(trade: AISignalRecord) {
-  if (!trade.closed_at) return "保有中";
+  if (!trade.closed_at) {
+    if (trade.actual_result === "FILLED") return "保有中";
+    if (trade.actual_result === "PENDING") return "未約定";
+    if (trade.actual_result === "CANCELLED") return "キャンセル";
+    return "未決済";
+  }
   if (trade.actual_result === "WIN") return "決済完了: WIN";
   if (trade.actual_result === "LOSS") return "決済完了: LOSS";
   if (trade.actual_result === "BREAK_EVEN") return "決済完了: BE";
@@ -303,6 +308,7 @@ async function fetchOpenTrades(): Promise<AISignalRecord[]> {
   const url = buildRestUrl("ai_signals", {
     select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution",
     is_virtual: "eq.false",
+    actual_result: "eq.FILLED",
     closed_at: "is.null",
     order: "created_at.desc",
     limit: "8",
