@@ -40,7 +40,7 @@ const SKIP_REASON_LABELS: Record<string, string> = {
 
 function formatDateTime(value: string | null | undefined) {
   if (!value) return "-";
-  return new Date(value).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" });
+  return `${new Date(value).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" })} JST`;
 }
 
 function formatPercent(value: number | null | undefined) {
