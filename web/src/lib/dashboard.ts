@@ -41,6 +41,7 @@ type PairSelectorLatest = {
   cadence: string;
   timeframe: string;
   lookback_days: number;
+  top_n?: number;
   summary: string;
   digest_text?: string;
   digest_lines?: string[];
@@ -198,6 +199,22 @@ function buildFunctionUrl(functionName: string, params: Record<string, string>) 
   return `${SUPABASE_URL}/functions/v1/${functionName}?${search.toString()}`;
 }
 
+async function postJson<T>(url: string, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      ...supabaseHeaders(),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status} ${url}`);
+  }
+  return response.json() as Promise<T>;
+}
+
 function toIsoDaysAgo(days: number) {
   return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 }
@@ -283,6 +300,20 @@ function decorateTrades(trades: AISignalRecord[]) {
 
 async function fetchPairSelector(): Promise<PairSelectorResponse> {
   return fetchJson<PairSelectorResponse>(buildFunctionUrl("pair-selector", { limit: "1" }));
+}
+
+export async function triggerPairSelectorRefresh(options?: {
+  cadence?: string;
+  lookbackDays?: number;
+  topN?: number;
+}) {
+  requireEnv();
+  return postJson<Record<string, unknown>>(buildFunctionUrl("pair-selector", {}), {
+    cadence: options?.cadence ?? "daily",
+    lookback_days: options?.lookbackDays ?? 21,
+    top_n: options?.topN ?? 3,
+    triggered_by: "dashboard-manual-refresh",
+  });
 }
 
 async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
