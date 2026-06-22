@@ -69,6 +69,21 @@ export default async function Home({ searchParams }: PageProps) {
     return (
       <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(34,197,94,0.18),_transparent_22%),linear-gradient(180deg,_#07111f_0%,_#081826_44%,_#050910_100%)] px-5 py-8 text-slate-100 sm:px-8 lg:px-10">
         <div className="mx-auto max-w-7xl">
+          {data.dataErrors.length > 0 ? (
+            <section className="mb-6 rounded-[28px] border border-amber-300/20 bg-amber-500/10 p-5 backdrop-blur">
+              <p className="text-xs uppercase tracking-[0.28em] text-amber-200/80">Data Warning</p>
+              <h2 className="mt-2 text-2xl font-semibold text-white">一部データ取得に失敗しています</h2>
+              <p className="mt-2 text-sm leading-7 text-amber-50/90">
+                Vercel の環境変数、Supabase の権限、または Function / REST API 応答を確認してください。下の詳細はそのまま原因切り分けに使えます。
+              </p>
+              <div className="mt-4 space-y-2 text-sm text-amber-100">
+                {data.dataErrors.map((error) => (
+                  <div key={error} className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-3">{error}</div>
+                ))}
+              </div>
+            </section>
+          ) : null}
+
           <section className="rounded-[32px] border border-cyan-400/15 bg-slate-950/55 p-6 shadow-[0_24px_120px_rgba(3,10,18,0.55)] backdrop-blur lg:p-8">
             <div className="flex flex-col gap-8 lg:flex-row lg:items-start lg:justify-between">
               <div className="max-w-3xl">

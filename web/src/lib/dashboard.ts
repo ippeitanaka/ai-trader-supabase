@@ -111,6 +111,7 @@ type SymbolSummary = {
 
 type DashboardData = {
   generatedAt: string;
+  dataErrors: string[];
   pairSelector: PairSelectorResponse;
   recentEaLogs: EALogRecord[];
   recentTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
@@ -161,6 +162,21 @@ async function safeFetch<T>(loader: () => Promise<T>, fallback: T): Promise<T> {
     return await loader();
   } catch {
     return fallback;
+  }
+}
+
+async function safeFetchWithError<T>(label: string, loader: () => Promise<T>, fallback: T): Promise<{ data: T; error: string | null }> {
+  try {
+    return {
+      data: await loader(),
+      error: null,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      data: fallback,
+      error: `${label}: ${message}`,
+    };
   }
 }
 
@@ -300,17 +316,33 @@ async function fetchClosedTrades(period: string): Promise<AISignalRecord[]> {
 export async function getDashboardData(period = "30"): Promise<DashboardData> {
   requireEnv();
 
-  const [pairSelector, recentEaLogs, recentTrades, openTrades, selectedTrades, totalTrades] = await Promise.all([
-    safeFetch(fetchPairSelector, { latest: null, live_context: null }),
-    safeFetch(fetchRecentEaLogs, []),
-    safeFetch(fetchRecentTrades, []),
-    safeFetch(fetchOpenTrades, []),
-    safeFetch(() => fetchClosedTrades(period), []),
-    safeFetch(() => fetchClosedTrades("all"), []),
+  const [pairSelectorResult, recentEaLogsResult, recentTradesResult, openTradesResult, selectedTradesResult, totalTradesResult] = await Promise.all([
+    safeFetchWithError("pair-selector", fetchPairSelector, { latest: null, live_context: null }),
+    safeFetchWithError("ea-log recent", fetchRecentEaLogs, []),
+    safeFetchWithError("ai_signals recent", fetchRecentTrades, []),
+    safeFetchWithError("ai_signals open", fetchOpenTrades, []),
+    safeFetchWithError(`ai_signals period ${period}`, () => fetchClosedTrades(period), []),
+    safeFetchWithError("ai_signals total", () => fetchClosedTrades("all"), []),
   ]);
+
+  const pairSelector = pairSelectorResult.data;
+  const recentEaLogs = recentEaLogsResult.data;
+  const recentTrades = recentTradesResult.data;
+  const openTrades = openTradesResult.data;
+  const selectedTrades = selectedTradesResult.data;
+  const totalTrades = totalTradesResult.data;
+  const dataErrors = [
+    pairSelectorResult.error,
+    recentEaLogsResult.error,
+    recentTradesResult.error,
+    openTradesResult.error,
+    selectedTradesResult.error,
+    totalTradesResult.error,
+  ].filter((value): value is string => Boolean(value));
 
   return {
     generatedAt: new Date().toISOString(),
+    dataErrors,
     pairSelector,
     recentEaLogs,
     recentTrades: decorateTrades(recentTrades),
