@@ -14,3 +14,9 @@ verify_jwt = false
 
 [functions.ml-training]
 verify_jwt = false
+
+[functions.pair-selector]
+verify_jwt = false
+
+[functions.pair-selector-page]
+verify_jwt = false

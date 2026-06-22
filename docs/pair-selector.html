@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>今日の推奨ペア</title>
+  <style>
+    :root {
+      --bg: #f5efe4;
+      --panel: rgba(255, 251, 244, 0.92);
+      --ink: #1f1a17;
+      --muted: #6c6259;
+      --line: #ddcdbb;
+      --accent: #a44e29;
+      --good: #dceddb;
+      --good-line: #779f75;
+      --neutral: #efe6d3;
+      --neutral-line: #af9567;
+      --bad: #f4dbd8;
+      --bad-line: #ba6f6b;
+      --shadow: 0 14px 36px rgba(54, 34, 18, 0.10);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: Georgia, "Hiragino Mincho ProN", "Yu Mincho", serif;
+      background:
+        radial-gradient(circle at top right, rgba(164, 78, 41, 0.10), transparent 28%),
+        linear-gradient(180deg, #f8f3eb 0%, var(--bg) 100%);
+    }
+    .wrap {
+      width: min(1120px, calc(100% - 28px));
+      margin: 24px auto 56px;
+    }
+    .hero, .section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 26px;
+      box-shadow: var(--shadow);
+    }
+    .hero {
+      padding: 26px;
+    }
+    .eyebrow {
+      font-size: 12px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 10px;
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(30px, 4vw, 52px);
+      line-height: 1.06;
+    }
+    .summary {
+      margin: 0;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1.7;
+      max-width: 72ch;
+    }
+    .meta, .legend {
+      display: grid;
+      gap: 12px;
+      margin-top: 18px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+    .chip, .legend-card {
+      background: rgba(255,255,255,0.72);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px 16px;
+    }
+    .chip strong, .legend-card strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+      color: var(--accent);
+    }
+    .chip span, .legend-card p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+      margin: 0;
+    }
+    .actions {
+      margin-top: 18px;
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    button, a.button {
+      appearance: none;
+      border: none;
+      cursor: pointer;
+      text-decoration: none;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 999px;
+      padding: 12px 18px;
+      font-size: 14px;
+      font-family: inherit;
+    }
+    a.button.secondary {
+      background: transparent;
+      color: var(--accent);
+      border: 1px solid var(--accent);
+    }
+    .status {
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .section {
+      margin-top: 24px;
+      padding: 22px;
+    }
+    .section h2 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+    .section p.lead {
+      margin: 0 0 16px;
+      color: var(--muted);
+    }
+    .context-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+    }
+    .context-card {
+      background: rgba(255,255,255,0.62);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+    }
+    .context-card h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.78);
+      border: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .list {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .list li + li {
+      margin-top: 8px;
+    }
+    .headline-summary {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      border-radius: 20px;
+      padding: 18px;
+      border: 1px solid transparent;
+      min-height: 170px;
+    }
+    .card.good { background: var(--good); border-color: var(--good-line); }
+    .card.neutral { background: var(--neutral); border-color: var(--neutral-line); }
+    .card.bad { background: var(--bad); border-color: var(--bad-line); }
+    .head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+    }
+    .head h3 {
+      margin: 0;
+      font-size: 24px;
+    }
+    .score {
+      font-size: 34px;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .badge {
+      display: inline-block;
+      margin-top: 10px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.72);
+      font-size: 12px;
+    }
+    .reason {
+      margin: 14px 0 0;
+      font-size: 15px;
+      line-height: 1.6;
+    }
+    .caution {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .pair-note-list {
+      margin: 12px 0 0;
+      padding-left: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .pair-note-list li + li {
+      margin-top: 6px;
+    }
+    .empty {
+      background: rgba(255,255,255,0.5);
+      border: 1px dashed var(--line);
+      border-radius: 16px;
+      padding: 18px;
+      color: var(--muted);
+    }
+    @media (max-width: 700px) {
+      .wrap { width: min(100% - 18px, 1120px); margin: 18px auto 36px; }
+      .hero, .section { border-radius: 18px; }
+      .hero { padding: 18px; }
+      .section { padding: 18px; }
+      .head h3 { font-size: 20px; }
+      .score { font-size: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <div class="eyebrow">AI Pair Selector</div>
+      <h1>今日の推奨ペア</h1>
+      <p id="summary" class="summary">読み込み中です...</p>
+      <div class="meta">
+        <div class="chip"><strong>生成日時</strong><span id="generatedAt">-</span></div>
+        <div class="chip"><strong>時間足</strong><span id="timeframe">-</span></div>
+        <div class="chip"><strong>周期</strong><span id="cadence">-</span></div>
+        <div class="chip"><strong>参照期間</strong><span id="lookback">-</span></div>
+        <div class="chip"><strong>指標結果</strong><span id="actualFeedStatus">-</span></div>
+      </div>
+      <div class="legend">
+        <div class="legend-card">
+          <strong>スコア</strong>
+          <p>0から100で相性を表します。高いほど今のロジックと直近成績の相性が良い想定です。</p>
+        </div>
+        <div class="legend-card">
+          <strong>信頼度</strong>
+          <p>直近の実トレード件数が多いほど高くなります。低い場合は参考度が低めです。</p>
+        </div>
+        <div class="legend-card">
+          <strong>見方</strong>
+          <p>おすすめを優先し、避けるは今日のEAセット対象から外す、という使い方を想定しています。</p>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="reloadButton" type="button">再読み込み</button>
+        <a class="button secondary" id="jsonLink" target="_blank" rel="noreferrer">JSONを開く</a>
+      </div>
+      <div id="status" class="status"></div>
+    </section>
+
+    <section class="section">
+      <h2>市場環境</h2>
+      <p class="lead">ニュース、マクロ要因、直近の市場反応を要約した根拠です。</p>
+      <div class="context-grid">
+        <div class="context-card">
+          <h3>現在の要約</h3>
+          <p id="marketSummary" class="lead">読み込み中です...</p>
+        </div>
+        <div class="context-card">
+          <h3>主要テーマ</h3>
+          <div id="marketThemes" class="pill-row"></div>
+        </div>
+        <div class="context-card">
+          <h3>リスク水準</h3>
+          <p id="riskLevel" class="lead">-</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>ニュース見出し</h2>
+      <p class="lead">AIが参照する直近ニュースです。</p>
+      <ul id="headlines" class="list"></ul>
+    </section>
+
+    <section class="section">
+      <h2>経済イベント</h2>
+      <p class="lead">今から48時間以内の重要イベントと、直近のイベントです。</p>
+      <ul id="economicEvents" class="list"></ul>
+    </section>
+
+    <section class="section">
+      <h2>市場スナップショット</h2>
+      <p class="lead">主要ペアや関連資産の直近変動です。</p>
+      <div id="snapshots" class="cards"></div>
+    </section>
+
+    <section class="section">
+      <h2>おすすめ</h2>
+      <p class="lead">今日EAを優先的にセットする候補です。理由には市場環境とシステム直近実績の両方を含みます。</p>
+      <div id="recommended" class="cards"></div>
+    </section>
+
+    <section class="section">
+      <h2>中立</h2>
+      <p class="lead">データ不足または優位性が弱い候補です。</p>
+      <div id="neutral" class="cards"></div>
+    </section>
+
+    <section class="section">
+      <h2>避ける</h2>
+      <p class="lead">直近で相性が悪く、今日は外したい候補です。</p>
+      <div id="avoided" class="cards"></div>
+    </section>
+
+    <section class="section">
+      <h2>最優先</h2>
+      <p class="lead">今すぐ見るべき上位候補です。</p>
+      <div id="topPicks" class="cards"></div>
+    </section>
+  </main>
+
+  <script>
+    const API_URL = "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/pair-selector?limit=1";
+
+    function text(value) {
+      return value == null ? "-" : String(value);
+    }
+
+    function cadenceLabel(value) {
+      if (value === "daily") return "日次";
+      if (value === "weekly") return "週次";
+      return text(value);
+    }
+
+    function confidenceLabel(value) {
+      if (value === "high") return "信頼度 高";
+      if (value === "medium") return "信頼度 中";
+      return "信頼度 低";
+    }
+
+    function formatSignedNumber(value) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "-";
+      const prefix = num > 0 ? "+" : "";
+      return prefix + new Intl.NumberFormat("ja-JP").format(Math.round(num));
+    }
+
+    function translateMarketNote(note) {
+      const raw = text(note).trim();
+      if (!raw) return "-";
+      if (raw === "live market snapshot unavailable") return "市場スナップショットを取得できませんでした";
+      if (raw === "current price reaction is sharp and whipsaw risk is elevated") return "現在の値動きは急で、往復びんたのリスクが高めです";
+      if (raw === "current move is directional without excessive intraday noise") return "現在の値動きは方向感があり、短期ノイズは過度ではありません";
+      if (raw === "price action is mixed and not strongly directional") return "値動きは混在しており、強い方向感はまだありません";
+      if (raw === "USD is firm today, which keeps pressure on USD-quote FX pairs") return "本日はドルが強く、対ドル通貨ペアには重しになりやすい状況です";
+      if (raw === "broad USD strength is part of the current move") return "足元の値動きには広いドル高が影響しています";
+      if (raw === "higher US yields are reinforcing USDJPY upside pressure") return "米金利上昇が USDJPY の上昇圧力を強めています";
+      if (raw === "rising US yields are a headwind for precious metals") return "米金利上昇は金属に逆風です";
+      if (raw === "risk appetite remains constructive for bitcoin") return "市場のリスク選好はビットコインに追い風です";
+      if (raw === "macro risk-off pressure can quickly hit crypto volatility") return "マクロのリスクオフ圧力で暗号資産は急変しやすい地合いです";
+
+      const headlineMatch = raw.match(/^headline flow:\s*(.+)$/i);
+      if (headlineMatch) {
+        return "関連見出し: " + headlineMatch[1];
+      }
+
+      const eventMatch = raw.match(/^(upcoming|recent)\s+([A-Z]{3})\s+(.+?)(?:\s+actual=([^\s]+))?(?:\s+forecast=([^\s]+))?(?:\s+reaction=([^\s]+))?$/i);
+      if (eventMatch) {
+        const timing = eventMatch[1].toLowerCase() === "upcoming" ? "予定" : "直近";
+        const country = eventMatch[2];
+        const title = eventMatch[3];
+        const actual = eventMatch[4] ? " / 結果 " + eventMatch[4] : "";
+        const forecast = eventMatch[5] ? " / 予想 " + eventMatch[5] : "";
+        const reaction = eventMatch[6] ? " / 判定 " + surpriseLabel(eventMatch[6]) : "";
+        return timing + " " + country + " " + title + actual + forecast + reaction;
+      }
+
+      return raw;
+    }
+
+    function countryLabel(value) {
+      if (value === "USD") return "米国";
+      if (value === "EUR") return "ユーロ圏";
+      if (value === "GBP") return "英国";
+      if (value === "JPY") return "日本";
+      if (value === "CAD") return "カナダ";
+      if (value === "AUD") return "豪州";
+      if (value === "NZD") return "NZ";
+      if (value === "CHF") return "スイス";
+      return text(value);
+    }
+
+    function economicTitleLabel(value) {
+      let next = text(value).trim();
+      next = next.replace(/\by\/y\b/gi, "前年比");
+      next = next.replace(/\bm\/m\b/gi, "前月比");
+      next = next.replace(/\bq\/q\b/gi, "前期比");
+      next = next.replace(/^FOMC Member\s+(.+?)\s+Speaks$/i, "FOMCメンバー $1 発言");
+      next = next.replace(/^German Buba President\s+(.+?)\s+Speaks$/i, "独連銀総裁 $1 発言");
+      next = next.replace(/^Credit Card Spending\s+前年比$/i, "クレジットカード支出 前年比");
+      next = next.replace(/^Median CPI\s+前年比$/i, "中央値CPI 前年比");
+      next = next.replace(/^Trimmed CPI\s+前年比$/i, "トリムCPI 前年比");
+      next = next.replace(/^Common CPI\s+前年比$/i, "共通CPI 前年比");
+      return next;
+    }
+
+    function formatReason(reason) {
+      const raw = text(reason).trim();
+      const marketSplit = raw.split('; market=');
+      const base = marketSplit[0];
+      const market = marketSplit[1];
+      const match = base.match(/recent real=(\d+), win_rate=([\d.]+)%, pnl=([-\d.]+)/i);
+      if (match) {
+        const systemText = "システム実績: 直近実トレード " + match[1] + "回 / 勝率 " + match[2] + "% / 損益 " + formatSignedNumber(match[3]);
+        if (market) {
+          return systemText + " / 市場環境: " + translateMarketNote(market);
+        }
+        return systemText;
+      }
+      if (raw === "Fallback selection based on recent realized performance and sample size.") {
+        return "直近の実トレード成績とサンプル数をもとに選定しています。";
+      }
+      if (market) {
+        return base + " / 市場環境: " + translateMarketNote(market);
+      }
+      if (raw === "selected by AI") return "AI が選定しました。";
+      if (raw === "avoided by AI") return "AI が回避候補と判断しました。";
+      return raw;
+    }
+
+    function cautionLabel(value) {
+      if (value === "sample_small") return "サンプル数が少ないため参考度は低めです";
+      return text(value);
+    }
+
+    function pairBiasLabel(value) {
+      if (value === "supportive") return "市場は追い風";
+      if (value === "cautious") return "市場は注意寄り";
+      return "市場は中立";
+    }
+
+    function renderCards(targetId, pairs, tone, pairNotesMap) {
+      const target = document.getElementById(targetId);
+      if (!target) return;
+      if (!Array.isArray(pairs) || pairs.length === 0) {
+        target.innerHTML = '<div class="empty">該当なし</div>';
+        return;
+      }
+      target.innerHTML = pairs.map((pair) => {
+        const pairNote = pairNotesMap && pairNotesMap.get(pair.symbol);
+        const noteItems = pairNote && Array.isArray(pairNote.notes)
+          ? pairNote.notes.map((note) => '<li>' + text(translateMarketNote(note)) + '</li>').join('')
+          : '';
+        const noteBlock = pairNote
+          ? '<ul class="pair-note-list"><li><strong>' + pairBiasLabel(pairNote.bias) + '</strong></li>' + noteItems + '</ul>'
+          : '';
+        return '<article class="card ' + tone + '">' +
+          '<div class="head"><h3>' + text(pair.symbol) + '</h3><div class="score">' + text(pair.score) + '</div></div>' +
+          '<div class="badge">' + confidenceLabel(pair.confidence) + '</div>' +
+          '<p class="reason">' + formatReason(pair.reason) + '</p>' +
+          noteBlock +
+          (pair.caution ? '<div class="caution">注意: ' + cautionLabel(pair.caution) + '</div>' : '') +
+          '</article>';
+      }).join('');
+    }
+
+    function riskLabel(value) {
+      if (value === "high") return "高: 値動きが荒く、急反転警戒";
+      if (value === "medium") return "中: テーマはあるがノイズも混在";
+      return "低: 極端な混乱は比較的少ない";
+    }
+
+    function renderThemes(themes) {
+      const target = document.getElementById("marketThemes");
+      const items = Array.isArray(themes) ? themes : [];
+      target.innerHTML = items.length > 0
+        ? items.map((theme) => '<span class="pill">' + text(theme) + '</span>').join('')
+        : '<span class="pill">情報なし</span>';
+    }
+
+    function renderHeadlines(headlines) {
+      const target = document.getElementById("headlines");
+      const items = Array.isArray(headlines) ? headlines : [];
+      target.innerHTML = items.length > 0
+        ? items.map((headline) => {
+            const summary = headline.summary
+              ? '<div class="headline-summary">' + text(headline.summary) + '</div>'
+              : '';
+            const link = text(headline.resolved_url || headline.url);
+            return '<li><a href="' + link + '" target="_blank" rel="noreferrer">' + text(headline.title) + '</a> (' + text(headline.source) + ')' + summary + '</li>';
+          }).join('')
+        : '<li>直近ニュースは取得できませんでした</li>';
+    }
+
+    function renderSnapshots(snapshots) {
+      const target = document.getElementById("snapshots");
+      const items = Array.isArray(snapshots) ? snapshots : [];
+      if (items.length === 0) {
+        target.innerHTML = '<div class="empty">市場スナップショットなし</div>';
+        return;
+      }
+      target.innerHTML = items.map((item) => {
+        return '<article class="card neutral">' +
+          '<div class="head"><h3>' + text(item.key) + '</h3><div class="score">' + text(item.day_change_pct) + '%</div></div>' +
+          '<div class="badge">週次 ' + text(item.week_change_pct) + '%</div>' +
+          '<p class="reason">' + text(item.label) + ' / 価格 ' + text(item.price) + ' / 実現ボラ ' + text(item.realized_vol_pct) + '%</p>' +
+          '</article>';
+      }).join('');
+    }
+
+    function expectedBiasLabel(value) {
+      if (value === "hawkish") return "引き締め寄り";
+      if (value === "dovish") return "緩和寄り";
+      return "中立";
+    }
+
+    function reactionBiasLabel(value) {
+      if (value === "supports_usd") return "ドル追い風";
+      if (value === "hurts_usd") return "ドル逆風";
+      if (value === "supports_risk") return "リスク選好";
+      if (value === "hurts_risk") return "リスク回避";
+      return "混在";
+    }
+
+    function surpriseLabel(value) {
+      if (value === "aligned") return "結果と反応が整合";
+      if (value === "contrary") return "結果と反応が逆行";
+      if (value === "muted") return "反応は限定的";
+      return "判定材料不足";
+    }
+
+    function buildEconomicNarrative(event) {
+      const parts = [];
+      const title = event.title_ja || economicTitleLabel(event.title);
+      if (event.status === "upcoming") {
+        if (event.forecast) {
+          parts.push("予想は " + text(event.forecast));
+        }
+        if (event.expected_bias) {
+          parts.push("事前想定は " + expectedBiasLabel(event.expected_bias));
+        }
+        return parts.length > 0 ? parts.join("、") : "結果待ちです";
+      }
+
+      if (event.actual && event.forecast) {
+        parts.push(title + " は結果 " + text(event.actual) + " に対し予想 " + text(event.forecast));
+      } else if (event.actual) {
+        parts.push(title + " の結果は " + text(event.actual));
+      } else {
+        parts.push(title + " の結果は未取得です");
+      }
+
+      if (event.reaction_bias) {
+        parts.push("市場は " + reactionBiasLabel(event.reaction_bias));
+      }
+      if (event.surprise_proxy) {
+        parts.push(surpriseLabel(event.surprise_proxy));
+      }
+      return parts.join("、");
+    }
+
+    function renderEconomicEvents(events) {
+      const target = document.getElementById("economicEvents");
+      const items = Array.isArray(events) ? events : [];
+      target.innerHTML = items.length > 0
+        ? items.map((event) => {
+            const localDate = event.date ? new Date(event.date).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" }) : "-";
+          const country = event.country_label_ja || countryLabel(event.country);
+          const title = event.title_ja || economicTitleLabel(event.title);
+            const actual = event.actual ? " / 結果 " + text(event.actual) : event.status === "recent" ? " / 結果 未取得" : "";
+            const forecast = event.forecast ? " / 予想 " + text(event.forecast) : "";
+            const previous = event.previous ? " / 前回 " + text(event.previous) : "";
+            const affected = Array.isArray(event.affected_symbols) ? event.affected_symbols.join(", ") : "-";
+            const status = event.status === "upcoming" ? "予定" : "直近";
+            const expected = event.expected_bias ? " / 想定バイアス " + expectedBiasLabel(event.expected_bias) : "";
+            const reaction = event.reaction_bias ? " / 市場反応 " + reactionBiasLabel(event.reaction_bias) : "";
+            const surprise = event.surprise_proxy ? " / 判定 " + surpriseLabel(event.surprise_proxy) : "";
+            const narrative = buildEconomicNarrative(event);
+            return '<li>' +
+              '<strong>' + text(status) + '</strong> ' + country + ' ' + title +
+              ' (' + text(event.impact) + ', ' + localDate + ')' + actual + forecast + previous + expected + reaction + surprise +
+              ' / 関連: ' + affected +
+              '<div class="headline-summary">' + text(narrative) + '</div>' +
+              '</li>';
+          }).join('')
+        : '<li>該当イベントなし</li>';
+    }
+
+    async function loadReport() {
+      const status = document.getElementById("status");
+      status.textContent = "最新データを取得中です...";
+      try {
+        const response = await fetch(API_URL, { headers: { "Accept": "application/json" } });
+        if (!response.ok) {
+          throw new Error("API error: " + response.status);
+        }
+        const payload = await response.json();
+        const report = payload && payload.latest ? payload.latest : null;
+        const liveContext = payload && payload.live_context ? payload.live_context : null;
+        const pairNotesMap = new Map(((liveContext && liveContext.pair_notes) || []).map((note) => [note.symbol, note]));
+        if (!report) {
+          throw new Error("最新レポートが見つかりません");
+        }
+
+        document.getElementById("summary").textContent = formatReason(report.summary);
+        document.getElementById("generatedAt").textContent = report.generated_at
+          ? new Date(report.generated_at).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" })
+          : "-";
+        document.getElementById("timeframe").textContent = text(report.timeframe || "M15");
+        document.getElementById("cadence").textContent = cadenceLabel(report.cadence || "daily");
+        document.getElementById("lookback").textContent = text(report.lookback_days) + "日";
+        document.getElementById("actualFeedStatus").textContent = liveContext && Array.isArray(liveContext.economic_events) && liveContext.economic_events.some((event) => !!event.actual)
+          ? "actual 連携あり"
+          : "fallback のみ";
+        document.getElementById("jsonLink").href = API_URL;
+        document.getElementById("marketSummary").textContent = liveContext && liveContext.summary ? text(liveContext.summary) : "市場環境データなし";
+        document.getElementById("riskLevel").textContent = riskLabel(liveContext && liveContext.risk_level ? liveContext.risk_level : "low");
+
+        renderThemes(liveContext && liveContext.themes ? liveContext.themes : []);
+        renderHeadlines(liveContext && liveContext.headlines ? liveContext.headlines : []);
+        renderEconomicEvents(liveContext && liveContext.economic_events ? liveContext.economic_events : []);
+        renderSnapshots(liveContext && liveContext.snapshots ? liveContext.snapshots : []);
+
+        renderCards("recommended", report.recommended_pairs || [], "good", pairNotesMap);
+        renderCards("neutral", report.neutral_pairs || [], "neutral", pairNotesMap);
+        renderCards("avoided", report.avoided_pairs || [], "bad", pairNotesMap);
+        renderCards("topPicks", report.top_picks || [], "good", pairNotesMap);
+
+        status.textContent = "更新完了";
+      } catch (error) {
+        document.getElementById("summary").textContent = "読み込みに失敗しました。";
+        document.getElementById("marketSummary").textContent = "市場環境の読み込みに失敗しました。";
+        document.getElementById("riskLevel").textContent = "-";
+        document.getElementById("actualFeedStatus").textContent = "-";
+        status.textContent = String(error && error.message ? error.message : error);
+        renderThemes([]);
+        renderHeadlines([]);
+        renderEconomicEvents([]);
+        renderSnapshots([]);
+        renderCards("recommended", [], "good", new Map());
+        renderCards("neutral", [], "neutral", new Map());
+        renderCards("avoided", [], "bad", new Map());
+        renderCards("topPicks", [], "good", new Map());
+      }
+    }
+
+    document.getElementById("reloadButton").addEventListener("click", loadReport);
+    document.getElementById("jsonLink").href = API_URL;
+    loadReport();
+  </script>
+</body>
+</html>

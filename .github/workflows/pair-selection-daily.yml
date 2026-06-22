@@ -1,0 +1,107 @@
+name: Pair Selection Daily
+
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+    inputs:
+      cadence:
+        description: 'daily or weekly'
+        required: false
+        default: 'daily'
+      lookback_days:
+        description: 'Lookback days for selection'
+        required: false
+        default: '21'
+      top_n:
+        description: 'Number of pairs to pick'
+        required: false
+        default: '3'
+
+jobs:
+  pair-selection:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run pair selection
+        env:
+          CADENCE: ${{ github.event.inputs.cadence || 'daily' }}
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '21' }}
+          TOP_N: ${{ github.event.inputs.top_n || '3' }}
+          PAIR_SELECTOR_SLACK_WEBHOOK_URL: ${{ secrets.PAIR_SELECTOR_SLACK_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE=$(curl --retry 3 --retry-all-errors --retry-delay 10 --connect-timeout 10 --max-time 300 -sS -w "\n%{http_code}" -X POST \
+            "${{ secrets.SUPABASE_URL }}/functions/v1/pair-selector" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"cadence\":\"${CADENCE}\",\"lookback_days\":${LOOKBACK_DAYS},\"top_n\":${TOP_N},\"triggered_by\":\"github-actions\"}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "HTTP Status: $HTTP_CODE"
+          echo "$BODY" | jq '.' || echo "$BODY"
+
+          DIGEST=$(echo "$BODY" | jq -r '.digest_text // .report.digest_text // empty')
+          DIGEST_LINES=$(echo "$BODY" | jq -c '.digest_lines // .report.digest_lines // []')
+          DIGEST_JSON=$(echo "$BODY" | jq -c '.digest // .report.digest // {}')
+          if [ -n "$DIGEST" ]; then
+            echo "---- Pair Selector Digest ----"
+            echo "$DIGEST"
+
+            {
+              echo "## Pair Selector Digest"
+              echo
+              echo "$DIGEST_LINES" | jq -r '.[] | "- " + .'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            if [ -n "$PAIR_SELECTOR_SLACK_WEBHOOK_URL" ]; then
+              jq -n \
+                --arg text "$DIGEST" \
+                --argjson lines "$DIGEST_LINES" \
+                --argjson digest "$DIGEST_JSON" \
+                '{
+                  text: $text,
+                  blocks: [
+                    {
+                      type: "header",
+                      text: {
+                        type: "plain_text",
+                        text: "AI Pair Selector"
+                      }
+                    },
+                    {
+                      type: "section",
+                      text: {
+                        type: "mrkdwn",
+                        text: ("*推奨:* " + ($digest.top_pick_symbol // "なし") + "\n"
+                          + "*リスク:* " + ($digest.risk_label // "-") + "\n"
+                          + "*市場テーマ:* " + (($digest.market_themes // []) | if length > 0 then join(" / ") else "情報なし" end) + "\n"
+                          + "*回避候補:* " + (($digest.avoided_symbols // []) | if length > 0 then join(", ") else "特になし" end))
+                      }
+                    },
+                    {
+                      type: "section",
+                      text: {
+                        type: "mrkdwn",
+                        text: (([
+                          ($digest.top_pick_reason // empty | if . != "" then "*推奨理由:* " + . else empty end),
+                          ($digest.avoided_reason // empty | if . != "" then "*回避理由:* " + . else empty end)
+                        ] | map(select(. != "")) | join("\n")))
+                      }
+                    }
+                  ]
+                }' \
+                | curl --retry 3 --retry-all-errors --retry-delay 10 --connect-timeout 10 --max-time 60 -sS -X POST \
+                    -H "Content-Type: application/json" \
+                    --data @- \
+                    "$PAIR_SELECTOR_SLACK_WEBHOOK_URL" >/dev/null
+              echo "Slack notification sent"
+            fi
+          fi
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            exit 1
+          fi

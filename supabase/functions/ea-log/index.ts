@@ -21,6 +21,15 @@ interface EALogEntry {
   sell_win_prob?: number;        // dir=0両方向評価のSELL勝率（0-1）
   trade_decision?: string;       // 実際の取引状況
   win_prob?: number;             // AIの算出した勝率
+  recommended_min_win_prob?: number;
+  expected_value_r?: number;
+  skip_reason?: string;
+  decision_summary?: string;
+  threshold_met?: boolean;
+  current_positions?: number;
+  entry_method?: string;
+  method_selected_by?: string;
+  method_reason?: string;
   lot_multiplier?: number;       // AI/ML suggested lot multiplier
   lot_level?: string;            // Lot sizing level label
   lot_reason?: string;           // Reason for lot multiplier
@@ -58,8 +67,15 @@ interface EALogInput {
   ai_confidence?: string;
   ai_reasoning?: string;
   trade_decision?: string;
+  decision_summary?: string;
+  recommended_min_win_prob?: number;
+  expected_value_r?: number;
+  skip_reason?: string;
   threshold_met?: boolean;
   current_positions?: number;
+  entry_method?: string;
+  method_selected_by?: string;
+  method_reason?: string;
   lot_multiplier?: number;
   lot_level?: string;
   lot_reason?: string;
@@ -211,6 +227,19 @@ function attachRegimeToReasoning(reasoning: unknown, regime?: string, strategy?:
   return text ? `${prefix} ${text}` : prefix;
 }
 
+function pickDecisionSummary(body: any): string | undefined {
+  const candidates = [
+    body?.decision_summary,
+    body?.ai_trader_response?.decision_summary,
+    body?.ai?.decision_summary,
+    body?.response?.decision_summary,
+  ];
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return undefined;
+}
+
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -295,6 +324,7 @@ serve(async (req: Request) => {
     // Extract only essential columns for simplified ea-log table
     // EA can send all fields, but we only store what's needed for monitoring
     const pickedReasoning = pickAiReasoning(body as any);
+    const decisionSummary = pickDecisionSummary(body as any);
     const pickedRegime = pickRegimeFields(body as any, pickedReasoning);
     const normalizedReasoning = attachRegimeToReasoning(
       pickedReasoning,
@@ -302,6 +332,9 @@ serve(async (req: Request) => {
       pickedRegime.strategy ?? body.strategy,
       pickedRegime.regime_confidence ?? body.regime_confidence,
     );
+    const storedReasoning = decisionSummary
+      ? (normalizedReasoning ? `${decisionSummary} | ${normalizedReasoning}` : decisionSummary)
+      : normalizedReasoning;
 
     const logEntry: EALogEntry = {
       at: toISO(body.at),
@@ -318,11 +351,20 @@ serve(async (req: Request) => {
       sell_win_prob: body.sell_win_prob !== undefined ? Number(body.sell_win_prob) : undefined,
       trade_decision: body.trade_decision || undefined,
       win_prob: body.win_prob !== undefined ? Number(body.win_prob) : undefined,
+      recommended_min_win_prob: body.recommended_min_win_prob !== undefined ? Number(body.recommended_min_win_prob) : undefined,
+      expected_value_r: body.expected_value_r !== undefined ? Number(body.expected_value_r) : undefined,
+      skip_reason: body.skip_reason || undefined,
+      decision_summary: decisionSummary,
+      threshold_met: typeof body.threshold_met === "boolean" ? body.threshold_met : undefined,
+      current_positions: body.current_positions !== undefined ? Number(body.current_positions) : undefined,
+      entry_method: body.entry_method || undefined,
+      method_selected_by: body.method_selected_by || undefined,
+      method_reason: body.method_reason || undefined,
       lot_multiplier: body.lot_multiplier !== undefined ? Number(body.lot_multiplier) : undefined,
       lot_level: body.lot_level || undefined,
       lot_reason: body.lot_reason || undefined,
       executed_lot: body.executed_lot !== undefined ? Number(body.executed_lot) : undefined,
-      ai_reasoning: normalizedReasoning,
+      ai_reasoning: storedReasoning,
       order_ticket: body.order_ticket !== undefined ? Number(body.order_ticket) : undefined,
     };
 
@@ -353,7 +395,7 @@ serve(async (req: Request) => {
         action: logEntry.action,
         trade_decision: logEntry.trade_decision,
         win_prob: logEntry.win_prob,
-        ai_reasoning: normalizedReasoning,
+        ai_reasoning: storedReasoning,
         order_ticket: logEntry.order_ticket,
       };
 

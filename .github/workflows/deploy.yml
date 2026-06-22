@@ -63,6 +63,8 @@ jobs:
           supabase functions deploy ai-signals --no-verify-jwt
           supabase functions deploy ai-signals-update --no-verify-jwt
           supabase functions deploy ml-training --no-verify-jwt
+          supabase functions deploy pair-selector --no-verify-jwt
+          supabase functions deploy pair-selector-page --no-verify-jwt
           echo "✅ All Edge Functions deployed successfully"
 
       - name: Set Edge Function Secrets
@@ -70,6 +72,7 @@ jobs:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           echo "Setting Edge Function secrets..."
@@ -89,4 +92,11 @@ jobs:
             echo "✅ OpenAI secrets configured"
           else
             echo "⚠️  WARNING: OPENAI_API_KEY not set, skipping OpenAI configuration"
+          fi
+
+          if [ -n "$FINNHUB_API_KEY" ]; then
+            supabase secrets set FINNHUB_API_KEY="$FINNHUB_API_KEY" --project-ref "$PROJECT_REF"
+            echo "✅ FINNHUB_API_KEY configured"
+          else
+            echo "⚠️  WARNING: FINNHUB_API_KEY not set, economic actuals stay in fallback-only mode"
           fi
