@@ -10,6 +10,7 @@
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  --font-title: var(--font-orbitron);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -36,4 +37,10 @@ a {
 ::selection {
   background: rgba(34, 197, 94, 0.35);
   color: white;
+}
+
+.font-title {
+  font-family: var(--font-orbitron), var(--font-geist-sans), sans-serif;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
