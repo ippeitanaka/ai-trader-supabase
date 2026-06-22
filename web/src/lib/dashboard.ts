@@ -128,9 +128,17 @@ type DashboardData = {
   };
 };
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? process.env.SUPABASE_URL ?? "";
+const RAW_SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? process.env.SUPABASE_URL ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SERVICE_ROLE_KEY ?? "";
-const PAIR_SELECTOR_URL = `${SUPABASE_URL}/functions/v1/pair-selector?limit=1`;
+
+function normalizeSupabaseProjectUrl(value: string) {
+  return value
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/(?:rest|functions)\/v1$/, "");
+}
+
+const SUPABASE_URL = normalizeSupabaseProjectUrl(RAW_SUPABASE_URL);
 
 function requireEnv() {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -183,6 +191,11 @@ async function safeFetchWithError<T>(label: string, loader: () => Promise<T>, fa
 function buildRestUrl(table: string, params: Record<string, string>) {
   const search = new URLSearchParams(params);
   return `${SUPABASE_URL}/rest/v1/${table}?${search.toString()}`;
+}
+
+function buildFunctionUrl(functionName: string, params: Record<string, string>) {
+  const search = new URLSearchParams(params);
+  return `${SUPABASE_URL}/functions/v1/${functionName}?${search.toString()}`;
 }
 
 function toIsoDaysAgo(days: number) {
@@ -264,7 +277,7 @@ function decorateTrades(trades: AISignalRecord[]) {
 }
 
 async function fetchPairSelector(): Promise<PairSelectorResponse> {
-  return fetchJson<PairSelectorResponse>(PAIR_SELECTOR_URL);
+  return fetchJson<PairSelectorResponse>(buildFunctionUrl("pair-selector", { limit: "1" }));
 }
 
 async function fetchRecentEaLogs(): Promise<EALogRecord[]> {

@@ -19,6 +19,8 @@ SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
 ```
 
+`SUPABASE_URL` と `NEXT_PUBLIC_SUPABASE_URL` には Supabase プロジェクトのルート URL を入れてください。`https://...supabase.co/rest/v1` や `https://...supabase.co/functions/v1` のような API パス付き URL は付けません。
+
 2. 依存関係を入れます。
 
 ```bash
@@ -53,6 +55,8 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
 ```
+
+ここでも URL は `https://your-project.supabase.co` を指定してください。
 
 7. `Deploy` を押します。
 8. 初回デプロイ後、Vercel の `Project Settings -> Domains` で独自ドメインを追加できます。
