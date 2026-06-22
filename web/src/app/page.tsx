@@ -392,22 +392,22 @@ export default async function Home({ searchParams }: PageProps) {
                 {data.recentEaLogs.map((log) => (
                   <div key={log.id} className="rounded-3xl border border-white/8 bg-white/5 p-4">
                     <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
-                      <div>
+                      <div className="min-w-0">
                         <div className="text-lg font-semibold text-white">{log.sym} {log.tf ?? "-"}</div>
                         <div className="mt-1 text-xs text-slate-400">{formatDateTime(log.at)}</div>
                       </div>
-                      <div className="flex flex-wrap gap-2 text-xs">
-                        <span className="rounded-full bg-cyan-300/10 px-3 py-1 text-cyan-100">{formatDirection(log.action)}</span>
-                        <span className="rounded-full bg-white/8 px-3 py-1 text-slate-200">{log.trade_decision ?? "-"}</span>
-                        <span className="rounded-full bg-emerald-300/10 px-3 py-1 text-emerald-100">勝率 {formatPercent(log.win_prob != null ? log.win_prob * 100 : null)}</span>
+                      <div className="flex flex-wrap gap-2 text-xs sm:justify-end">
+                        <span className="max-w-full rounded-full bg-cyan-300/10 px-3 py-1 text-cyan-100">{formatDirection(log.action)}</span>
+                        <span className="max-w-full rounded-full bg-white/8 px-3 py-1 text-slate-200">{log.trade_decision ?? "-"}</span>
+                        <span className="max-w-full rounded-full bg-emerald-300/10 px-3 py-1 text-emerald-100">勝率 {formatPercent(log.win_prob != null ? log.win_prob * 100 : null)}</span>
                       </div>
                     </div>
                     <p className="mt-3 text-sm leading-7 text-slate-100">{buildEaNarrative(log)}</p>
-                    {log.decision_summary ? <p className="mt-3 rounded-2xl border border-white/8 bg-slate-950/45 px-4 py-3 font-mono text-xs leading-6 text-slate-400">診断ログ: {log.decision_summary}</p> : null}
-                    <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-400">
-                      {log.entry_method ? <span>entry: {log.entry_method}</span> : null}
-                      {log.skip_reason ? <span>skip: {log.skip_reason}</span> : null}
-                      {log.order_ticket ? <span>ticket: {log.order_ticket}</span> : null}
+                    {log.decision_summary ? <p className="mt-3 overflow-hidden rounded-2xl border border-white/8 bg-slate-950/45 px-4 py-3 font-mono text-xs leading-6 break-all text-slate-400">診断ログ: {log.decision_summary}</p> : null}
+                    <div className="mt-2 flex flex-col gap-2 text-xs text-slate-400 sm:flex-row sm:flex-wrap sm:gap-3">
+                      {log.entry_method ? <span className="break-all">entry: {log.entry_method}</span> : null}
+                      {log.skip_reason ? <span className="break-all">skip: {log.skip_reason}</span> : null}
+                      {log.order_ticket ? <span className="break-all">ticket: {log.order_ticket}</span> : null}
                     </div>
                   </div>
                 ))}
