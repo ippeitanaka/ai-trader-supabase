@@ -385,22 +385,17 @@ export default async function Home({ searchParams }: PageProps) {
               <h1 className="font-title text-3xl font-semibold tracking-[0.16em] text-white sm:text-5xl">
                 Awaji Samurai AI Trader
               </h1>
-              <p className="mt-4 max-w-3xl text-base leading-8 text-slate-300 sm:text-lg">
-                本日の推奨ペア、リアルタイムの AI 判断、EA ログ、直近実トレード、指定期間成績、総合成績を 1 画面で確認できる運用ビューです。
-              </p>
               <div className="mt-6 grid gap-3 sm:grid-cols-3">
                 <HeroBadge label="更新 cadence" value={formatCadenceLabel(latest?.cadence ?? null)} />
                 <HeroBadge label="監視テーマ" value={`${liveContext?.themes?.length ?? 0} 件`} />
                 <HeroBadge label="選定 lookback" value={`${latest?.lookback_days ?? 21} 日`} />
               </div>
-              <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-start">
+              <div className="mt-5 flex flex-col gap-3 sm:items-start">
                 <AiRefreshButton
                   cadence={latest?.cadence ?? "daily"}
                   lookbackDays={latest?.lookback_days ?? 21}
                   topN={latest?.top_n ?? latest?.top_picks?.length ?? latest?.recommended_pairs?.length ?? 3}
                 />
-                <a href={`/api/dashboard?period=${period}`} className="rounded-full border border-emerald-300/25 bg-emerald-300/10 px-4 py-2 text-center text-sm text-emerald-100 transition hover:bg-emerald-300/16">Dashboard API</a>
-                <a href="https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/pair-selector?limit=1" className="rounded-full border border-white/12 bg-white/6 px-4 py-2 text-center text-sm text-slate-100 transition hover:bg-white/10">Pair Selector JSON</a>
               </div>
             </div>
 

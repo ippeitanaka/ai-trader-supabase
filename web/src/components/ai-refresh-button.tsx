@@ -56,7 +56,7 @@ export function AiRefreshButton({ cadence, lookbackDays, topN }: AiRefreshButton
         type="button"
         onClick={handleRefresh}
         disabled={isRefreshing}
-        className="rounded-full border border-cyan-300/28 bg-cyan-300/12 px-5 py-3 text-sm font-semibold text-cyan-50 transition hover:bg-cyan-300/18 disabled:cursor-not-allowed disabled:opacity-70"
+        className="rounded-full border border-amber-200/50 bg-[linear-gradient(135deg,rgba(251,191,36,0.96),rgba(249,115,22,0.92))] px-6 py-3 text-sm font-semibold text-slate-950 shadow-[0_14px_34px_rgba(249,115,22,0.35)] transition hover:brightness-105 hover:shadow-[0_18px_42px_rgba(249,115,22,0.48)] disabled:cursor-not-allowed disabled:opacity-70"
       >
         {isRefreshing ? "AI判定を更新中..." : "AI判定"}
       </button>
