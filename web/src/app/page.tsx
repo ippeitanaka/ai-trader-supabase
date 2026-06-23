@@ -62,6 +62,27 @@ function formatDateTime(value: string | null | undefined) {
   }).format(date) + " JST";
 }
 
+function formatEaLogDateTime(value: string | null | undefined, referenceIso: string | null | undefined) {
+  if (!value) return "-";
+
+  const normalized = value.trim();
+  const mt5Match = normalized.match(/^(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (!mt5Match) return formatDateTime(normalized);
+
+  const parsedUtc = new Date(`${mt5Match[1]}-${mt5Match[2]}-${mt5Match[3]}T${mt5Match[4]}:${mt5Match[5]}:${mt5Match[6]}Z`);
+  if (Number.isNaN(parsedUtc.getTime())) return normalized;
+
+  const reference = referenceIso ? new Date(referenceIso) : null;
+  if (reference && !Number.isNaN(reference.getTime())) {
+    const diffHours = Math.round((reference.getTime() - parsedUtc.getTime()) / (60 * 60 * 1000));
+    if (Math.abs(diffHours) <= 12) {
+      return formatDateTime(new Date(parsedUtc.getTime() + diffHours * 60 * 60 * 1000).toISOString());
+    }
+  }
+
+  return formatDateTime(parsedUtc.toISOString());
+}
+
 function formatPercent(value: number | null | undefined) {
   if (value == null || !Number.isFinite(value)) return "-";
   return `${value.toFixed(1)}%`;
@@ -554,7 +575,7 @@ export default async function Home({ searchParams }: PageProps) {
                   <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
                     <div className="min-w-0">
                       <div className="text-lg font-semibold text-white">{log.sym} {log.tf ?? "-"}</div>
-                      <div className="mt-1 text-xs text-slate-400">{formatDateTime(log.at)}</div>
+                      <div className="mt-1 text-xs text-slate-400">{formatEaLogDateTime(log.at, log.created_at)}</div>
                     </div>
                     <div className="flex flex-wrap gap-2 text-xs sm:justify-end">
                       <span className="max-w-full rounded-full bg-cyan-300/10 px-3 py-1 text-cyan-100">{formatDirection(log.action)}</span>
