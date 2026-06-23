@@ -2217,9 +2217,21 @@ void CheckPositionStatus()
          if(MathIsValidNumber(ep) && ep>0)
          {
             g_tracked[ti].entry_price=ep;
+            int posDir=0;
+            long posType=PositionGetInteger(POSITION_TYPE);
+            if(posType==POSITION_TYPE_BUY) posDir=1;
+            else if(posType==POSITION_TYPE_SELL) posDir=-1;
             string payload="{\"order_ticket\":\""+ULongToString(g_tracked[ti].order_ticket)+"\""+
                            ",\"entry_price\":"+DoubleToString(ep,_Digits)+
-                           ",\"actual_result\":\"FILLED\"}";
+                           ",\"actual_result\":\"FILLED\""+
+                           ",\"symbol\":\""+JsonEscape(_Symbol)+"\""+
+                           ",\"timeframe\":\"M15\""+
+                           ",\"dir\":"+IntegerToString(posDir)+
+                           ",\"reason\":\"rehydrated_existing_position\""+
+                           ",\"instance\":\""+JsonEscape(AI_EA_Instance)+"\""+
+                           ",\"model_version\":\""+JsonEscape(AI_EA_Version)+"\""+
+                           (g_tracked[ti].open_time>0 ? ",\"created_at\":\""+TimeToString(g_tracked[ti].open_time,TIME_DATE|TIME_SECONDS)+"\"" : "")+
+                           "}";
             string resp;
             if(HttpPostJson(AI_Signals_Update_URL,AI_Bearer_Token,payload,resp,3000))
             {
@@ -2290,10 +2302,26 @@ void CheckPositionStatus()
          g_trackedFillSent=false;
          g_trackedFillLastTry=0;
 
+         int posDir=0;
+         if(PositionSelectByTicket(posTicket))
+         {
+            long posType=PositionGetInteger(POSITION_TYPE);
+            if(posType==POSITION_TYPE_BUY) posDir=1;
+            else if(posType==POSITION_TYPE_SELL) posDir=-1;
+         }
+
          // シグナル更新（エントリー価格を記録） - order_ticketキーで更新
          string payload="{\"order_ticket\":\""+ULongToString(g_trackedOrderTicket)+"\""+
                         ",\"entry_price\":"+DoubleToString(g_trackedPositionEntryPrice,_Digits)+
-                        ",\"actual_result\":\"FILLED\"}";
+                        ",\"actual_result\":\"FILLED\""+
+                        ",\"symbol\":\""+JsonEscape(_Symbol)+"\""+
+                        ",\"timeframe\":\"M15\""+
+                        ",\"dir\":"+IntegerToString(posDir)+
+                        ",\"reason\":\"rehydrated_existing_position\""+
+                        ",\"instance\":\""+JsonEscape(AI_EA_Instance)+"\""+
+                        ",\"model_version\":\""+JsonEscape(AI_EA_Version)+"\""+
+                        (g_trackedPositionOpenTime>0 ? ",\"created_at\":\""+TimeToString(g_trackedPositionOpenTime,TIME_DATE|TIME_SECONDS)+"\"" : "")+
+                        "}";
          string resp;
          HttpPostJson(AI_Signals_Update_URL,AI_Bearer_Token,payload,resp,3000);
 

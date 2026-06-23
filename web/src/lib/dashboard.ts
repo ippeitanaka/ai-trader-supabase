@@ -91,6 +91,7 @@ type AISignalRecord = {
   entry_method?: string | null;
   is_virtual?: boolean | null;
   reverse_execution?: boolean | null;
+  is_manual_trade?: boolean | null;
 };
 
 type DashboardSummary = {
@@ -327,9 +328,13 @@ async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
 
 async function fetchRecentTrades(): Promise<AISignalRecord[]> {
   const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade",
     is_virtual: "eq.false",
-    order: "created_at.desc",
+    or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
+    reverse_execution: "eq.false",
+    closed_at: "not.is.null",
+    actual_result: "in.(WIN,LOSS,BREAK_EVEN)",
+    order: "closed_at.desc",
     limit: "12",
   });
   return fetchJson<AISignalRecord[]>(url);
@@ -337,8 +342,9 @@ async function fetchRecentTrades(): Promise<AISignalRecord[]> {
 
 async function fetchOpenTrades(): Promise<AISignalRecord[]> {
   const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade",
     is_virtual: "eq.false",
+    or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
     actual_result: "eq.FILLED",
     closed_at: "is.null",
     order: "created_at.desc",
@@ -349,8 +355,10 @@ async function fetchOpenTrades(): Promise<AISignalRecord[]> {
 
 async function fetchClosedTrades(period: string): Promise<AISignalRecord[]> {
   const params: Record<string, string> = {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade",
     is_virtual: "eq.false",
+    or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
+    reverse_execution: "eq.false",
     closed_at: "not.is.null",
     actual_result: "in.(WIN,LOSS,BREAK_EVEN)",
     order: "closed_at.desc",

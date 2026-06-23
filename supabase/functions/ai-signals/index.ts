@@ -340,6 +340,7 @@ interface AISignalEntry {
   ml_pattern_confidence?: number | null;
 
   // manual trade
+  is_manual_trade?: boolean | null;
   lot_size?: number;
 
   // lot sizing telemetry
@@ -707,6 +708,7 @@ serve(async (req: Request) => {
         ml_pattern_confidence: pgNumeric5_2(body.ml_pattern_confidence) ?? null,
 
         // manual trade
+        is_manual_trade: body.is_manual_trade ?? false,
         // NOTE: lot_size is numeric(10,2) in some schemas
         lot_size: pgNumeric10_2(body.lot_size) ?? undefined,
 
@@ -902,6 +904,7 @@ serve(async (req: Request) => {
         if (method_selected_by !== undefined) updateData.method_selected_by = method_selected_by;
         if (method_confidence !== undefined) updateData.method_confidence = method_confidence;
         if (method_reason !== undefined) updateData.method_reason = method_reason;
+        if (body.is_manual_trade !== undefined) updateData.is_manual_trade = body.is_manual_trade === true;
 
       // Guard: prevent FILLED without a valid order_ticket for non-virtual trades.
       // - Real execution should always have a positive order_ticket.

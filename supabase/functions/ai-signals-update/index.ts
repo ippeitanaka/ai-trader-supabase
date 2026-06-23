@@ -172,6 +172,38 @@ interface SignalUpdateRequest {
   order_ticket: number | string;
   entry_price?: number;
   actual_result?: string;
+  symbol?: string;
+  timeframe?: string;
+  dir?: number;
+  reason?: string;
+  instance?: string;
+  model_version?: string;
+  entry_method?: string;
+  is_virtual?: boolean;
+  reverse_execution?: boolean;
+  created_at?: string;
+}
+
+function safeText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeCreatedAt(value: unknown): string | null {
+  const text = safeText(value);
+  if (!text) return null;
+
+  const isoDate = new Date(text);
+  if (!Number.isNaN(isoDate.getTime())) {
+    return isoDate.toISOString();
+  }
+
+  const mt5Match = text.match(/^(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (!mt5Match) return null;
+
+  const [, year, month, day, hour, minute, second] = mt5Match;
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}Z`;
 }
 
 function parseOrderTicket(value: unknown): string | null {
@@ -257,14 +289,64 @@ serve(async (req: Request) => {
     }
     
     if (!data || data.length === 0) {
-      console.warn(`[ai-signals-update] No record found for ticket ${orderTicket}`);
+      const canCreatePlaceholder =
+        body.actual_result === "FILLED" &&
+        body.is_virtual !== true &&
+        safeText(body.symbol) !== null;
+
+      if (!canCreatePlaceholder) {
+        console.warn(`[ai-signals-update] No record found for ticket ${orderTicket}`);
+        return new Response(
+          JSON.stringify({ 
+            ok: false, 
+            message: "No matching record found",
+            order_ticket: orderTicket 
+          }),
+          { status: 404, headers: corsHeaders() }
+        );
+      }
+
+      const insertData: Record<string, unknown> = {
+        order_ticket: orderTicket,
+        actual_result: "FILLED",
+        symbol: safeText(body.symbol),
+        timeframe: safeText(body.timeframe) ?? "M15",
+        dir: body.dir === 1 || body.dir === -1 ? body.dir : null,
+        price: body.entry_price ?? null,
+        entry_price: body.entry_price ?? null,
+        reason: safeText(body.reason) ?? "rehydrated_existing_position",
+        instance: safeText(body.instance),
+        model_version: safeText(body.model_version),
+        entry_method: safeText(body.entry_method),
+        is_virtual: false,
+        reverse_execution: body.reverse_execution === true,
+      };
+
+      const createdAt = normalizeCreatedAt(body.created_at);
+      if (createdAt) insertData.created_at = createdAt;
+
+      const { data: inserted, error: insertError } = await supabase
+        .from("ai_signals")
+        .insert(insertData)
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error("[ai-signals-update] Placeholder insert failed:", insertError);
+        return new Response(
+          JSON.stringify({ error: "Placeholder insert failed", details: insertError.message }),
+          { status: 500, headers: corsHeaders() }
+        );
+      }
+
+      console.warn(`[ai-signals-update] Created FILLED placeholder for ticket ${orderTicket}`);
       return new Response(
-        JSON.stringify({ 
-          ok: false, 
-          message: "No matching record found",
-          order_ticket: orderTicket 
+        JSON.stringify({
+          ok: true,
+          created_placeholder: true,
+          data: inserted,
         }),
-        { status: 404, headers: corsHeaders() }
+        { status: 200, headers: corsHeaders() }
       );
     }
 

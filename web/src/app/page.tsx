@@ -40,7 +40,26 @@ const SKIP_REASON_LABELS: Record<string, string> = {
 
 function formatDateTime(value: string | null | undefined) {
   if (!value) return "-";
-  return `${new Date(value).toLocaleString("ja-JP", { timeZone: "Asia/Tokyo" })} JST`;
+
+  const normalized = value.trim();
+  const mt5Match = normalized.match(/^(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  const isoLike = mt5Match
+    ? `${mt5Match[1]}-${mt5Match[2]}-${mt5Match[3]}T${mt5Match[4]}:${mt5Match[5]}:${mt5Match[6]}Z`
+    : normalized;
+
+  const date = new Date(isoLike);
+  if (Number.isNaN(date.getTime())) return normalized;
+
+  return new Intl.DateTimeFormat("ja-JP", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date) + " JST";
 }
 
 function formatPercent(value: number | null | undefined) {
@@ -559,7 +578,7 @@ export default async function Home({ searchParams }: PageProps) {
             <SectionTitle title="直近の実トレード" description="保有中と決済完了を同時に確認" />
             <div className="mb-4 flex flex-wrap gap-2">
               {data.openTrades.length > 0 ? data.openTrades.map((trade) => (
-                <span key={`open-${trade.id}`} className="rounded-full border border-amber-300/18 bg-amber-300/8 px-3 py-1 text-xs text-amber-100">保有中 {trade.symbol} {trade.directionLabel}</span>
+                <span key={`open-${trade.id}`} className="rounded-full border border-amber-300/18 bg-amber-300/8 px-3 py-1 text-xs text-amber-100">保有中 {trade.symbol}{trade.dir != null ? ` ${trade.directionLabel}` : ""}</span>
               )) : <span className="rounded-full border border-white/10 bg-white/6 px-3 py-1 text-xs text-slate-300">現在保有なし</span>}
             </div>
             <TradeCards trades={data.recentTrades} />
