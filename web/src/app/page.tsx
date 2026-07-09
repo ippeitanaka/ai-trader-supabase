@@ -1,5 +1,6 @@
 import { getDashboardData } from "@/lib/dashboard";
 import { AiRefreshButton } from "@/components/ai-refresh-button";
+import { TradePlanControls } from "@/components/trade-plan-controls";
 
 export const dynamic = "force-dynamic";
 
@@ -110,6 +111,28 @@ function formatCadenceLabel(value: string | null | undefined) {
     default:
       return value ?? "更新頻度不明";
   }
+}
+
+function formatAllowedDirection(value: string | null | undefined) {
+  if (value === "buy") return "BUYのみ";
+  if (value === "sell") return "SELLのみ";
+  if (value === "both") return "両方向";
+  if (value === "none") return "待機";
+  return "-";
+}
+
+function formatStrategy(value: string | null | undefined) {
+  if (value === "trend_follow") return "順張り";
+  if (value === "pullback") return "押し目/戻り";
+  if (value === "mean_revert") return "短期逆張り";
+  if (value === "breakout") return "ブレイク";
+  if (value === "standby") return "待機優先";
+  return value ?? "-";
+}
+
+function formatUtcWindow(start?: string, end?: string) {
+  if (!start || !end) return "-";
+  return `${start}-${end} UTC`;
 }
 
 function formatIndicatorTitle(title: string) {
@@ -390,6 +413,9 @@ export default async function Home({ searchParams }: PageProps) {
 
   const latest = data.pairSelector.latest;
   const liveContext = data.pairSelector.live_context;
+  const tradePlan = latest?.trade_plan;
+  const planSymbols = tradePlan?.symbols ?? [];
+  const planStatus = latest?.plan_overrides?.status ?? latest?.plan_status ?? "active";
   const marketPulse = buildMarketPulse(
     liveContext?.themes?.length ?? 0,
     data.openTrades.length,
@@ -518,6 +544,85 @@ export default async function Home({ searchParams }: PageProps) {
               </div>
             </article>
           </div>
+        </section>
+
+        <section className="mt-8 surface-panel rounded-[28px] p-6 backdrop-blur">
+          <div className="mb-5 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <p className="text-xs uppercase tracking-[0.24em] text-cyan-200/70">Daily Trade Plan</p>
+              <h2 className="mt-2 text-2xl font-semibold text-white">本日の取引計画</h2>
+              <p className="mt-2 max-w-3xl text-sm leading-7 text-slate-300">
+                AIが選んだ銘柄について、今日だけ許可する方向・戦略・時間帯・イベント回避・実行ゲートを表示します。
+              </p>
+            </div>
+            <div className="flex flex-col gap-3 lg:items-end">
+              <span className={`w-fit rounded-full border px-3 py-1 text-xs ${
+                planStatus === "paused"
+                  ? "border-rose-300/30 bg-rose-300/10 text-rose-100"
+                  : "border-emerald-300/30 bg-emerald-300/10 text-emerald-100"
+              }`}>
+                {planStatus === "paused" ? "計画停止中" : "計画稼働中"}
+              </span>
+              <TradePlanControls reportId={latest?.id ?? null} status={planStatus} />
+            </div>
+          </div>
+
+          <div className="grid gap-4 xl:grid-cols-3">
+            {planSymbols.length > 0 ? planSymbols.map((item) => (
+              <article key={`plan-${item.symbol}`} className="rounded-3xl border border-cyan-300/16 bg-cyan-300/7 p-5">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h3 className="text-2xl font-semibold text-white">{item.symbol}</h3>
+                    <p className="mt-1 text-xs uppercase tracking-[0.2em] text-cyan-100/70">{formatStrategy(item.strategy)}</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-2xl font-semibold text-cyan-50">{item.score}</p>
+                    <p className="text-xs text-slate-400">{item.confidence}</p>
+                  </div>
+                </div>
+
+                <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+                  <div className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-3">
+                    <p className="text-xs text-slate-400">許可方向</p>
+                    <p className="mt-1 font-medium text-white">{formatAllowedDirection(item.allowed_direction)}</p>
+                  </div>
+                  <div className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-3">
+                    <p className="text-xs text-slate-400">実行ゲート</p>
+                    <p className="mt-1 font-medium text-white">p≥{((item.min_win_prob ?? 0) * 100).toFixed(0)}% / cost≤{item.max_cost_r?.toFixed?.(2) ?? "-"}</p>
+                  </div>
+                </div>
+
+                <p className="mt-4 text-sm leading-7 text-slate-200">{item.reason}</p>
+
+                <div className="mt-4 space-y-2">
+                  {(item.session_windows ?? []).slice(0, 3).map((window) => (
+                    <div key={`${item.symbol}-${window.label}-${window.start_utc}`} className="rounded-2xl border border-white/8 bg-white/5 px-4 py-3 text-xs text-slate-300">
+                      <span className="text-white">{window.label ?? "session"}</span> / {formatUtcWindow(window.start_utc, window.end_utc)}
+                    </div>
+                  ))}
+                  {(item.avoid_event_windows ?? []).slice(0, 2).map((event) => (
+                    <div key={`${item.symbol}-${event.label}-${event.start_at}`} className="rounded-2xl border border-amber-300/18 bg-amber-300/8 px-4 py-3 text-xs leading-6 text-amber-50">
+                      回避: {event.label ?? "重要イベント"} / {event.start_at ? formatDateTime(event.start_at) : "-"} から
+                    </div>
+                  ))}
+                </div>
+
+                {item.setup_focus?.length ? (
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    {item.setup_focus.slice(0, 4).map((focus) => (
+                      <span key={`${item.symbol}-${focus}`} className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-xs text-slate-300">{focus}</span>
+                    ))}
+                  </div>
+                ) : null}
+              </article>
+            )) : (
+              <div className="rounded-3xl border border-white/8 bg-slate-950/35 p-5 text-sm text-slate-300 xl:col-span-3">
+                日次計画はまだ生成されていません。AI判定ボタンで最新計画を作成できます。
+              </div>
+            )}
+          </div>
+
+          {tradePlan?.summary ? <p className="mt-5 text-sm leading-7 text-slate-300">{tradePlan.summary}</p> : null}
         </section>
 
         <section className="mt-8 grid gap-5 xl:grid-cols-2">

@@ -460,6 +460,44 @@ function isEmergencyStopEnabled(): boolean {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+type HigherTimeframeSnapshot = {
+  timeframe?: string;
+  trend_dir?: number;
+  ema_slope_atr?: number;
+  price_vs_ema25_atr?: number;
+  adx?: number;
+  di_plus?: number;
+  di_minus?: number;
+  rsi?: number;
+  atr_norm?: number;
+  price_vs_cloud?: number;
+};
+
+type DailyPlanSymbol = {
+  symbol: string;
+  allowed_direction?: "buy" | "sell" | "both" | "none";
+  strategy?: string;
+  session_windows?: Array<{ label?: string; start_utc?: string; end_utc?: string }>;
+  avoid_event_windows?: Array<{ label?: string; start_at?: string; end_at?: string; impact?: string; reason?: string }>;
+  min_win_prob?: number;
+  max_cost_r?: number;
+  confidence?: string;
+  score?: number;
+  reason?: string;
+  setup_focus?: string[];
+};
+
+type DailyPlanContext = {
+  report_id: number | null;
+  generated_at?: string | null;
+  plan_status: "active" | "paused" | "unknown";
+  summary?: string | null;
+  risk_level?: "low" | "medium" | "high";
+  market_themes?: string[];
+  item?: DailyPlanSymbol | null;
+  plan_overrides?: Record<string, unknown>;
+};
+
 export interface TradeRequest {
   symbol: string;
   timeframe: string;
@@ -538,6 +576,16 @@ export interface TradeRequest {
     body?: number;
     range?: number;
   }>;
+
+  // Execution context supplied by the EA.
+  market_session?: string;
+  utc_hour?: number;
+  day_of_week?: number;
+  higher_timeframes?: Record<string, HigherTimeframeSnapshot>;
+  level_distances?: Record<string, number | string | null>;
+  chart_structure?: Record<string, number | string | null>;
+  volatility_context?: Record<string, number | string | null>;
+  cost_context?: Record<string, number | string | null>;
   
   // EA側の判断（参考情報として）
   ea_suggestion: {
@@ -596,6 +644,12 @@ export interface TradeResponse {
     buy?: { win_prob: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
     sell?: { win_prob: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
   };
+
+  // Daily trade plan diagnostics
+  trade_plan_id?: number | null;
+  plan_alignment?: string | null;
+  event_risk?: string | null;
+  daily_plan?: DailyPlanContext | null;
 }
 
 function classifyMarketRegime(req: TradeRequest): Pick<TradeResponse, "regime" | "strategy" | "regime_confidence"> {
@@ -692,6 +746,290 @@ function buildDecisionSummary(opts: {
   ];
   if (!opts.willExecute && opts.skipReason) parts.push(`skip=${opts.skipReason}`);
   return parts.join(" | ");
+}
+
+function appendReasonText(current: unknown, addition: string): string {
+  const base = typeof current === "string" ? current.trim() : "";
+  return base ? `${base} | ${addition}` : addition;
+}
+
+function appendSkip(current: unknown, addition: string): string {
+  const base = typeof current === "string" ? current.trim() : "";
+  if (!base) return addition;
+  return base.split(/[|+]/).includes(addition) ? base : `${base}|${addition}`;
+}
+
+function directionToPlanLabel(dir: number): "buy" | "sell" | "none" {
+  if (dir > 0) return "buy";
+  if (dir < 0) return "sell";
+  return "none";
+}
+
+function minutesFromTime(value: string | undefined): number | null {
+  if (!value) return null;
+  const match = value.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const h = Number(match[1]);
+  const m = Number(match[2]);
+  if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+  return h * 60 + m;
+}
+
+function isNowInSessionWindow(window: NonNullable<DailyPlanSymbol["session_windows"]>[number], utcHour?: number): boolean {
+  const start = minutesFromTime(window.start_utc);
+  const end = minutesFromTime(window.end_utc);
+  if (start === null || end === null) return true;
+  const now = (typeof utcHour === "number" ? utcHour : new Date().getUTCHours()) * 60 + new Date().getUTCMinutes();
+  if (start <= end) return now >= start && now <= end;
+  return now >= start || now <= end;
+}
+
+function activeEventWindow(item: DailyPlanSymbol | null | undefined): NonNullable<DailyPlanSymbol["avoid_event_windows"]>[number] | null {
+  const windows = item?.avoid_event_windows ?? [];
+  const now = Date.now();
+  for (const window of windows) {
+    const start = Date.parse(String(window.start_at ?? ""));
+    const end = Date.parse(String(window.end_at ?? ""));
+    if (Number.isFinite(start) && Number.isFinite(end) && now >= start && now <= end) {
+      return window;
+    }
+  }
+  return null;
+}
+
+function htfOpposesDirection(req: TradeRequest, dir: number): boolean {
+  if (!req.higher_timeframes || dir === 0) return false;
+  const checks = ["h1", "h4", "d1", "H1", "H4", "D1"]
+    .map((key) => req.higher_timeframes?.[key])
+    .filter((v): v is HigherTimeframeSnapshot => Boolean(v));
+  if (checks.length === 0) return false;
+  const opposing = checks.filter((snapshot) => typeof snapshot.trend_dir === "number" && snapshot.trend_dir === -dir);
+  return opposing.length >= Math.min(2, checks.length);
+}
+
+async function fetchDailyPlanContext(req: TradeRequest): Promise<DailyPlanContext | null> {
+  let primary: any = await supabase
+    .from("pair_selection_reports")
+    .select("id, generated_at, timeframe, selected_pairs, summary, trade_plan, plan_overrides, plan_status")
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .limit(5);
+
+  if (primary.error && /trade_plan|plan_status|plan_overrides|column/i.test(String(primary.error.message ?? ""))) {
+    primary = await supabase
+      .from("pair_selection_reports")
+      .select("id, generated_at, timeframe, selected_pairs, summary")
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(5);
+  }
+
+  if (primary.error || !primary.data || primary.data.length === 0) return null;
+
+  const report = (primary.data.find((row: any) => row?.timeframe === req.timeframe) ?? primary.data[0]) as any;
+  const plan = report?.trade_plan && typeof report.trade_plan === "object" ? report.trade_plan : null;
+  const selectedPairs = Array.isArray(report?.selected_pairs) ? report.selected_pairs : [];
+  const planSymbols = Array.isArray(plan?.symbols) ? plan.symbols : [];
+  const item = [...planSymbols, ...selectedPairs].find((row: any) => {
+    return typeof row?.symbol === "string" && row.symbol.toUpperCase() === req.symbol.toUpperCase();
+  }) ?? null;
+  const overrides = report?.plan_overrides && typeof report.plan_overrides === "object" ? report.plan_overrides : {};
+  const overrideStatus = typeof (overrides as any).status === "string" ? String((overrides as any).status) : "";
+  const planStatus = overrideStatus === "paused" || report?.plan_status === "paused" ? "paused" : "active";
+
+  return {
+    report_id: typeof report?.id === "number" ? report.id : Number(report?.id ?? null) || null,
+    generated_at: typeof report?.generated_at === "string" ? report.generated_at : null,
+    plan_status: planStatus,
+    summary: typeof plan?.summary === "string" ? plan.summary : (typeof report?.summary === "string" ? report.summary : null),
+    risk_level: plan?.risk_level === "low" || plan?.risk_level === "medium" || plan?.risk_level === "high" ? plan.risk_level : undefined,
+    market_themes: Array.isArray(plan?.market_themes) ? plan.market_themes.filter((v: unknown) => typeof v === "string").slice(0, 5) : [],
+    item: item as DailyPlanSymbol | null,
+    plan_overrides: overrides as Record<string, unknown>,
+  };
+}
+
+function buildDailyPlanPrompt(plan: DailyPlanContext | null, req: TradeRequest): string {
+  const htf = req.higher_timeframes ? JSON.stringify(req.higher_timeframes) : "N/A";
+  const levels = req.level_distances ? JSON.stringify(req.level_distances) : "N/A";
+  const chart = req.chart_structure ? JSON.stringify(req.chart_structure) : "N/A";
+  const vol = req.volatility_context ? JSON.stringify(req.volatility_context) : "N/A";
+  const cost = req.cost_context ? JSON.stringify(req.cost_context) : "N/A";
+  if (!plan) {
+    return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n最新の日次計画は取得できませんでした。EAの上位足/セッション/構造情報を通常の判断補助として使ってください。\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}`;
+  }
+  return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• report_id=${plan.report_id ?? "N/A"} status=${plan.plan_status} risk=${plan.risk_level ?? "unknown"}\n• summary=${plan.summary ?? "N/A"}\n• themes=${(plan.market_themes ?? []).join(" / ") || "N/A"}\n• symbol_plan=${JSON.stringify(plan.item ?? null)}\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}\n\nこの日次計画に反する方向・時間帯・イベント直前直後・上位足逆行・節目直前・異常コストのエントリーは、勝率を保守的に見積もってください。`;
+}
+
+function contextNumber(source: Record<string, number | string | null> | undefined, key: string): number | null {
+  const value = source?.[key];
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function applyChartQualityGuard(tradeReq: TradeRequest, response: TradeResponse): TradeResponse {
+  const actionDir = typeof response.action === "number" ? response.action : 0;
+  if (actionDir === 0) return response;
+
+  const chart = tradeReq.chart_structure;
+  const vol = tradeReq.volatility_context;
+  const cost = tradeReq.cost_context;
+  const reasons: string[] = [];
+  let alignment = response.plan_alignment ?? "chart_aligned";
+
+  const swingDir = contextNumber(chart, "swing_dir");
+  const lastBreakDir = contextNumber(chart, "last_break_dir");
+  const resistanceDist = contextNumber(chart, "nearest_resistance_dist_atr");
+  const supportDist = contextNumber(chart, "nearest_support_dist_atr");
+  const rangePosition = contextNumber(chart, "range_position");
+  const atrPercentile = contextNumber(vol, "atr_percentile_100");
+  const rangeExpansion = contextNumber(vol, "range_expansion_20");
+  const spreadAtr = contextNumber(cost, "spread_atr");
+  const tickVolumeRatio = contextNumber(cost, "tick_volume_ratio_20");
+
+  if (swingDir !== null && lastBreakDir !== null && swingDir === -actionDir && lastBreakDir === -actionDir) {
+    reasons.push("chart_structure_opposes_entry");
+    alignment = "structure_conflict";
+  }
+
+  if (actionDir > 0 && resistanceDist !== null && resistanceDist >= 0 && resistanceDist < 0.25 && lastBreakDir !== 1) {
+    reasons.push("near_resistance_without_break");
+    alignment = "level_conflict";
+  }
+  if (actionDir < 0 && supportDist !== null && supportDist >= 0 && supportDist < 0.25 && lastBreakDir !== -1) {
+    reasons.push("near_support_without_break");
+    alignment = "level_conflict";
+  }
+
+  if (actionDir > 0 && rangePosition !== null && rangePosition > 0.92 && lastBreakDir !== 1) {
+    reasons.push("long_at_range_extreme");
+    alignment = "level_conflict";
+  }
+  if (actionDir < 0 && rangePosition !== null && rangePosition < 0.08 && lastBreakDir !== -1) {
+    reasons.push("short_at_range_extreme");
+    alignment = "level_conflict";
+  }
+
+  if (atrPercentile !== null && atrPercentile < 0.12 && rangeExpansion !== null && rangeExpansion < 0.65) {
+    reasons.push("volatility_too_compressed");
+  }
+  if (spreadAtr !== null && spreadAtr > 0.12) {
+    reasons.push("spread_atr_too_high");
+  }
+  if (lastBreakDir === actionDir && tickVolumeRatio !== null && tickVolumeRatio < 0.55) {
+    reasons.push("breakout_without_volume");
+  }
+
+  if (reasons.length === 0) {
+    return {
+      ...response,
+      plan_alignment: response.plan_alignment ?? alignment,
+    };
+  }
+
+  const guardNote = `CHART_GUARD: ${reasons.join("; ")}`;
+  return {
+    ...response,
+    action: 0,
+    entry_method: "market",
+    entry_params: null,
+    plan_alignment: alignment,
+    skip_reason: appendSkip(response.skip_reason, reasons[0]),
+    decision_summary: appendReasonText(response.decision_summary, `chart_block=${reasons.join("+")}`),
+    reasoning: appendReasonText(response.reasoning, guardNote),
+    method_reason: appendReasonText(response.method_reason, guardNote),
+  };
+}
+
+async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeResponse): Promise<TradeResponse> {
+  const plan = await fetchDailyPlanContext(tradeReq);
+  if (!plan) return response;
+
+  const item = plan.item ?? null;
+  const actionDir = typeof response.action === "number" ? response.action : 0;
+  const reasons: string[] = [];
+  let eventRisk = "none";
+  let alignment = response.plan_alignment ?? (item ? "aligned" : "symbol_not_in_daily_plan");
+
+  if (plan.plan_status === "paused") reasons.push("daily_plan_paused");
+  if (!item) reasons.push("daily_plan_symbol_not_selected");
+
+  const expiresAt = (item as any)?.expires_at ?? (plan as any)?.expires_at;
+  if (typeof expiresAt === "string") {
+    const expiresMs = Date.parse(expiresAt);
+    if (Number.isFinite(expiresMs) && Date.now() > expiresMs) reasons.push("daily_plan_expired");
+  }
+
+  const eventWindow = activeEventWindow(item);
+  if (eventWindow) {
+    eventRisk = eventWindow.impact === "High" ? "high" : "medium";
+    reasons.push("daily_plan_event_window");
+  }
+
+  if (item && actionDir !== 0) {
+    const allowed = item.allowed_direction ?? "both";
+    const actual = directionToPlanLabel(actionDir);
+    if (allowed === "none" || (allowed !== "both" && actual !== allowed)) {
+      reasons.push("daily_plan_direction_mismatch");
+      alignment = "direction_mismatch";
+    }
+
+    const sessions = item.session_windows ?? [];
+    if (sessions.length > 0 && !sessions.some((window) => isNowInSessionWindow(window, tradeReq.utc_hour))) {
+      reasons.push("daily_plan_session_closed");
+      alignment = "session_mismatch";
+    }
+
+    if (typeof item.min_win_prob === "number" && response.win_prob < item.min_win_prob) {
+      reasons.push("daily_plan_winprob_below_plan");
+      alignment = "plan_gate_miss";
+    }
+
+    const costR = typeof response.cost_r === "number" ? response.cost_r : null;
+    if (typeof item.max_cost_r === "number" && costR !== null && costR > item.max_cost_r) {
+      reasons.push("daily_plan_cost_too_high");
+      alignment = "plan_gate_miss";
+    }
+
+    if (htfOpposesDirection(tradeReq, actionDir)) {
+      reasons.push("daily_plan_htf_conflict");
+      alignment = "htf_conflict";
+    }
+  }
+
+  const planTag =
+    `DAILY_PLAN(id=${plan.report_id ?? "na"} status=${plan.plan_status}` +
+    ` align=${alignment} event=${eventRisk}` +
+    `${item?.allowed_direction ? ` dir=${item.allowed_direction}` : ""}` +
+    `${item?.strategy ? ` strategy=${item.strategy}` : ""})`;
+
+  const withDiagnostics = {
+    ...response,
+    trade_plan_id: plan.report_id,
+    plan_alignment: alignment,
+    event_risk: eventRisk,
+    daily_plan: plan,
+    reasoning: appendReasonText(response.reasoning, planTag),
+    method_reason: appendReasonText(response.method_reason, planTag),
+  } as TradeResponse;
+
+  if (actionDir === 0 || reasons.length === 0) return withDiagnostics;
+
+  const guardNote = `GUARD: ${reasons.join("; ")}`;
+  return {
+    ...withDiagnostics,
+    action: 0,
+    entry_method: "market",
+    entry_params: null,
+    skip_reason: appendSkip(withDiagnostics.skip_reason, reasons[0]),
+    decision_summary: appendReasonText(withDiagnostics.decision_summary, `plan_block=${reasons.join("+")}`),
+    reasoning: appendReasonText(withDiagnostics.reasoning, guardNote),
+    method_reason: appendReasonText(withDiagnostics.method_reason, guardNote),
+  };
 }
 
 type InputSanityIssue = {
@@ -800,6 +1138,62 @@ function normalizeTradeRequest(body: any): TradeRequest {
     })
     .filter((v: any) => v !== null) as TradeRequest["candle_bars"];
 
+  const session = typeof (req as any).market_session === "string"
+    ? (req as any).market_session.trim().slice(0, 40)
+    : undefined;
+  const utc_hour = isFiniteNumber((req as any).utc_hour)
+    ? Math.max(0, Math.min(23, Math.floor((req as any).utc_hour)))
+    : undefined;
+  const day_of_week = isFiniteNumber((req as any).day_of_week)
+    ? Math.max(0, Math.min(6, Math.floor((req as any).day_of_week)))
+    : undefined;
+
+  const htfRaw = (req as any).higher_timeframes;
+  const higher_timeframes: Record<string, HigherTimeframeSnapshot> | undefined =
+    htfRaw && typeof htfRaw === "object" && !Array.isArray(htfRaw)
+      ? Object.fromEntries(
+          Object.entries(htfRaw)
+            .slice(0, 6)
+            .map(([key, value]) => {
+              const v: any = value ?? {};
+              return [key, {
+                timeframe: typeof v.timeframe === "string" ? v.timeframe : key,
+                trend_dir: isSide(v.trend_dir) ? Number(v.trend_dir) : undefined,
+                ema_slope_atr: isFiniteNumber(v.ema_slope_atr) ? v.ema_slope_atr : undefined,
+                price_vs_ema25_atr: isFiniteNumber(v.price_vs_ema25_atr) ? v.price_vs_ema25_atr : undefined,
+                adx: isFiniteNumber(v.adx) ? v.adx : undefined,
+                di_plus: isFiniteNumber(v.di_plus) ? v.di_plus : undefined,
+                di_minus: isFiniteNumber(v.di_minus) ? v.di_minus : undefined,
+                rsi: isFiniteNumber(v.rsi) ? v.rsi : undefined,
+                atr_norm: isFiniteNumber(v.atr_norm) ? v.atr_norm : undefined,
+                price_vs_cloud: isSide(v.price_vs_cloud) ? Number(v.price_vs_cloud) : undefined,
+              }];
+            }),
+        )
+      : undefined;
+
+  const distRaw = (req as any).level_distances;
+  const level_distances: TradeRequest["level_distances"] | undefined =
+    distRaw && typeof distRaw === "object" && !Array.isArray(distRaw)
+      ? Object.fromEntries(
+          Object.entries(distRaw)
+            .slice(0, 24)
+            .filter(([, value]) => typeof value === "string" || value === null || isFiniteNumber(value)),
+        ) as TradeRequest["level_distances"]
+      : undefined;
+
+  const sanitizeContext = (raw: unknown, limit = 32): Record<string, number | string | null> | undefined => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const entries = Object.entries(raw as Record<string, unknown>)
+      .slice(0, limit)
+      .filter(([, value]) => typeof value === "string" || value === null || isFiniteNumber(value));
+    return entries.length > 0 ? Object.fromEntries(entries) as Record<string, number | string | null> : undefined;
+  };
+
+  const chart_structure = sanitizeContext((req as any).chart_structure);
+  const volatility_context = sanitizeContext((req as any).volatility_context);
+  const cost_context = sanitizeContext((req as any).cost_context);
+
   return {
     ...req,
     macd,
@@ -811,6 +1205,14 @@ function normalizeTradeRequest(body: any): TradeRequest {
     bb_width,
     candle_features,
     candle_bars,
+    market_session: session,
+    utc_hour,
+    day_of_week,
+    higher_timeframes,
+    level_distances,
+    chart_structure,
+    volatility_context,
+    cost_context,
   };
 }
 
@@ -1628,6 +2030,8 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
         })
         .join("\n")
     : "N/A";
+  const dailyPlanContext = await fetchDailyPlanContext(req);
+  const dailyPlanPrompt = buildDailyPlanPrompt(dailyPlanContext, req);
   
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 🔄 ハイブリッド学習システム（3段階）
@@ -1964,6 +2368,7 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
     systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。1000件以上の実績データに基づくML学習結果を最重視して勝率を予測してください。
 ${priorityGuideline}
 ${mlContextForPrompt}${successCasesForPrompt}${failureCasesForPrompt}${recommendationsForPrompt}
+${dailyPlanPrompt}
   補助情報: RSI=${rsi.toFixed(2)}, ATR=${atr.toFixed(5)}${atrNorm !== undefined ? `, ATR_norm=${atrNorm.toFixed(8)}` : ""}${adx !== undefined ? `, ADX=${adx.toFixed(2)}` : ""}${diPlus !== undefined ? `, +DI=${diPlus.toFixed(2)}` : ""}${diMinus !== undefined ? `, -DI=${diMinus.toFixed(2)}` : ""}${bbWidth !== undefined ? `, BB_width=${bbWidth.toFixed(6)}` : ""}
 ${ichimokuContext}
 EA判断: ${reason}`;
@@ -1984,6 +2389,7 @@ EA判断: ${reason}`;
     systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。高品質なML学習結果とテクニカル指標を総合的に判断し、勝率を予測してください。
 ${priorityGuideline}
 ${mlContextForPrompt}${successCasesForPrompt}${failureCasesForPrompt}
+${dailyPlanPrompt}
   テクニカル指標: RSI=${rsi.toFixed(2)}, ATR=${atr.toFixed(5)}${atrNorm !== undefined ? `, ATR_norm=${atrNorm.toFixed(8)}` : ""}${adx !== undefined ? `, ADX=${adx.toFixed(2)}` : ""}${diPlus !== undefined ? `, +DI=${diPlus.toFixed(2)}` : ""}${diMinus !== undefined ? `, -DI=${diMinus.toFixed(2)}` : ""}${bbWidth !== undefined ? `, BB_width=${bbWidth.toFixed(6)}` : ""}
 ${ichimokuContext}
 EA判断: ${reason}`;
@@ -2003,6 +2409,7 @@ EA判断: ${reason}`;
     
     systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。すべてのテクニカル指標とEA側の総合判断を総合的に分析し、取引の成功確率（勝率）を0.0～1.0の範囲で予測してください。
   ${priorityGuideline}${mlContextForPrompt}
+${dailyPlanPrompt}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 市場情報
@@ -2462,6 +2869,10 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       ml_pattern_confidence: matchedPatterns && matchedPatterns.length > 0 ? Math.round(matchedPatterns[0].win_rate * 100 * 100) / 100 : null,
       win_prob_raw: round3(raw_win_prob),
       win_prob_calibration: cal.debug,
+      trade_plan_id: dailyPlanContext?.report_id ?? null,
+      plan_alignment: dailyPlanContext?.item ? "model_context" : "no_symbol_plan",
+      event_risk: activeEventWindow(dailyPlanContext?.item) ? "high" : "none",
+      daily_plan: dailyPlanContext,
     } as any;
     
   } catch (error) {
@@ -2597,7 +3008,7 @@ serve(async (req: Request) => {
       JSON.stringify({ 
         ok: true, 
         service: "ai-trader with OpenAI + Comprehensive Technical Analysis", 
-        version: "2.8.0-calib-robust",
+        version: "2.10.0-chart-structure",
         mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
         ml_learning_enabled: mlLearningEnabled,
@@ -2619,6 +3030,10 @@ serve(async (req: Request) => {
           "rsi",
           "atr",
           "ichimoku_full",
+          "daily_trade_plan_guard",
+          "higher_timeframe_context",
+          "chart_structure_guard",
+          "volatility_cost_context",
           "market_only_execution"
         ],
         note: "Learning phase: AI comprehensively analyzes all technical indicators (MA, MACD, RSI, ATR, Ichimoku). ML phase gating: <80 trades=technical, 80-999=hybrid, 1000+=full. Set AI_TRADER_ML_MODE=on to apply ML to decisions (otherwise log_only)."
@@ -2745,6 +3160,8 @@ serve(async (req: Request) => {
 
     // Apply hard guards (double-safety with EA-side rules)
     response = applyExecutionGuards(tradeReq, response);
+    response = applyChartQualityGuard(tradeReq, response);
+    response = await applyDailyPlanGuard(tradeReq, response);
 
     // Emergency stop: keep AI inference (win_prob/reasoning) for monitoring/learning,
     // but force execution decision to no-trade.

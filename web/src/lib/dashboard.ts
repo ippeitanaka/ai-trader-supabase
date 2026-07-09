@@ -4,6 +4,65 @@ type PairRecommendation = {
   confidence: "high" | "medium" | "low";
   reason: string;
   caution?: string;
+  allowed_direction?: "buy" | "sell" | "both" | "none";
+  strategy?: "trend_follow" | "pullback" | "mean_revert" | "breakout" | "standby";
+  session_windows?: SessionWindow[];
+  avoid_event_windows?: EventWindow[];
+  min_win_prob?: number;
+  max_cost_r?: number;
+  plan_note?: string;
+};
+
+type SessionWindow = {
+  label?: string;
+  start_utc?: string;
+  end_utc?: string;
+};
+
+type EventWindow = {
+  label?: string;
+  start_at?: string;
+  end_at?: string;
+  impact?: "High" | "Medium" | "Low";
+  reason?: string;
+};
+
+type TradePlanSymbol = {
+  symbol: string;
+  allowed_direction: "buy" | "sell" | "both" | "none";
+  strategy: "trend_follow" | "pullback" | "mean_revert" | "breakout" | "standby";
+  session_windows: SessionWindow[];
+  avoid_event_windows: EventWindow[];
+  min_win_prob: number;
+  max_cost_r: number;
+  confidence: "high" | "medium" | "low";
+  score: number;
+  reason: string;
+  setup_focus?: string[];
+};
+
+type DailyTradePlan = {
+  plan_version?: string;
+  plan_date?: string;
+  generated_at?: string;
+  expires_at?: string;
+  timeframe?: string;
+  risk_level?: "low" | "medium" | "high";
+  summary?: string;
+  market_themes?: string[];
+  symbols?: TradePlanSymbol[];
+  global_rules?: {
+    avoid_high_impact_minutes_before?: number;
+    avoid_high_impact_minutes_after?: number;
+    require_higher_timeframe_alignment?: boolean;
+    max_open_positions?: number;
+  };
+};
+
+type PlanOverrides = {
+  status?: "active" | "paused";
+  note?: string;
+  updated_at?: string;
 };
 
 type PairSelectorDigest = {
@@ -37,6 +96,7 @@ type PairSelectorLiveContext = {
 };
 
 type PairSelectorLatest = {
+  id?: number;
   generated_at: string;
   cadence: string;
   timeframe: string;
@@ -50,6 +110,9 @@ type PairSelectorLatest = {
   recommended_pairs: PairRecommendation[];
   neutral_pairs: PairRecommendation[];
   avoided_pairs: PairRecommendation[];
+  trade_plan?: DailyTradePlan;
+  plan_overrides?: PlanOverrides;
+  plan_status?: "active" | "paused" | string;
 };
 
 type PairSelectorResponse = {
@@ -69,6 +132,10 @@ type EALogRecord = {
   decision_summary: string | null;
   skip_reason: string | null;
   entry_method: string | null;
+  trade_plan_id?: number | null;
+  plan_alignment?: string | null;
+  event_risk?: string | null;
+  market_session?: string | null;
   ai_reasoning: string | null;
   order_ticket: number | null;
 };
@@ -92,6 +159,10 @@ type AISignalRecord = {
   is_virtual?: boolean | null;
   reverse_execution?: boolean | null;
   is_manual_trade?: boolean | null;
+  trade_plan_id?: number | null;
+  plan_alignment?: string | null;
+  event_risk?: string | null;
+  market_session?: string | null;
 };
 
 type DashboardSummary = {
@@ -165,14 +236,6 @@ async function fetchJson<T>(url: string): Promise<T> {
     throw new Error(`Request failed: ${response.status} ${url}`);
   }
   return response.json() as Promise<T>;
-}
-
-async function safeFetch<T>(loader: () => Promise<T>, fallback: T): Promise<T> {
-  try {
-    return await loader();
-  } catch {
-    return fallback;
-  }
 }
 
 async function safeFetchWithError<T>(label: string, loader: () => Promise<T>, fallback: T): Promise<{ data: T; error: string | null }> {
@@ -317,9 +380,36 @@ export async function triggerPairSelectorRefresh(options?: {
   });
 }
 
+export async function updateTradePlanOverrides(reportId: number, overrides: PlanOverrides) {
+  requireEnv();
+  const url = buildRestUrl("pair_selection_reports", {
+    id: `eq.${reportId}`,
+  });
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      ...supabaseHeaders(),
+      "Content-Type": "application/json",
+      Prefer: "return=representation",
+    },
+    body: JSON.stringify({
+      plan_overrides: {
+        ...overrides,
+        updated_at: new Date().toISOString(),
+      },
+      plan_status: overrides.status ?? "active",
+    }),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status} ${url}`);
+  }
+  return response.json() as Promise<Record<string, unknown>[]>;
+}
+
 async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
   const url = buildRestUrl("ea-log", {
-    select: "id,created_at,at,sym,tf,action,trade_decision,win_prob,decision_summary,skip_reason,entry_method,ai_reasoning,order_ticket",
+    select: "id,created_at,at,sym,tf,action,trade_decision,win_prob,decision_summary,skip_reason,entry_method,trade_plan_id,plan_alignment,event_risk,market_session,ai_reasoning,order_ticket",
     order: "at.desc",
     limit: "5",
   });
@@ -328,7 +418,7 @@ async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
 
 async function fetchRecentTrades(): Promise<AISignalRecord[]> {
   const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
     is_virtual: "eq.false",
     or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
     reverse_execution: "eq.false",
@@ -342,7 +432,7 @@ async function fetchRecentTrades(): Promise<AISignalRecord[]> {
 
 async function fetchOpenTrades(): Promise<AISignalRecord[]> {
   const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
     is_virtual: "eq.false",
     or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
     actual_result: "eq.FILLED",
@@ -355,7 +445,7 @@ async function fetchOpenTrades(): Promise<AISignalRecord[]> {
 
 async function fetchClosedTrades(period: string): Promise<AISignalRecord[]> {
   const params: Record<string, string> = {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
     is_virtual: "eq.false",
     or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
     reverse_execution: "eq.false",
