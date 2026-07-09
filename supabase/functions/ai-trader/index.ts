@@ -241,6 +241,80 @@ async function applyStreakGuard(
   return { applied: true, streak, winProb: penalized, guardTag };
 }
 
+function isSymbolCooldownEnabled(): boolean {
+  // Default on: this is a final hard guard against symbols that are degrading in live results.
+  const raw = (Deno.env.get("AI_TRADER_SYMBOL_COOLDOWN") ?? "on").toLowerCase().trim();
+  return raw === "on" || raw === "true" || raw === "1";
+}
+
+function getSymbolCooldownLookback(): number {
+  const v = Number(Deno.env.get("AI_TRADER_SYMBOL_COOLDOWN_LOOKBACK") ?? 12);
+  if (!Number.isFinite(v) || v < 5) return 12;
+  return Math.min(50, Math.floor(v));
+}
+
+function getSymbolCooldownMinN(): number {
+  const v = Number(Deno.env.get("AI_TRADER_SYMBOL_COOLDOWN_MIN_N") ?? 5);
+  if (!Number.isFinite(v) || v < 3) return 5;
+  return Math.min(20, Math.floor(v));
+}
+
+function getSymbolCooldownMinWinRate(): number {
+  const v = Number(Deno.env.get("AI_TRADER_SYMBOL_COOLDOWN_MIN_WR") ?? 0.45);
+  if (!Number.isFinite(v)) return 0.45;
+  return Math.max(0.20, Math.min(0.70, v));
+}
+
+type SymbolCooldownResult = {
+  blocked: boolean;
+  guardTag: string;
+};
+
+async function evaluateSymbolCooldown(req: TradeRequest): Promise<SymbolCooldownResult> {
+  if (!isSymbolCooldownEnabled()) return { blocked: false, guardTag: "" };
+
+  const lookback = getSymbolCooldownLookback();
+  const minN = getSymbolCooldownMinN();
+  const minWr = getSymbolCooldownMinWinRate();
+
+  let q = supabase
+    .from("ai_signals")
+    .select("actual_result,profit_loss")
+    .eq("symbol", req.symbol)
+    .eq("reverse_execution", false)
+    .in("actual_result", ["WIN", "LOSS"])
+    .order("created_at", { ascending: false })
+    .limit(lookback);
+
+  if (!includeVirtualInPerfGuards()) {
+    q = q.eq("is_virtual", false);
+  }
+
+  const { data, error } = await q;
+  if (error) {
+    console.warn(`[symbol-cooldown] fetch error symbol=${req.symbol}: ${error.message}`);
+    return { blocked: false, guardTag: "" };
+  }
+  if (!data || data.length < minN) return { blocked: false, guardTag: "" };
+
+  const wins = data.filter((r: any) => r.actual_result === "WIN").length;
+  const recentWr = wins / data.length;
+  const totalPnl = data.reduce((sum: number, r: any) => {
+    const pnl = Number(r.profit_loss ?? 0);
+    return Number.isFinite(pnl) ? sum + pnl : sum;
+  }, 0);
+
+  if (recentWr >= minWr || totalPnl >= 0) {
+    return { blocked: false, guardTag: "" };
+  }
+
+  const guardTag =
+    `SYMBOL_COOLDOWN(blocked ${req.symbol}` +
+    ` wr=${round3(recentWr)} n=${data.length} pnl=${round3(totalPnl)} minWr=${round3(minWr)})`;
+
+  return { blocked: true, guardTag };
+}
+
 function clampWinProb(v: number): number {
   // Policy in this project: win_prob is within [0.00, 1.00]
   const minProb = 0.0;
@@ -877,7 +951,40 @@ function assessInputSanity(req: TradeRequest): InputSanityIssue[] {
   return issues;
 }
 
-function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): TradeResponse {
+function appendGuardText(current: unknown, addition: string): string {
+  const base = typeof current === "string" ? current.trim() : "";
+  return base ? `${base} | ${addition}` : addition;
+}
+
+function appendSkipReason(current: unknown, addition: string): string {
+  const base = typeof current === "string" ? current.trim() : "";
+  if (!base) return addition;
+  return base.split("|").includes(addition) ? base : `${base}|${addition}`;
+}
+
+async function applySymbolCooldownGuard(tradeReq: TradeRequest, response: TradeResponse): Promise<TradeResponse> {
+  const actionDir = typeof response.action === "number" ? response.action : 0;
+  if (actionDir === 0) return response;
+
+  const cooldown = await evaluateSymbolCooldown(tradeReq);
+  if (!cooldown.blocked) return response;
+
+  const guardNote = `GUARD: ${cooldown.guardTag}`;
+  console.warn(`[ai-trader] ${guardNote}`);
+
+  return {
+    ...response,
+    action: 0,
+    entry_method: "market",
+    entry_params: null,
+    skip_reason: appendSkipReason(response.skip_reason, "symbol_cooldown"),
+    method_selected_by: response.method_selected_by || "Manual",
+    method_reason: appendGuardText(response.method_reason, guardNote),
+    reasoning: appendGuardText(response.reasoning, guardNote),
+  };
+}
+
+async function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): Promise<TradeResponse> {
   const symbol = (tradeReq.symbol || "").toUpperCase();
   const utcHour = new Date().getUTCHours();
   const hasMlSupport = (response as any).ml_pattern_used === true;
@@ -927,20 +1034,24 @@ function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): 
     }
   }
 
-  if (reasons.length === 0) return response;
+  let guardedResponse = response;
 
-  const guardNote = `GUARD: ${reasons.join("; ")}`;
+  if (reasons.length > 0) {
+    const guardNote = `GUARD: ${reasons.join("; ")}`;
 
-  return {
-    ...response,
-    action: 0,
-    entry_method: "market",
-    entry_params: null,
-    skip_reason: response.skip_reason || "guard",
-    method_selected_by: response.method_selected_by || "Manual",
-    method_reason: response.method_reason ? `${response.method_reason} | ${guardNote}` : guardNote,
-    reasoning: response.reasoning ? `${response.reasoning} | ${guardNote}` : guardNote,
-  };
+    guardedResponse = {
+      ...response,
+      action: 0,
+      entry_method: "market",
+      entry_params: null,
+      skip_reason: response.skip_reason || "guard",
+      method_selected_by: response.method_selected_by || "Manual",
+      method_reason: appendGuardText(response.method_reason, guardNote),
+      reasoning: appendGuardText(response.reasoning, guardNote),
+    };
+  }
+
+  return await applySymbolCooldownGuard(tradeReq, guardedResponse);
 }
 
 function corsHeaders() {
@@ -2597,7 +2708,7 @@ serve(async (req: Request) => {
       JSON.stringify({ 
         ok: true, 
         service: "ai-trader with OpenAI + Comprehensive Technical Analysis", 
-        version: "2.8.0-calib-robust",
+        version: "2.9.0-symbol-cooldown",
         mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
         ml_learning_enabled: mlLearningEnabled,
@@ -2619,6 +2730,7 @@ serve(async (req: Request) => {
           "rsi",
           "atr",
           "ichimoku_full",
+          "symbol_cooldown_guard",
           "market_only_execution"
         ],
         note: "Learning phase: AI comprehensively analyzes all technical indicators (MA, MACD, RSI, ATR, Ichimoku). ML phase gating: <80 trades=technical, 80-999=hybrid, 1000+=full. Set AI_TRADER_ML_MODE=on to apply ML to decisions (otherwise log_only)."
@@ -2744,7 +2856,7 @@ serve(async (req: Request) => {
     }
 
     // Apply hard guards (double-safety with EA-side rules)
-    response = applyExecutionGuards(tradeReq, response);
+    response = await applyExecutionGuards(tradeReq, response);
 
     // Emergency stop: keep AI inference (win_prob/reasoning) for monitoring/learning,
     // but force execution decision to no-trade.

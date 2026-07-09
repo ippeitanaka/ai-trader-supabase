@@ -233,6 +233,17 @@ AI_TRADER_CALIBRATION_MIN_N=20
 AI_TRADER_CALIBRATION_MIN_BIN_N=5
 ```
 
+### 銘柄別クールダウンガード
+直近の実トレードで銘柄単位の成績が悪化している場合、AIがエントリー可と判断しても `action=0` にします。
+デフォルトでは、直近12件のうち最低5件以上の実績があり、勝率45%未満かつ合計損益がマイナスの場合に発動します。
+
+```bash
+AI_TRADER_SYMBOL_COOLDOWN=on
+AI_TRADER_SYMBOL_COOLDOWN_LOOKBACK=12
+AI_TRADER_SYMBOL_COOLDOWN_MIN_N=5
+AI_TRADER_SYMBOL_COOLDOWN_MIN_WR=0.45
+```
+
 重要: 勝率キャリブレーションを有効化している場合、モデルの `win_prob` が過信（高め）だと、キャリブ後の値は大きく下がります。
 その状態で `ai_config.min_win_prob` を `0.60`〜`0.70` に置くと、実行がほぼゼロになりやすいです。
 
