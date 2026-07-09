@@ -39,16 +39,17 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   streak_guard: "連敗ガードを優先したため",
 };
 
+function parseMt5DateTime(value: string) {
+  const match = value.match(/^(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  return match ? `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}` : null;
+}
+
 function formatDateTime(value: string | null | undefined) {
   if (!value) return "-";
 
   const normalized = value.trim();
-  const mt5Match = normalized.match(/^(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
-  const isoLike = mt5Match
-    ? `${mt5Match[1]}-${mt5Match[2]}-${mt5Match[3]}T${mt5Match[4]}:${mt5Match[5]}:${mt5Match[6]}Z`
-    : normalized;
-
-  const date = new Date(isoLike);
+  const mt5Local = parseMt5DateTime(normalized);
+  const date = new Date(mt5Local ?? normalized);
   if (Number.isNaN(date.getTime())) return normalized;
 
   return new Intl.DateTimeFormat("ja-JP", {
@@ -64,24 +65,9 @@ function formatDateTime(value: string | null | undefined) {
 }
 
 function formatEaLogDateTime(value: string | null | undefined, referenceIso: string | null | undefined) {
-  if (!value) return "-";
-
-  const normalized = value.trim();
-  const mt5Match = normalized.match(/^(\d{4})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
-  if (!mt5Match) return formatDateTime(normalized);
-
-  const parsedUtc = new Date(`${mt5Match[1]}-${mt5Match[2]}-${mt5Match[3]}T${mt5Match[4]}:${mt5Match[5]}:${mt5Match[6]}Z`);
-  if (Number.isNaN(parsedUtc.getTime())) return normalized;
-
-  const reference = referenceIso ? new Date(referenceIso) : null;
-  if (reference && !Number.isNaN(reference.getTime())) {
-    const diffHours = Math.round((reference.getTime() - parsedUtc.getTime()) / (60 * 60 * 1000));
-    if (Math.abs(diffHours) <= 12) {
-      return formatDateTime(new Date(parsedUtc.getTime() + diffHours * 60 * 60 * 1000).toISOString());
-    }
-  }
-
-  return formatDateTime(parsedUtc.toISOString());
+  // EA sends MT5 server time in `at`, which can differ from JST/UTC by broker.
+  // Supabase `created_at` is the reliable timestamp for dashboard display.
+  return formatDateTime(referenceIso ?? value);
 }
 
 function formatPercent(value: number | null | undefined) {
@@ -132,7 +118,19 @@ function formatStrategy(value: string | null | undefined) {
 
 function formatUtcWindow(start?: string, end?: string) {
   if (!start || !end) return "-";
-  return `${start}-${end} UTC`;
+  return `${formatUtcClockAsJst(start)}-${formatUtcClockAsJst(end)} JST`;
+}
+
+function formatUtcClockAsJst(value: string) {
+  const match = value.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return value;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return value;
+  const totalMinutes = ((((hours * 60 + minutes) + 9 * 60) % (24 * 60)) + (24 * 60)) % (24 * 60);
+  const jstHours = Math.floor(totalMinutes / 60);
+  const jstMinutes = totalMinutes % 60;
+  return `${String(jstHours).padStart(2, "0")}:${String(jstMinutes).padStart(2, "0")}`;
 }
 
 function formatIndicatorTitle(title: string) {
