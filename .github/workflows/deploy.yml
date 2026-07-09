@@ -49,6 +49,30 @@ jobs:
           fi
           echo "✅ SUPABASE_ACCESS_TOKEN is configured"
 
+      - name: Verify Database Password
+        env:
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          if [ -z "$SUPABASE_DB_PASSWORD" ]; then
+            echo "❌ ERROR: SUPABASE_DB_PASSWORD is not set!"
+            echo "Please set the GitHub Secret 'SUPABASE_DB_PASSWORD'"
+            echo "You can find or reset this in: https://supabase.com/dashboard/project/_/settings/database"
+            exit 1
+          fi
+          echo "✅ SUPABASE_DB_PASSWORD is configured"
+
+      - name: Push Database Migrations
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          echo "Linking to Supabase project for database push..."
+          supabase link --project-ref "$PROJECT_REF"
+          echo "Pushing database migrations..."
+          supabase db push
+          echo "✅ Database migrations pushed successfully"
+
       - name: Deploy Edge Functions
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
