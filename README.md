@@ -39,7 +39,7 @@ echo "docs/pair-selector.html"
 ## 📌 推奨ペア選定
 
 - GitHub Actions: `.github/workflows/pair-selection-daily.yml`
-- 毎日 UTC 02:30 に `pair-selector` 関数を実行し、最新の推奨ペアを `pair_selection_reports` に保存
+- 毎日 UTC 22:00（JST 07:00）に `pair-selector` 関数を実行し、最新の推奨ペアを `pair_selection_reports` に保存
 - GET `/functions/v1/pair-selector` で最新レポートを確認可能
 - POST/GET の応答には `digest_text` / `digest_lines` / `digest` が含まれ、通知や転記に使える要約を取得可能
 - 日次レポートには `trade_plan` が含まれ、銘柄ごとの許可方向、戦略、稼働セッション、イベント回避時間、勝率/コストゲートを `ai-trader` とWebダッシュボードで共有
