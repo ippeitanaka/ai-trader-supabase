@@ -105,12 +105,66 @@ interface PairRecommendation {
   confidence: "high" | "medium" | "low";
   reason: string;
   caution?: string;
+  allowed_direction?: "buy" | "sell" | "both" | "none";
+  strategy?: "trend_follow" | "pullback" | "mean_revert" | "breakout" | "standby";
+  session_windows?: SessionWindow[];
+  avoid_event_windows?: EventWindow[];
+  min_win_prob?: number;
+  max_cost_r?: number;
+  plan_note?: string;
 }
 
 interface AiSelectionResult {
   summary: string;
   selected_pairs: PairRecommendation[];
   avoided_pairs: PairRecommendation[];
+  trade_plan?: DailyTradePlan;
+}
+
+interface SessionWindow {
+  label: string;
+  start_utc: string;
+  end_utc: string;
+}
+
+interface EventWindow {
+  label: string;
+  start_at: string;
+  end_at: string;
+  impact: "High" | "Medium" | "Low";
+  reason: string;
+}
+
+interface TradePlanSymbol {
+  symbol: string;
+  allowed_direction: "buy" | "sell" | "both" | "none";
+  strategy: "trend_follow" | "pullback" | "mean_revert" | "breakout" | "standby";
+  session_windows: SessionWindow[];
+  avoid_event_windows: EventWindow[];
+  min_win_prob: number;
+  max_cost_r: number;
+  confidence: "high" | "medium" | "low";
+  score: number;
+  reason: string;
+  setup_focus: string[];
+}
+
+interface DailyTradePlan {
+  plan_version: string;
+  plan_date: string;
+  generated_at: string;
+  expires_at: string;
+  timeframe: string;
+  risk_level: "low" | "medium" | "high";
+  summary: string;
+  market_themes: string[];
+  symbols: TradePlanSymbol[];
+  global_rules: {
+    avoid_high_impact_minutes_before: number;
+    avoid_high_impact_minutes_after: number;
+    require_higher_timeframe_alignment: boolean;
+    max_open_positions: number;
+  };
 }
 
 interface NewsHeadline {
@@ -320,6 +374,217 @@ function makeRecommendationFromStats(stats: SymbolStats, marketNote?: string): P
   };
 }
 
+function utcTime(hour: number, minute = 0): string {
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function defaultSessionWindows(symbol: string, riskLevel: MarketContext["risk_level"] | undefined): SessionWindow[] {
+  if (symbol === "BTCUSD") {
+    return riskLevel === "high"
+      ? [{ label: "NY risk window", start_utc: utcTime(13), end_utc: utcTime(21) }]
+      : [{ label: "24h crypto", start_utc: utcTime(0), end_utc: utcTime(23, 59) }];
+  }
+
+  if (symbol === "XAUUSD" || symbol === "XAGUSD") {
+    return [
+      { label: "London metals", start_utc: utcTime(7), end_utc: utcTime(11) },
+      { label: "NY metals", start_utc: utcTime(13), end_utc: utcTime(17) },
+    ];
+  }
+
+  if (symbol.endsWith("JPY") || symbol.includes("JPY")) {
+    return [
+      { label: "Tokyo flow", start_utc: utcTime(0), end_utc: utcTime(5) },
+      { label: "London/NY overlap", start_utc: utcTime(12), end_utc: utcTime(16) },
+    ];
+  }
+
+  return [
+    { label: "London", start_utc: utcTime(7), end_utc: utcTime(11) },
+    { label: "NY overlap", start_utc: utcTime(12), end_utc: utcTime(16) },
+  ];
+}
+
+function inferAllowedDirection(symbol: string, marketContext: MarketContext | null): TradePlanSymbol["allowed_direction"] {
+  const snapshotByKey = new Map((marketContext?.snapshots ?? []).map((snapshot) => [snapshot.key, snapshot]));
+  const dxy = snapshotByKey.get("DXY")?.day_change_pct ?? 0;
+  const us10y = snapshotByKey.get("US10Y")?.day_change_pct ?? 0;
+  const pairMove = snapshotByKey.get(symbol)?.day_change_pct ?? 0;
+
+  if (["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "XAUUSD", "XAGUSD", "BTCUSD"].includes(symbol)) {
+    if (dxy >= 0.25 && pairMove <= 0.1) return "sell";
+    if (dxy <= -0.25 && pairMove >= -0.1) return "buy";
+  }
+  if (["USDJPY", "USDCHF", "USDCAD"].includes(symbol)) {
+    if (dxy >= 0.25 || us10y >= 0.4) return "buy";
+    if (dxy <= -0.25) return "sell";
+  }
+  if (["EURJPY", "GBPJPY"].includes(symbol)) {
+    if (us10y >= 0.4 && pairMove >= 0) return "buy";
+    if ((marketContext?.risk_level ?? "low") === "high" && pairMove <= 0) return "sell";
+  }
+
+  return "both";
+}
+
+function inferStrategy(symbol: string, marketContext: MarketContext | null, stats?: SymbolStats): TradePlanSymbol["strategy"] {
+  const snapshot = marketContext?.snapshots.find((item) => item.key === symbol);
+  const regime = pairRegimeLabel(snapshot, symbol);
+  if (regime === "directional") return "trend_follow";
+  if (regime === "noisy") return stats && stats.pullback_win_rate !== null && stats.pullback_win_rate >= 0.5 ? "pullback" : "standby";
+  if ((marketContext?.risk_level ?? "low") === "high") return "pullback";
+  return "trend_follow";
+}
+
+function eventWindowsForSymbol(symbol: string, marketContext: MarketContext | null): EventWindow[] {
+  const events = marketContext?.economic_events ?? [];
+  const windows: EventWindow[] = [];
+  for (const event of events) {
+    if (event.impact !== "High") continue;
+    if (!event.affected_symbols.includes(symbol)) continue;
+    const eventTime = Date.parse(event.date);
+    if (!Number.isFinite(eventTime)) continue;
+    const beforeMs = 60 * 60 * 1000;
+    const afterMs = 45 * 60 * 1000;
+    const country = event.country_label_ja ?? countryLabelJa(event.country);
+    const title = event.title_ja ?? localizedEconomicTitle(event.title);
+    windows.push({
+      label: `${country} ${title}`,
+      start_at: new Date(eventTime - beforeMs).toISOString(),
+      end_at: new Date(eventTime + afterMs).toISOString(),
+      impact: event.impact,
+      reason: `${event.status === "upcoming" ? "予定" : "直近"}の高重要イベント`,
+    });
+  }
+  return windows.slice(0, 4);
+}
+
+function planGatesForSymbol(symbol: string, riskLevel: MarketContext["risk_level"] | undefined): { min_win_prob: number; max_cost_r: number } {
+  const baseMin = riskLevel === "high" ? 0.60 : riskLevel === "medium" ? 0.57 : 0.55;
+  const baseCost = riskLevel === "high" ? 0.14 : riskLevel === "medium" ? 0.17 : 0.20;
+  if (symbol === "BTCUSD") return { min_win_prob: baseMin + 0.02, max_cost_r: Math.min(baseCost, 0.16) };
+  if (symbol === "XAUUSD" || symbol === "XAGUSD") return { min_win_prob: baseMin + 0.03, max_cost_r: Math.min(baseCost, 0.15) };
+  return { min_win_prob: baseMin, max_cost_r: baseCost };
+}
+
+function setupFocusForSymbol(strategy: TradePlanSymbol["strategy"], allowedDirection: TradePlanSymbol["allowed_direction"]): string[] {
+  const focus = [
+    "M15 signal quality",
+    "H1 trend confirmation",
+    "spread cost below gate",
+  ];
+  if (strategy === "trend_follow") focus.push("H4/D1 direction not opposing");
+  if (strategy === "pullback") focus.push("entry after shallow retrace");
+  if (strategy === "mean_revert") focus.push("RSI extreme plus rejection candle");
+  if (allowedDirection !== "both") focus.push(`${allowedDirection.toUpperCase()} only`);
+  return focus.slice(0, 5);
+}
+
+function makePlanSymbol(
+  rec: PairRecommendation,
+  stats: SymbolStats | undefined,
+  marketContext: MarketContext | null,
+): TradePlanSymbol {
+  const allowedDirection = rec.allowed_direction ?? inferAllowedDirection(rec.symbol, marketContext);
+  const strategy = rec.strategy ?? inferStrategy(rec.symbol, marketContext, stats);
+  const gates = planGatesForSymbol(rec.symbol, marketContext?.risk_level);
+  return {
+    symbol: rec.symbol,
+    allowed_direction: allowedDirection,
+    strategy,
+    session_windows: rec.session_windows?.length ? rec.session_windows : defaultSessionWindows(rec.symbol, marketContext?.risk_level),
+    avoid_event_windows: rec.avoid_event_windows?.length ? rec.avoid_event_windows : eventWindowsForSymbol(rec.symbol, marketContext),
+    min_win_prob: typeof rec.min_win_prob === "number" ? clamp(rec.min_win_prob, 0.45, 0.75) : gates.min_win_prob,
+    max_cost_r: typeof rec.max_cost_r === "number" ? clamp(rec.max_cost_r, 0.05, 0.35) : gates.max_cost_r,
+    confidence: rec.confidence ?? scoreToConfidence(stats?.real_trades ?? 0),
+    score: Number.isFinite(rec.score) ? Math.round(rec.score) : Math.round(stats?.compatibility_score ?? 50),
+    reason: rec.reason || (stats ? makeRecommendationFromStats(stats, noteForSymbol(marketContext, rec.symbol)).reason : "AI selected"),
+    setup_focus: setupFocusForSymbol(strategy, allowedDirection),
+  };
+}
+
+function attachPlanToRecommendations(recs: PairRecommendation[], plan: DailyTradePlan | undefined): PairRecommendation[] {
+  if (!plan) return recs;
+  const bySymbol = new Map(plan.symbols.map((item) => [item.symbol, item]));
+  return recs.map((rec) => {
+    const item = bySymbol.get(rec.symbol);
+    if (!item) return rec;
+    return {
+      ...rec,
+      allowed_direction: item.allowed_direction,
+      strategy: item.strategy,
+      session_windows: item.session_windows,
+      avoid_event_windows: item.avoid_event_windows,
+      min_win_prob: item.min_win_prob,
+      max_cost_r: item.max_cost_r,
+      plan_note: item.setup_focus.join(" / "),
+    };
+  });
+}
+
+function buildFallbackTradePlan(
+  selected: PairRecommendation[],
+  stats: SymbolStats[],
+  timeframe: string,
+  marketContext: MarketContext | null,
+  summary: string,
+): DailyTradePlan {
+  const now = new Date();
+  const statsBySymbol = new Map(stats.map((item) => [item.symbol, item]));
+  const symbols = selected.slice(0, Math.max(1, selected.length)).map((rec) =>
+    makePlanSymbol(rec, statsBySymbol.get(rec.symbol), marketContext)
+  );
+
+  return {
+    plan_version: "daily-plan-v1",
+    plan_date: now.toISOString().slice(0, 10),
+    generated_at: now.toISOString(),
+    expires_at: new Date(now.getTime() + 30 * 60 * 60 * 1000).toISOString(),
+    timeframe,
+    risk_level: marketContext?.risk_level ?? "medium",
+    summary: summary || marketContext?.summary || "現在の市場環境とシステム実績から作成した日次トレード計画です。",
+    market_themes: (marketContext?.themes ?? []).slice(0, 5),
+    symbols,
+    global_rules: {
+      avoid_high_impact_minutes_before: 60,
+      avoid_high_impact_minutes_after: 45,
+      require_higher_timeframe_alignment: true,
+      max_open_positions: 1,
+    },
+  };
+}
+
+function normalizeTradePlan(
+  value: unknown,
+  selected: PairRecommendation[],
+  stats: SymbolStats[],
+  timeframe: string,
+  marketContext: MarketContext | null,
+  summary: string,
+): DailyTradePlan {
+  const fallback = buildFallbackTradePlan(selected, stats, timeframe, marketContext, summary);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
+  const raw = value as any;
+  const symbolsRaw = Array.isArray(raw.symbols) ? raw.symbols : [];
+  const statsBySymbol = new Map(stats.map((item) => [item.symbol, item]));
+  const validSelected = new Set(selected.map((rec) => rec.symbol));
+  const symbols = symbolsRaw
+    .filter((item: any) => typeof item?.symbol === "string" && validSelected.has(item.symbol))
+    .map((item: any) => makePlanSymbol(item as PairRecommendation, statsBySymbol.get(item.symbol), marketContext));
+
+  return {
+    ...fallback,
+    summary: typeof raw.summary === "string" && raw.summary.trim() ? raw.summary.trim() : fallback.summary,
+    market_themes: Array.isArray(raw.market_themes) ? raw.market_themes.filter((x: unknown) => typeof x === "string").slice(0, 5) : fallback.market_themes,
+    risk_level: raw.risk_level === "low" || raw.risk_level === "medium" || raw.risk_level === "high" ? raw.risk_level : fallback.risk_level,
+    symbols: symbols.length > 0 ? symbols : fallback.symbols,
+    global_rules: {
+      ...fallback.global_rules,
+      ...(raw.global_rules && typeof raw.global_rules === "object" ? raw.global_rules : {}),
+    },
+  };
+}
+
 function shortenDigestReason(reason: string | undefined, maxLength = 48): string | null {
   if (!reason) return null;
   const normalized = reason.replace(/\s+/g, " ").trim();
@@ -452,7 +717,7 @@ function buildSelectionView(
   };
 }
 
-function fallbackSelection(stats: SymbolStats[], topN: number, marketContext: MarketContext | null): AiSelectionResult {
+function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string, marketContext: MarketContext | null): AiSelectionResult {
   const sorted = [...stats].sort((a, b) => b.compatibility_score - a.compatibility_score);
   const selected_pairs = sorted
     .filter((s) => s.compatibility_score >= 55)
@@ -466,10 +731,14 @@ function fallbackSelection(stats: SymbolStats[], topN: number, marketContext: Ma
     selected_pairs.push(...sorted.slice(0, topN).map((s) => makeRecommendationFromStats(s, noteForSymbol(marketContext, s.symbol))));
   }
 
+  const summary = marketContext?.summary || "現在の市場反応と直近実績を併用した簡易選定です。";
+  const trade_plan = buildFallbackTradePlan(selected_pairs.slice(0, topN), stats, timeframe, marketContext, summary);
+
   return {
-    summary: marketContext?.summary || "現在の市場反応と直近実績を併用した簡易選定です。",
-    selected_pairs,
+    summary,
+    selected_pairs: attachPlanToRecommendations(selected_pairs, trade_plan),
     avoided_pairs,
+    trade_plan,
   };
 }
 
@@ -1273,7 +1542,7 @@ function applySystemFitToContext(marketContext: MarketContext | null, stats: Sym
 
 async function askOpenAi(stats: SymbolStats[], topN: number, cadence: string, timeframe: string, marketContext: MarketContext | null): Promise<AiSelectionResult> {
   if (!OPENAI_API_KEY) {
-    return fallbackSelection(stats, topN, marketContext);
+    return fallbackSelection(stats, topN, timeframe, marketContext);
   }
 
   const prompt = `あなたはMT5自動売買システムの運用アナリストです。
@@ -1288,6 +1557,10 @@ async function askOpenAi(stats: SymbolStats[], topN: number, cadence: string, ti
 - このシステムは ${timeframe} を使う
 - top ${topN} 件を選ぶ
 - 理由は「現在の市場環境」と「このシステムの直近実績」の両方に触れる
+- 選んだ銘柄ごとに、今日だけ許可する方向・戦略・取引時間帯・避けるイベント・実行ゲートを決める
+- allowed_direction は buy/sell/both/none のいずれか。迷うなら both ではなく根拠のある方向へ絞る
+- strategy は trend_follow/pullback/mean_revert/breakout/standby のいずれか
+- 高重要イベントに影響される銘柄は、その前後を avoid_event_windows に入れる
 
 現在の市場環境:
 ${JSON.stringify(marketContext, null, 2)}
@@ -1299,11 +1572,35 @@ JSONのみで回答:
 {
   "summary": "日本語で、市場環境とシステム適合性を2-3文で要約",
   "selected_pairs": [
-    {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"..."}
+    {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"...","allowed_direction":"buy|sell|both|none","strategy":"trend_follow|pullback|mean_revert|breakout|standby","min_win_prob":0.55,"max_cost_r":0.16}
   ],
   "avoided_pairs": [
     {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"..."}
-  ]
+  ],
+  "trade_plan": {
+    "summary": "日本語で今日の取引計画を1-2文",
+    "risk_level": "low|medium|high",
+    "market_themes": ["..."],
+    "symbols": [
+      {
+        "symbol": "X",
+        "allowed_direction": "buy|sell|both|none",
+        "strategy": "trend_follow|pullback|mean_revert|breakout|standby",
+        "min_win_prob": 0.55,
+        "max_cost_r": 0.16,
+        "confidence": "high|medium|low",
+        "score": 0-100,
+        "reason": "日本語で具体的に",
+        "setup_focus": ["H1 trend confirmation", "spread cost below gate"]
+      }
+    ],
+    "global_rules": {
+      "avoid_high_impact_minutes_before": 60,
+      "avoid_high_impact_minutes_after": 45,
+      "require_higher_timeframe_alignment": true,
+      "max_open_positions": 1
+    }
+  }
 }`;
 
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -1315,7 +1612,7 @@ JSONのみで回答:
     body: JSON.stringify({
       model: OPENAI_MODEL,
       temperature: 0.1,
-      max_tokens: 700,
+      max_tokens: 1200,
       messages: [
         {
           role: "system",
@@ -1327,30 +1624,36 @@ JSONのみで回答:
   });
 
   if (!response.ok) {
-    return fallbackSelection(stats, topN, marketContext);
+    return fallbackSelection(stats, topN, timeframe, marketContext);
   }
 
   const data = await response.json();
   const content = data?.choices?.[0]?.message?.content ?? "";
   const jsonMatch = typeof content === "string" ? content.match(/\{[\s\S]*\}/) : null;
   if (!jsonMatch) {
-    return fallbackSelection(stats, topN, marketContext);
+    return fallbackSelection(stats, topN, timeframe, marketContext);
   }
 
   try {
     const parsed = JSON.parse(jsonMatch[0]);
     const selected_pairs = Array.isArray(parsed?.selected_pairs) ? parsed.selected_pairs : [];
     const avoided_pairs = Array.isArray(parsed?.avoided_pairs) ? parsed.avoided_pairs : [];
+    const summary = typeof parsed?.summary === "string" && parsed.summary.trim()
+      ? parsed.summary.trim()
+      : `${cadence} pair selection report`;
+    const fallbackSelected = selected_pairs.length > 0
+      ? selected_pairs
+      : fallbackSelection(stats, topN, timeframe, marketContext).selected_pairs;
+    const trade_plan = normalizeTradePlan(parsed?.trade_plan, fallbackSelected.slice(0, topN), stats, timeframe, marketContext, summary);
 
     return {
-      summary: typeof parsed?.summary === "string" && parsed.summary.trim()
-        ? parsed.summary.trim()
-        : `${cadence} pair selection report`,
-      selected_pairs,
+      summary,
+      selected_pairs: attachPlanToRecommendations(fallbackSelected, trade_plan),
       avoided_pairs,
+      trade_plan,
     };
   } catch (_error) {
-    return fallbackSelection(stats, topN, marketContext);
+    return fallbackSelection(stats, topN, timeframe, marketContext);
   }
 }
 
@@ -1366,7 +1669,19 @@ async function generateReport(body: any) {
   const stats = buildStats(universe, timeframe, realRows, virtualRows);
   const enrichedContext = applySystemFitToContext(marketContext, stats);
   const aiSelection = await askOpenAi(stats, topN, cadence, timeframe, enrichedContext);
+  const tradePlan = normalizeTradePlan(
+    aiSelection.trade_plan,
+    aiSelection.selected_pairs.slice(0, topN),
+    stats,
+    timeframe,
+    enrichedContext,
+    aiSelection.summary || enrichedContext?.summary || "",
+  );
+  aiSelection.trade_plan = tradePlan;
+  aiSelection.selected_pairs = attachPlanToRecommendations(aiSelection.selected_pairs, tradePlan);
   const selectionView = buildSelectionView(stats, aiSelection, topN, enrichedContext);
+  const selectedWithPlan = attachPlanToRecommendations(selectionView.recommended_pairs, tradePlan);
+  const topPicksWithPlan = attachPlanToRecommendations(selectionView.top_picks, tradePlan);
 
   const payload = {
     generated_at: new Date().toISOString(),
@@ -1375,20 +1690,37 @@ async function generateReport(body: any) {
     lookback_days: lookbackDays,
     top_n: topN,
     universe,
-    selected_pairs: selectionView.recommended_pairs,
+    selected_pairs: selectedWithPlan,
     avoided_pairs: selectionView.avoided_pairs,
     candidate_stats: stats,
     summary: aiSelection.summary || enrichedContext?.summary || null,
+    trade_plan: tradePlan,
+    plan_status: "active",
+    plan_overrides: {},
     model: OPENAI_MODEL,
     triggered_by: triggeredBy,
     status: "active",
   };
 
-  const { data: inserted, error } = await supabase
+  let { data: inserted, error } = await supabase
     .from("pair_selection_reports")
     .insert(payload)
     .select()
     .single();
+
+  if (error && /trade_plan|plan_status|plan_overrides|column/i.test(String(error.message ?? ""))) {
+    const legacyPayload = { ...payload } as any;
+    delete legacyPayload.trade_plan;
+    delete legacyPayload.plan_status;
+    delete legacyPayload.plan_overrides;
+    const retry = await supabase
+      .from("pair_selection_reports")
+      .insert(legacyPayload)
+      .select()
+      .single();
+    inserted = retry.data;
+    error = retry.error;
+  }
 
   if (error) {
     throw new Error(`failed to save pair selection report: ${error.message}`);
@@ -1401,8 +1733,9 @@ async function generateReport(body: any) {
       ...inserted,
       live_context: enrichedContext,
       ...buildReportDigest(aiSelection.summary || enrichedContext?.summary || "", selectionView, enrichedContext),
-      top_picks: selectionView.top_picks,
-      recommended_pairs: selectionView.recommended_pairs,
+      trade_plan: tradePlan,
+      top_picks: topPicksWithPlan,
+      recommended_pairs: selectedWithPlan,
       neutral_pairs: selectionView.neutral_pairs,
       ranked_pairs: selectionView.ranked_pairs,
     },
@@ -1427,12 +1760,25 @@ Deno.serve(async (req: Request) => {
       const url = new URL(req.url);
       const limit = clamp(Number(url.searchParams.get("limit") ?? 1), 1, 10);
       const liveContextRaw = limit === 1 ? await fetchMarketContext(DEFAULT_UNIVERSE) : null;
-      const { data, error } = await supabase
+      const primaryReports = await supabase
         .from("pair_selection_reports")
-        .select("id, created_at, generated_at, cadence, timeframe, lookback_days, top_n, universe, selected_pairs, avoided_pairs, candidate_stats, summary, model, triggered_by")
+        .select("id, created_at, generated_at, cadence, timeframe, lookback_days, top_n, universe, selected_pairs, avoided_pairs, candidate_stats, summary, trade_plan, plan_overrides, plan_status, model, triggered_by")
         .eq("status", "active")
         .order("created_at", { ascending: false })
         .limit(limit);
+      let data: any[] | null = primaryReports.data as any[] | null;
+      let error: any = primaryReports.error;
+
+      if (error && /trade_plan|plan_status|plan_overrides|column/i.test(String(error.message ?? ""))) {
+        const retry = await supabase
+          .from("pair_selection_reports")
+          .select("id, created_at, generated_at, cadence, timeframe, lookback_days, top_n, universe, selected_pairs, avoided_pairs, candidate_stats, summary, model, triggered_by")
+          .eq("status", "active")
+          .order("created_at", { ascending: false })
+          .limit(limit);
+        data = retry.data;
+        error = retry.error;
+      }
 
       if (error) {
         throw new Error(error.message);
@@ -1446,11 +1792,24 @@ Deno.serve(async (req: Request) => {
           avoided_pairs: Array.isArray(report?.avoided_pairs) ? report.avoided_pairs : [],
         };
         const liveContext = applySystemFitToContext(liveContextRaw, stats);
+        const reportPlan = normalizeTradePlan(
+          report?.trade_plan,
+          aiSelection.selected_pairs.slice(0, Number(report?.top_n ?? DEFAULT_TOP_N)),
+          stats,
+          String(report?.timeframe ?? DEFAULT_TIMEFRAME),
+          liveContext,
+          aiSelection.summary,
+        );
+        aiSelection.trade_plan = reportPlan;
+        aiSelection.selected_pairs = attachPlanToRecommendations(aiSelection.selected_pairs, reportPlan);
         const selectionView = buildSelectionView(stats, aiSelection, Number(report?.top_n ?? DEFAULT_TOP_N), liveContext);
         const digest = buildReportDigest(aiSelection.summary, selectionView, liveContext);
         return {
           ...report,
           ...digest,
+          trade_plan: reportPlan,
+          plan_overrides: report?.plan_overrides ?? {},
+          plan_status: typeof report?.plan_status === "string" ? report.plan_status : "active",
           top_picks: selectionView.top_picks,
           recommended_pairs: selectionView.recommended_pairs,
           neutral_pairs: selectionView.neutral_pairs,

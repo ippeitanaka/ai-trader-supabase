@@ -84,6 +84,17 @@ SELECT * FROM "ea-log" ORDER BY created_at DESC LIMIT 10;
 SELECT * FROM ai_signals ORDER BY created_at DESC LIMIT 10;
 ```
 
+### 日次トレード計画の反映
+```bash
+# ローカルDBへ最新マイグレーションを反映
+supabase migration up
+
+# 本番Supabaseへ反映
+supabase db push
+```
+
+`20260709_001_add_daily_trade_plan.sql` は、`pair_selection_reports.trade_plan`、手動停止用の `plan_overrides`、AI/EAログの `trade_plan_id`、上位足コンテキスト、主要レベル距離、スイング構造、相対ボラティリティ、コスト文脈を追加します。Webダッシュボードの「本日の取引計画」表示と一時停止/再開操作を使う前に反映してください。
+
 ---
 
 ## 📖 ドキュメント
@@ -176,8 +187,11 @@ supabase link --project-ref your-project-ref
 supabase secrets set OPENAI_API_KEY=your-key-here
 
 # デプロイ
-supabase functions deploy ai-trader
 supabase db push
+supabase functions deploy pair-selector
+supabase functions deploy ai-trader
+supabase functions deploy ai-signals
+supabase functions deploy ea-log
 ```
 
 ---

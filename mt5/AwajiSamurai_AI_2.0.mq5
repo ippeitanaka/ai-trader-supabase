@@ -1080,6 +1080,278 @@ TechSignal Evaluate(ENUM_TIMEFRAMES tf)
    return s;
 }
 
+string JsonNum(const double v,const int digits)
+{
+   if(!MathIsValidNumber(v) || v==EMPTY_VALUE) return "null";
+   return DoubleToString(v,digits);
+}
+
+int CurrentUtcHour()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeGMT(),dt);
+   return dt.hour;
+}
+
+int CurrentUtcDayOfWeek()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeGMT(),dt);
+   return dt.day_of_week;
+}
+
+string MarketSessionLabel()
+{
+   int h=CurrentUtcHour();
+   if(h>=0 && h<6) return "tokyo";
+   if(h>=6 && h<12) return "london";
+   if(h>=12 && h<17) return "london_ny_overlap";
+   if(h>=17 && h<22) return "ny";
+   return "rollover";
+}
+
+string BuildHtfSnapshotJson(const string label,const ENUM_TIMEFRAMES tf)
+{
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   double price=(bid+ask)/2.0;
+   double ema=MA(tf,25,MODE_EMA,PRICE_CLOSE,0);
+   double emaPrev=MA(tf,25,MODE_EMA,PRICE_CLOSE,1);
+   double sma=MA(tf,100,MODE_SMA,PRICE_CLOSE,0);
+   double atr=ATRv(tf,14,0);
+   double rsi=RSIv(tf,14,PRICE_CLOSE,0);
+   double adx=0,diPlus=0,diMinus=0;
+   bool hasAdx=GetADX(tf,adx,diPlus,diMinus,0);
+
+   int trend=0;
+   if(MathIsValidNumber(ema) && MathIsValidNumber(sma) && ema!=EMPTY_VALUE && sma!=EMPTY_VALUE){
+      if(ema>sma) trend=1;
+      else if(ema<sma) trend=-1;
+   }
+
+   double emaSlopeAtr=EMPTY_VALUE;
+   double priceVsEmaAtr=EMPTY_VALUE;
+   if(MathIsValidNumber(atr) && atr!=EMPTY_VALUE && atr>0){
+      if(MathIsValidNumber(ema) && MathIsValidNumber(emaPrev) && ema!=EMPTY_VALUE && emaPrev!=EMPTY_VALUE)
+         emaSlopeAtr=(ema-emaPrev)/atr;
+      if(MathIsValidNumber(price) && MathIsValidNumber(ema) && ema!=EMPTY_VALUE)
+         priceVsEmaAtr=(price-ema)/atr;
+   }
+
+   int priceVsCloud=0;
+   IchimokuValues ich;
+   if(GetIchimoku(tf,ich,0)){
+      if(price>MathMax(ich.senkou_a,ich.senkou_b)) priceVsCloud=1;
+      else if(price<MathMin(ich.senkou_a,ich.senkou_b)) priceVsCloud=-1;
+   }
+
+   return "{"+
+      "\"timeframe\":\""+JsonEscape(label)+"\","+
+      "\"trend_dir\":"+IntegerToString(trend)+","+
+      "\"ema_slope_atr\":"+JsonNum(emaSlopeAtr,5)+","+
+      "\"price_vs_ema25_atr\":"+JsonNum(priceVsEmaAtr,5)+","+
+      "\"adx\":"+(hasAdx?JsonNum(adx,2):"null")+","+
+      "\"di_plus\":"+(hasAdx?JsonNum(diPlus,2):"null")+","+
+      "\"di_minus\":"+(hasAdx?JsonNum(diMinus,2):"null")+","+
+      "\"rsi\":"+JsonNum(rsi,2)+","+
+      "\"atr_norm\":"+((MathIsValidNumber(atr) && atr!=EMPTY_VALUE && price>0)?JsonNum(atr/price,8):"null")+","+
+      "\"price_vs_cloud\":"+IntegerToString(priceVsCloud)+
+   "}";
+}
+
+string BuildHigherTimeframesJson()
+{
+   return "{"+
+      "\"h1\":"+BuildHtfSnapshotJson("H1",PERIOD_H1)+","+
+      "\"h4\":"+BuildHtfSnapshotJson("H4",PERIOD_H4)+","+
+      "\"d1\":"+BuildHtfSnapshotJson("D1",PERIOD_D1)+
+   "}";
+}
+
+double HighestHigh(ENUM_TIMEFRAMES tf,const int startShift,const int count)
+{
+   double high=-1.0e100;
+   int n=0;
+   for(int i=startShift;i<startShift+count;i++){
+      double v=iHigh(_Symbol,tf,i);
+      if(MathIsValidNumber(v) && v!=EMPTY_VALUE){
+         if(v>high) high=v;
+         n++;
+      }
+   }
+   return n>0 ? high : EMPTY_VALUE;
+}
+
+double LowestLow(ENUM_TIMEFRAMES tf,const int startShift,const int count)
+{
+   double low=1.0e100;
+   int n=0;
+   for(int i=startShift;i<startShift+count;i++){
+      double v=iLow(_Symbol,tf,i);
+      if(MathIsValidNumber(v) && v!=EMPTY_VALUE){
+         if(v<low) low=v;
+         n++;
+      }
+   }
+   return n>0 ? low : EMPTY_VALUE;
+}
+
+double AverageRange(ENUM_TIMEFRAMES tf,const int startShift,const int count)
+{
+   double sum=0.0;
+   int n=0;
+   for(int i=startShift;i<startShift+count;i++){
+      double h=iHigh(_Symbol,tf,i);
+      double l=iLow(_Symbol,tf,i);
+      if(MathIsValidNumber(h) && MathIsValidNumber(l) && h!=EMPTY_VALUE && l!=EMPTY_VALUE && h>=l){
+         sum+=(h-l);
+         n++;
+      }
+   }
+   return n>0 ? sum/n : EMPTY_VALUE;
+}
+
+double AverageTickVolume(ENUM_TIMEFRAMES tf,const int startShift,const int count)
+{
+   double sum=0.0;
+   int n=0;
+   for(int i=startShift;i<startShift+count;i++){
+      long v=iVolume(_Symbol,tf,i);
+      if(v>0){
+         sum+=(double)v;
+         n++;
+      }
+   }
+   return n>0 ? sum/n : EMPTY_VALUE;
+}
+
+double AtrPercentile(ENUM_TIMEFRAMES tf,const double currentAtr,const int lookback)
+{
+   if(!MathIsValidNumber(currentAtr) || currentAtr<=0 || currentAtr==EMPTY_VALUE) return EMPTY_VALUE;
+   int below=0;
+   int n=0;
+   for(int i=1;i<=lookback;i++){
+      double v=ATRv(tf,14,i);
+      if(MathIsValidNumber(v) && v!=EMPTY_VALUE && v>0){
+         if(v<=currentAtr) below++;
+         n++;
+      }
+   }
+   return n>0 ? (double)below/(double)n : EMPTY_VALUE;
+}
+
+string BuildLevelDistancesJson(const double price,const double atr)
+{
+   if(!MathIsValidNumber(price) || price<=0 || !MathIsValidNumber(atr) || atr<=0 || atr==EMPTY_VALUE)
+      return "{}";
+
+   double prevHigh=iHigh(_Symbol,PERIOD_D1,1);
+   double prevLow=iLow(_Symbol,PERIOD_D1,1);
+   double dayHigh=iHigh(_Symbol,PERIOD_D1,0);
+   double dayLow=iLow(_Symbol,PERIOD_D1,0);
+
+   return "{"+
+      "\"prev_day_high_dist_atr\":"+JsonNum((prevHigh-price)/atr,3)+","+
+      "\"prev_day_low_dist_atr\":"+JsonNum((price-prevLow)/atr,3)+","+
+      "\"day_high_dist_atr\":"+JsonNum((dayHigh-price)/atr,3)+","+
+      "\"day_low_dist_atr\":"+JsonNum((price-dayLow)/atr,3)+
+   "}";
+}
+
+string BuildChartStructureJson(const ENUM_TIMEFRAMES tf,const double price,const double atr)
+{
+   if(!MathIsValidNumber(price) || price<=0 || !MathIsValidNumber(atr) || atr<=0 || atr==EMPTY_VALUE)
+      return "{}";
+
+   const int lookback=20;
+   double recentHigh=HighestHigh(tf,1,lookback);
+   double recentLow=LowestLow(tf,1,lookback);
+   double priorHigh=HighestHigh(tf,lookback+1,lookback);
+   double priorLow=LowestLow(tf,lookback+1,lookback);
+   double close1=iClose(_Symbol,tf,1);
+   double closeN=iClose(_Symbol,tf,lookback);
+   bool hasRecent=(MathIsValidNumber(recentHigh) && recentHigh!=EMPTY_VALUE && MathIsValidNumber(recentLow) && recentLow!=EMPTY_VALUE);
+   bool hasPrior=(MathIsValidNumber(priorHigh) && priorHigh!=EMPTY_VALUE && MathIsValidNumber(priorLow) && priorLow!=EMPTY_VALUE);
+
+   int swingDir=0;
+   if(hasRecent && hasPrior){
+      if(recentHigh>priorHigh && recentLow>priorLow) swingDir=1;
+      else if(recentHigh<priorHigh && recentLow<priorLow) swingDir=-1;
+   }
+
+   int lastBreakDir=0;
+   if(hasRecent){
+      if(price>recentHigh) lastBreakDir=1;
+      else if(price<recentLow) lastBreakDir=-1;
+   }
+
+   double rangePosition=EMPTY_VALUE;
+   if(hasRecent && recentHigh>recentLow)
+      rangePosition=(price-recentLow)/(recentHigh-recentLow);
+
+   double impulseAtr=EMPTY_VALUE;
+   if(MathIsValidNumber(close1) && MathIsValidNumber(closeN) && close1!=EMPTY_VALUE && closeN!=EMPTY_VALUE)
+      impulseAtr=(close1-closeN)/atr;
+
+   double nearestResistanceDistAtr=(hasRecent ? (recentHigh-price)/atr : EMPTY_VALUE);
+   double nearestSupportDistAtr=(hasRecent ? (price-recentLow)/atr : EMPTY_VALUE);
+
+   return "{"+
+      "\"lookback_bars\":"+IntegerToString(lookback)+","+
+      "\"swing_dir\":"+IntegerToString(swingDir)+","+
+      "\"last_break_dir\":"+IntegerToString(lastBreakDir)+","+
+      "\"recent_high\":"+JsonNum(recentHigh,_Digits)+","+
+      "\"recent_low\":"+JsonNum(recentLow,_Digits)+","+
+      "\"prior_high\":"+JsonNum(priorHigh,_Digits)+","+
+      "\"prior_low\":"+JsonNum(priorLow,_Digits)+","+
+      "\"nearest_resistance_dist_atr\":"+JsonNum(nearestResistanceDistAtr,3)+","+
+      "\"nearest_support_dist_atr\":"+JsonNum(nearestSupportDistAtr,3)+","+
+      "\"range_position\":"+JsonNum(rangePosition,3)+","+
+      "\"impulse_20_atr\":"+JsonNum(impulseAtr,3)+
+   "}";
+}
+
+string BuildVolatilityContextJson(const ENUM_TIMEFRAMES tf,const double atr,const double bbWidth)
+{
+   double atrPct=AtrPercentile(tf,atr,100);
+   double avgRange=AverageRange(tf,1,20);
+   double currentRange=iHigh(_Symbol,tf,1)-iLow(_Symbol,tf,1);
+   double rangeExpansion=EMPTY_VALUE;
+   if(MathIsValidNumber(avgRange) && avgRange!=EMPTY_VALUE && avgRange>0 && MathIsValidNumber(currentRange) && currentRange>=0)
+      rangeExpansion=currentRange/avgRange;
+
+   int volRegime=0;
+   if(MathIsValidNumber(atrPct) && atrPct!=EMPTY_VALUE){
+      if(atrPct>=0.75) volRegime=1;
+      else if(atrPct<=0.25) volRegime=-1;
+   }
+
+   return "{"+
+      "\"atr_percentile_100\":"+JsonNum(atrPct,3)+","+
+      "\"range_expansion_20\":"+JsonNum(rangeExpansion,3)+","+
+      "\"volatility_regime\":"+IntegerToString(volRegime)+","+
+      "\"bb_width\":"+JsonNum(bbWidth,8)+
+   "}";
+}
+
+string BuildCostContextJson(const ENUM_TIMEFRAMES tf,const double atr,const double bid,const double ask)
+{
+   double spread=ask-bid;
+   double point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   double spreadPoints=(point>0 ? spread/point : EMPTY_VALUE);
+   double spreadAtr=(MathIsValidNumber(atr) && atr>0 && atr!=EMPTY_VALUE ? spread/atr : EMPTY_VALUE);
+   double avgVol=AverageTickVolume(tf,2,20);
+   double lastVol=(double)iVolume(_Symbol,tf,1);
+   double tickVolRatio=(MathIsValidNumber(avgVol) && avgVol!=EMPTY_VALUE && avgVol>0 && lastVol>0 ? lastVol/avgVol : EMPTY_VALUE);
+
+   return "{"+
+      "\"spread_points\":"+JsonNum(spreadPoints,2)+","+
+      "\"spread_atr\":"+JsonNum(spreadAtr,5)+","+
+      "\"last_tick_volume\":"+JsonNum(lastVol,0)+","+
+      "\"tick_volume_ratio_20\":"+JsonNum(tickVolRatio,3)+
+   "}";
+}
+
 // ===== AI連携 =====
 struct AIOut{
    double win_prob;int action;double offset_factor;int expiry_min;string reasoning;string confidence;
@@ -1104,6 +1376,9 @@ struct AIOut{
    long   ml_pattern_id;         // パターンID
    string ml_pattern_name;       // パターン名
    double ml_pattern_confidence; // パターン信頼度 (%)
+   long   trade_plan_id;         // 日次トレード計画ID
+   string plan_alignment;        // aligned / mismatch / htf_conflict 等
+   string event_risk;            // none / medium / high
 };
 bool ExtractJsonNumber(const string json,const string key,double &out){
    string pat="\""+key+"\":";int pos=StringFind(json,pat);if(pos<0)return false;
@@ -1230,6 +1505,9 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    out_ai.ml_pattern_id=0;
    out_ai.ml_pattern_name="";
    out_ai.ml_pattern_confidence=0.0;
+   out_ai.trade_plan_id=0;
+   out_ai.plan_alignment="";
+   out_ai.event_risk="";
 
    // ★ テクニカル指標の詳細データを取得
    ENUM_TIMEFRAMES tf=(tf_label=="M15")?TF_Entry:TF_Recheck;
@@ -1310,6 +1588,11 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
 
    // 正規化ATR（ATR/価格）
    double atr_norm=(price>0?atr_send/price:0);
+   string marketSession=MarketSessionLabel();
+   int utcHour=CurrentUtcHour();
+   int utcDay=CurrentUtcDayOfWeek();
+   string higherTfJson=BuildHigherTimeframesJson();
+   string levelDistancesJson=BuildLevelDistancesJson(price,atr_send);
    
    // 価格情報 (send-safe)
    double bid=0.0, ask=0.0;
@@ -1330,6 +1613,9 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
       bid=0.0;
       ask=0.0;
    }
+   string chartStructureJson=BuildChartStructureJson(tf,price,atr_send);
+   string volatilityContextJson=BuildVolatilityContextJson(tf,atr_send,(has_bb?bb_width:EMPTY_VALUE));
+   string costContextJson=BuildCostContextJson(tf,atr_send,bid,ask);
    
    // ★ すべての生データをAIに送信
    int dir_to_send = (UseAIForDirection ? 0 : dir);
@@ -1402,6 +1688,16 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
 
    // 生OHLC（複数本）
    "\"candle_bars\":"+candleBarsJson+","+
+
+   // セッション・上位足・主要価格レベル距離
+   "\"market_session\":\""+JsonEscape(marketSession)+"\","+
+   "\"utc_hour\":"+IntegerToString(utcHour)+","+
+   "\"day_of_week\":"+IntegerToString(utcDay)+","+
+   "\"higher_timeframes\":"+higherTfJson+","+
+   "\"level_distances\":"+levelDistancesJson+","+
+   "\"chart_structure\":"+chartStructureJson+","+
+   "\"volatility_context\":"+volatilityContextJson+","+
+   "\"cost_context\":"+costContextJson+","+
    
    // EA側の判断（参考情報として）
    "\"ea_suggestion\":{"+
@@ -1458,6 +1754,9 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    int mlId=0; if(ExtractJsonInt(resp,"ml_pattern_id",mlId)) out_ai.ml_pattern_id=(long)mlId; else out_ai.ml_pattern_id=0;
    ExtractJsonString(resp,"ml_pattern_name",out_ai.ml_pattern_name);
    double mlConf; if(ExtractJsonNumber(resp,"ml_pattern_confidence",mlConf)) out_ai.ml_pattern_confidence=mlConf; else out_ai.ml_pattern_confidence=0.0;
+   int planId=0; if(ExtractJsonInt(resp,"trade_plan_id",planId)) out_ai.trade_plan_id=(long)planId; else out_ai.trade_plan_id=0;
+   ExtractJsonString(resp,"plan_alignment",out_ai.plan_alignment);
+   ExtractJsonString(resp,"event_risk",out_ai.event_risk);
 
    // response validation (safe-side skip)
    string vwhy="";
@@ -1507,6 +1806,10 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
    "\"lot_reason\":"+(ai.lot_reason!=""?"\""+JsonEscape(ai.lot_reason)+"\"":"null")+","+
    (ticket>0?"\"order_ticket\":\""+ULongToString(ticket)+"\",":"")+
    (executed_lot>0?"\"executed_lot\":"+DoubleToString(executed_lot,2)+",":"")+
+   (ai.trade_plan_id>0?"\"trade_plan_id\":"+IntegerToString((int)ai.trade_plan_id)+",":"")+
+   "\"plan_alignment\":\""+JsonEscape(ai.plan_alignment)+"\","+
+   "\"event_risk\":\""+JsonEscape(ai.event_risk)+"\","+
+   "\"market_session\":\""+JsonEscape(MarketSessionLabel())+"\","+
    "\"offset_factor\":"+DoubleToString(ai.offset_factor,3)+","+
    "\"expiry_minutes\":"+IntegerToString(ai.expiry_min)+","+
    "\"reason\":\""+JsonEscape(reason)+"\","+
@@ -1613,6 +1916,14 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
          has_bb=false;
       }
    }
+   string marketSession=MarketSessionLabel();
+   int utcHour=CurrentUtcHour();
+   int utcDay=CurrentUtcDayOfWeek();
+   string higherTfJson=BuildHigherTimeframesJson();
+   string levelDistancesJson=BuildLevelDistancesJson(price,atr);
+   string chartStructureJson=BuildChartStructureJson(tf,price,atr);
+   string volatilityContextJson=BuildVolatilityContextJson(tf,atr,(has_bb?bb_width:EMPTY_VALUE));
+   string costContextJson=BuildCostContextJson(tf,atr,bid,ask);
 
    string payload="{"+
    "\"symbol\":\""+JsonEscape(_Symbol)+"\","+
@@ -1659,6 +1970,17 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"reason\":\""+JsonEscape(reason)+"\","+
    "\"instance\":\""+JsonEscape(AI_EA_Instance)+"\","+
    "\"model_version\":\""+JsonEscape(AI_EA_Version)+"\","+
+   "\"trade_plan_id\":"+(ai.trade_plan_id>0?IntegerToString((int)ai.trade_plan_id):"null")+","+
+   "\"plan_alignment\":"+(ai.plan_alignment!=""?"\""+JsonEscape(ai.plan_alignment)+"\"":"null")+","+
+   "\"event_risk\":"+(ai.event_risk!=""?"\""+JsonEscape(ai.event_risk)+"\"":"null")+","+
+   "\"market_session\":\""+JsonEscape(marketSession)+"\","+
+   "\"utc_hour\":"+IntegerToString(utcHour)+","+
+   "\"day_of_week\":"+IntegerToString(utcDay)+","+
+   "\"htf_context\":"+higherTfJson+","+
+   "\"level_distances\":"+levelDistancesJson+","+
+   "\"chart_structure\":"+chartStructureJson+","+
+   "\"volatility_context\":"+volatilityContextJson+","+
+   "\"cost_context\":"+costContextJson+","+
    "\"decision_summary\":"+(ai.decision_summary!=""?"\""+JsonEscape(ai.decision_summary)+"\"":"null")+","+
    "\"entry_method\":\""+JsonEscape(ai.entry_method)+"\","+
    "\"method_selected_by\":\""+JsonEscape(ai.method_selected_by)+"\","+

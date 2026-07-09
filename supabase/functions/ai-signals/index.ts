@@ -288,6 +288,17 @@ interface AISignalEntry {
   regime?: string | null;
   strategy?: string | null;
   regime_confidence?: string | null;
+  trade_plan_id?: number | null;
+  plan_alignment?: string | null;
+  event_risk?: string | null;
+  market_session?: string | null;
+  utc_hour?: number | null;
+  day_of_week?: number | null;
+  htf_context?: any | null;
+  level_distances?: any | null;
+  chart_structure?: any | null;
+  volatility_context?: any | null;
+  cost_context?: any | null;
   
   // 価格情報
   bid?: number;
@@ -654,6 +665,17 @@ serve(async (req: Request) => {
         regime: safeText(body.regime),
         strategy: safeText(body.strategy),
         regime_confidence: safeText(body.regime_confidence),
+        trade_plan_id: Number.isFinite(body.trade_plan_id) ? Number(body.trade_plan_id) : null,
+        plan_alignment: safeText(body.plan_alignment),
+        event_risk: safeText(body.event_risk),
+        market_session: safeText(body.market_session),
+        utc_hour: Number.isFinite(body.utc_hour) ? Math.max(0, Math.min(23, Math.floor(Number(body.utc_hour)))) : null,
+        day_of_week: Number.isFinite(body.day_of_week) ? Math.max(0, Math.min(6, Math.floor(Number(body.day_of_week)))) : null,
+        htf_context: body.htf_context ?? body.higher_timeframes ?? null,
+        level_distances: body.level_distances ?? null,
+        chart_structure: body.chart_structure ?? null,
+        volatility_context: body.volatility_context ?? null,
+        cost_context: body.cost_context ?? null,
         
         // 価格情報
         bid: pgNumeric20_5(body.bid) ?? undefined,
@@ -760,6 +782,17 @@ serve(async (req: Request) => {
           delete legacyEntry.regime;
           delete legacyEntry.strategy;
           delete legacyEntry.regime_confidence;
+          delete legacyEntry.trade_plan_id;
+          delete legacyEntry.plan_alignment;
+          delete legacyEntry.event_risk;
+          delete legacyEntry.market_session;
+          delete legacyEntry.utc_hour;
+          delete legacyEntry.day_of_week;
+          delete legacyEntry.htf_context;
+          delete legacyEntry.level_distances;
+          delete legacyEntry.chart_structure;
+          delete legacyEntry.volatility_context;
+          delete legacyEntry.cost_context;
           delete legacyEntry.lot_multiplier;
           delete legacyEntry.lot_level;
           delete legacyEntry.lot_reason;

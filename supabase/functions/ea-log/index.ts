@@ -34,6 +34,10 @@ interface EALogEntry {
   lot_level?: string;            // Lot sizing level label
   lot_reason?: string;           // Reason for lot multiplier
   executed_lot?: number;         // Final lot sent to broker
+  trade_plan_id?: number;
+  plan_alignment?: string;
+  event_risk?: string;
+  market_session?: string;
   ai_reasoning?: string;         // AIの判断根拠
   order_ticket?: number;         // 注文番号
 }
@@ -80,6 +84,10 @@ interface EALogInput {
   lot_level?: string;
   lot_reason?: string;
   executed_lot?: number;
+  trade_plan_id?: number;
+  plan_alignment?: string;
+  event_risk?: string;
+  market_session?: string;
   order_ticket?: number;
   ema25s2?: number;
   ma100?: number;
@@ -364,6 +372,10 @@ serve(async (req: Request) => {
       lot_level: body.lot_level || undefined,
       lot_reason: body.lot_reason || undefined,
       executed_lot: body.executed_lot !== undefined ? Number(body.executed_lot) : undefined,
+      trade_plan_id: body.trade_plan_id !== undefined ? Number(body.trade_plan_id) : undefined,
+      plan_alignment: body.plan_alignment || undefined,
+      event_risk: body.event_risk || undefined,
+      market_session: body.market_session || undefined,
       ai_reasoning: storedReasoning,
       order_ticket: body.order_ticket !== undefined ? Number(body.order_ticket) : undefined,
     };
