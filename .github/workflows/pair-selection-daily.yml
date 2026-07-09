@@ -2,7 +2,7 @@ name: Pair Selection Daily
 
 on:
   schedule:
-    - cron: '30 2 * * *'
+    - cron: '0 22 * * *' # Daily 07:00 JST
   workflow_dispatch:
     inputs:
       cadence:
