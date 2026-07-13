@@ -271,6 +271,24 @@ interface AISignalEntry {
   timeframe: string;
   dir: number;
   win_prob: number;
+  win_prob_raw?: number | null;
+  win_prob_calibrated?: number | null;
+  win_prob_final?: number | null;
+  calibration_applied?: boolean;
+  calibration_version?: string | null;
+  calibration_method?: string | null;
+  calibration_scope?: string | null;
+  calibration_sample_size?: number | null;
+  calibration_bin_sample_size?: number | null;
+  calibration_shift?: number | null;
+  probability_adjustments?: Record<string, unknown> | null;
+  h1_shadow_checked?: boolean;
+  h1_shadow_would_block?: boolean;
+  h1_shadow_reason?: string | null;
+  plan_base_min_win_prob?: number | null;
+  plan_gate_adjustment?: number | null;
+  plan_effective_min_win_prob?: number | null;
+  plan_gate_mode?: string | null;
   atr?: number;
   atr_norm?: number;
   adx?: number;
@@ -369,6 +387,10 @@ interface AISignalEntry {
   planned_tp?: number | null;
   planned_order_type?: number | null;
   virtual_filled_at?: string | null;
+  shadow_reason?: string | null;
+  gate_snapshot?: Record<string, unknown> | null;
+  mfe_r?: number | null;
+  mae_r?: number | null;
   
   // 注文情報
   order_ticket?: number | string;
@@ -649,6 +671,24 @@ serve(async (req: Request) => {
         timeframe: body.timeframe,
         dir: body.dir,
         win_prob: body.win_prob,
+        win_prob_raw: isFiniteNumber(body.win_prob_raw) ? clamp(body.win_prob_raw, 0, 1) : null,
+        win_prob_calibrated: isFiniteNumber(body.win_prob_calibrated) ? clamp(body.win_prob_calibrated, 0, 1) : null,
+        win_prob_final: isFiniteNumber(body.win_prob_final) ? clamp(body.win_prob_final, 0, 1) : body.win_prob,
+        calibration_applied: body.calibration_applied === true,
+        calibration_version: safeText(body.calibration_version),
+        calibration_method: safeText(body.calibration_method),
+        calibration_scope: safeText(body.calibration_scope),
+        calibration_sample_size: Number.isFinite(body.calibration_sample_size) ? Math.max(0, Math.floor(body.calibration_sample_size)) : null,
+        calibration_bin_sample_size: Number.isFinite(body.calibration_bin_sample_size) ? Math.max(0, Math.floor(body.calibration_bin_sample_size)) : null,
+        calibration_shift: isFiniteNumber(body.calibration_shift) ? body.calibration_shift : null,
+        probability_adjustments: isPlainObject(body.probability_adjustments) ? body.probability_adjustments : {},
+        h1_shadow_checked: body.h1_shadow_checked === true,
+        h1_shadow_would_block: body.h1_shadow_would_block === true,
+        h1_shadow_reason: safeText(body.h1_shadow_reason),
+        plan_base_min_win_prob: isFiniteNumber(body.plan_base_min_win_prob) ? clamp(body.plan_base_min_win_prob, 0, 1) : null,
+        plan_gate_adjustment: isFiniteNumber(body.plan_gate_adjustment) ? clamp(body.plan_gate_adjustment, 0, 0.10) : 0,
+        plan_effective_min_win_prob: isFiniteNumber(body.plan_effective_min_win_prob) ? clamp(body.plan_effective_min_win_prob, 0, 1) : null,
+        plan_gate_mode: safeText(body.plan_gate_mode),
         atr: body.atr,
         atr_norm: body.atr_norm,
         adx: body.adx,
@@ -749,6 +789,10 @@ serve(async (req: Request) => {
         planned_tp: body.planned_tp ?? null,
         planned_order_type: body.planned_order_type ?? null,
         virtual_filled_at: body.virtual_filled_at ?? null,
+        shadow_reason: safeText(body.shadow_reason),
+        gate_snapshot: isPlainObject(body.gate_snapshot) ? body.gate_snapshot : {},
+        mfe_r: isFiniteNumber(body.mfe_r) ? Math.max(0, body.mfe_r) : null,
+        mae_r: isFiniteNumber(body.mae_r) ? Math.max(0, body.mae_r) : null,
         
         actual_result: actualResult,
       };
@@ -809,6 +853,28 @@ serve(async (req: Request) => {
           delete legacyEntry.strict_inside_breakout_setup;
           delete legacyEntry.reverse_execution;
           delete legacyEntry.original_dir;
+          delete legacyEntry.win_prob_raw;
+          delete legacyEntry.win_prob_calibrated;
+          delete legacyEntry.win_prob_final;
+          delete legacyEntry.calibration_applied;
+          delete legacyEntry.calibration_version;
+          delete legacyEntry.calibration_method;
+          delete legacyEntry.calibration_scope;
+          delete legacyEntry.calibration_sample_size;
+          delete legacyEntry.calibration_bin_sample_size;
+          delete legacyEntry.calibration_shift;
+          delete legacyEntry.probability_adjustments;
+          delete legacyEntry.h1_shadow_checked;
+          delete legacyEntry.h1_shadow_would_block;
+          delete legacyEntry.h1_shadow_reason;
+          delete legacyEntry.plan_base_min_win_prob;
+          delete legacyEntry.plan_gate_adjustment;
+          delete legacyEntry.plan_effective_min_win_prob;
+          delete legacyEntry.plan_gate_mode;
+          delete legacyEntry.shadow_reason;
+          delete legacyEntry.gate_snapshot;
+          delete legacyEntry.mfe_r;
+          delete legacyEntry.mae_r;
 
           const { data: legacyData, error: legacyError } = await supabase
             .from("ai_signals")
@@ -881,6 +947,8 @@ serve(async (req: Request) => {
         planned_tp,
         planned_order_type,
         virtual_filled_at,
+        mfe_r,
+        mae_r,
         // エントリー方式の後追い更新にも対応
         entry_method,
         entry_params,
@@ -931,6 +999,8 @@ serve(async (req: Request) => {
         if (planned_tp !== undefined) updateData.planned_tp = planned_tp;
         if (planned_order_type !== undefined) updateData.planned_order_type = planned_order_type;
         if (virtual_filled_at !== undefined) updateData.virtual_filled_at = virtual_filled_at;
+        if (mfe_r !== undefined && isFiniteNumber(mfe_r)) updateData.mfe_r = Math.max(0, mfe_r);
+        if (mae_r !== undefined && isFiniteNumber(mae_r)) updateData.mae_r = Math.max(0, mae_r);
 
         if (entry_method !== undefined) updateData.entry_method = entry_method;
         if (entry_params !== undefined) updateData.entry_params = entry_params;

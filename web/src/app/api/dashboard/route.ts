@@ -25,9 +25,36 @@ export async function POST(request: Request) {
       if (!Number.isFinite(reportId) || reportId <= 0) {
         return NextResponse.json({ error: "report_id is required" }, { status: 400 });
       }
-      const status = body?.status === "paused" ? "paused" : "active";
+      const status = body?.status === "paused" ? "paused" : body?.status === "active" ? "active" : undefined;
+      const allowedAdjustments = new Set([0, 0.05, 0.1]);
+      const gateAdjustment = allowedAdjustments.has(Number(body?.gate_adjustment))
+        ? Number(body.gate_adjustment) as 0 | 0.05 | 0.10
+        : undefined;
+      const rawSymbolAdjustments = body?.symbol_gate_adjustments;
+      const symbolGateAdjustments: Record<string, 0 | 0.05 | 0.10> = {};
+      if (rawSymbolAdjustments && typeof rawSymbolAdjustments === "object" && !Array.isArray(rawSymbolAdjustments)) {
+        for (const [symbol, value] of Object.entries(rawSymbolAdjustments)) {
+          const normalizedSymbol = symbol.trim().toUpperCase();
+          const numeric = Number(value);
+          if (normalizedSymbol && allowedAdjustments.has(numeric)) {
+            symbolGateAdjustments[normalizedSymbol] = numeric as 0 | 0.05 | 0.10;
+          }
+        }
+      }
       const note = typeof body?.note === "string" ? body.note : "";
-      const result = await updateTradePlanOverrides(reportId, { status, note });
+      const result = await updateTradePlanOverrides(reportId, {
+        ...(status ? { status } : {}),
+        ...(gateAdjustment !== undefined
+          ? {
+              gate_adjustment: gateAdjustment,
+              gate_mode: gateAdjustment === 0.1 ? "very_cautious" : gateAdjustment === 0.05 ? "cautious" : "ai",
+            }
+          : {}),
+        ...(rawSymbolAdjustments && typeof rawSymbolAdjustments === "object"
+          ? { symbol_gate_adjustments: symbolGateAdjustments }
+          : {}),
+        note,
+      });
       return NextResponse.json({ ok: true, result }, { status: 200 });
     }
 

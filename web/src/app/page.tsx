@@ -1,6 +1,6 @@
 import { getDashboardData } from "@/lib/dashboard";
 import { AiRefreshButton } from "@/components/ai-refresh-button";
-import { TradePlanControls } from "@/components/trade-plan-controls";
+import { SymbolGateControl, TradePlanControls } from "@/components/trade-plan-controls";
 
 export const dynamic = "force-dynamic";
 
@@ -73,6 +73,11 @@ function formatEaLogDateTime(value: string | null | undefined, referenceIso: str
 function formatPercent(value: number | null | undefined) {
   if (value == null || !Number.isFinite(value)) return "-";
   return `${value.toFixed(1)}%`;
+}
+
+function formatPointShift(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return "-";
+  return `${value > 0 ? "+" : ""}${value.toFixed(1)}pt`;
 }
 
 function formatMoney(value: number | null | undefined) {
@@ -414,6 +419,8 @@ export default async function Home({ searchParams }: PageProps) {
   const tradePlan = latest?.trade_plan;
   const planSymbols = tradePlan?.symbols ?? [];
   const planStatus = latest?.plan_overrides?.status ?? latest?.plan_status ?? "active";
+  const globalGateAdjustment = latest?.plan_overrides?.gate_adjustment ?? 0;
+  const symbolGateAdjustments = latest?.plan_overrides?.symbol_gate_adjustments ?? {};
   const marketPulse = buildMarketPulse(
     liveContext?.themes?.length ?? 0,
     data.openTrades.length,
@@ -561,12 +568,17 @@ export default async function Home({ searchParams }: PageProps) {
               }`}>
                 {planStatus === "paused" ? "計画停止中" : "計画稼働中"}
               </span>
-              <TradePlanControls reportId={latest?.id ?? null} status={planStatus} />
+              <TradePlanControls reportId={latest?.id ?? null} status={planStatus} gateAdjustment={globalGateAdjustment} />
             </div>
           </div>
 
           <div className="grid gap-4 xl:grid-cols-3">
-            {planSymbols.length > 0 ? planSymbols.map((item) => (
+            {planSymbols.length > 0 ? planSymbols.map((item) => {
+              const symbolKey = item.symbol.toUpperCase();
+              const hasSymbolAdjustment = Object.prototype.hasOwnProperty.call(symbolGateAdjustments, symbolKey);
+              const gateAdjustment = hasSymbolAdjustment ? symbolGateAdjustments[symbolKey] : globalGateAdjustment;
+              const effectiveGate = Math.min(0.95, (item.min_win_prob ?? 0) + gateAdjustment);
+              return (
               <article key={`plan-${item.symbol}`} className="rounded-3xl border border-cyan-300/16 bg-cyan-300/7 p-5">
                 <div className="flex items-start justify-between gap-4">
                   <div>
@@ -586,9 +598,17 @@ export default async function Home({ searchParams }: PageProps) {
                   </div>
                   <div className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-3">
                     <p className="text-xs text-slate-400">実行ゲート</p>
-                    <p className="mt-1 font-medium text-white">p≥{((item.min_win_prob ?? 0) * 100).toFixed(0)}% / cost≤{item.max_cost_r?.toFixed?.(2) ?? "-"}</p>
+                    <p className="mt-1 font-medium text-white">p≥{(effectiveGate * 100).toFixed(0)}% / cost≤{item.max_cost_r?.toFixed?.(2) ?? "-"}</p>
+                    <p className="mt-1 text-xs text-slate-400">AI {(item.min_win_prob * 100).toFixed(0)}% {gateAdjustment > 0 ? `+ ${(gateAdjustment * 100).toFixed(0)}pt` : ""}</p>
                   </div>
                 </div>
+
+                <SymbolGateControl
+                  reportId={latest?.id ?? null}
+                  symbol={item.symbol}
+                  globalAdjustment={globalGateAdjustment}
+                  symbolAdjustments={symbolGateAdjustments}
+                />
 
                 <p className="mt-4 text-sm leading-7 text-slate-200">{item.reason}</p>
 
@@ -613,7 +633,8 @@ export default async function Home({ searchParams }: PageProps) {
                   </div>
                 ) : null}
               </article>
-            )) : (
+              );
+            }) : (
               <div className="rounded-3xl border border-white/8 bg-slate-950/35 p-5 text-sm text-slate-300 xl:col-span-3">
                 日次計画はまだ生成されていません。AI判定ボタンで最新計画を作成できます。
               </div>
@@ -669,6 +690,52 @@ export default async function Home({ searchParams }: PageProps) {
           </article>
         </section>
 
+        <section className="surface-panel mt-8 rounded-[28px] p-6 backdrop-blur">
+          <SectionTitle title="確率補正・シャドー検証" description="直近30日間の全見送り候補を仮想追跡し、補正とガードの効果を確認" />
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+            <StatCard label="シャドー候補" value={String(data.shadowAnalysis.candidateCount)} sublabel={`決着 ${data.shadowAnalysis.resolvedCount} / 追跡中 ${data.shadowAnalysis.pendingCount}`} />
+            <StatCard label="防いだ推定損失" value={`${data.shadowAnalysis.avoidedLossCount} 件`} sublabel="仮想結果がLOSS" accent="text-emerald-200/72" />
+            <StatCard label="逃した推定利益" value={`${data.shadowAnalysis.missedWinCount} 件`} sublabel="仮想結果がWIN" accent="text-amber-200/72" />
+            <StatCard label="シャドー勝率" value={formatPercent(data.shadowAnalysis.shadowWinRate)} sublabel={`合計 ${data.shadowAnalysis.netR >= 0 ? "+" : ""}${data.shadowAnalysis.netR.toFixed(2)}R`} />
+            <StatCard label="平均確率" value={`${formatPercent(data.shadowAnalysis.averageRawProb)} → ${formatPercent(data.shadowAnalysis.averageFinalProb)}`} sublabel={`補正直後 ${formatPercent(data.shadowAnalysis.averageCalibratedProb)}`} />
+            <StatCard label="確率精度" value={`Brier ${data.shadowAnalysis.rawBrierScore?.toFixed(2) ?? "-"} → ${data.shadowAnalysis.calibratedBrierScore?.toFixed(2) ?? "-"}`} sublabel={`ECE ${data.shadowAnalysis.rawEce?.toFixed(2) ?? "-"} → ${data.shadowAnalysis.calibratedEce?.toFixed(2) ?? "-"}（小さいほど正確）`} />
+          </div>
+
+          <div className="mt-4 flex flex-col gap-2 border-y border-white/8 py-4 text-sm text-slate-200 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+            <span>H1シャドー監査: {data.h1Audit.checkedCount}件確認 / 旧判定なら停止 {data.h1Audit.wouldBlockCount}件</span>
+            <span>停止候補の決着 {data.h1Audit.resolvedWouldBlockCount}件 / 勝率 {formatPercent(data.h1Audit.wouldBlockWinRate)} / 合計 {data.h1Audit.wouldBlockNetR >= 0 ? "+" : ""}{data.h1Audit.wouldBlockNetR.toFixed(2)}R</span>
+          </div>
+
+          <div className="mt-6 overflow-x-auto rounded-2xl border border-white/8">
+            <table className="min-w-full divide-y divide-white/8 text-sm">
+              <thead className="bg-white/6 text-slate-300">
+                <tr>
+                  <th className="px-4 py-3 text-left font-medium">候補</th>
+                  <th className="px-4 py-3 text-left font-medium">Raw</th>
+                  <th className="px-4 py-3 text-left font-medium">補正後</th>
+                  <th className="px-4 py-3 text-left font-medium">最終</th>
+                  <th className="px-4 py-3 text-left font-medium">補正根拠</th>
+                  <th className="px-4 py-3 text-left font-medium">見送り</th>
+                  <th className="px-4 py-3 text-left font-medium">仮想結果</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/6 bg-slate-950/35 text-slate-100">
+                {data.shadowAnalysis.recent.map((trade) => (
+                  <tr key={`shadow-${trade.id}`}>
+                    <td className="px-4 py-3"><div className="font-medium">{trade.symbol} {trade.dir === 1 ? "BUY" : "SELL"}</div><div className="text-xs text-slate-400">{formatDateTime(trade.created_at)}</div></td>
+                    <td className="px-4 py-3">{formatPercent(trade.win_prob_raw != null ? trade.win_prob_raw * 100 : null)}</td>
+                    <td className="px-4 py-3">{formatPercent(trade.win_prob_calibrated != null ? trade.win_prob_calibrated * 100 : null)}</td>
+                    <td className="px-4 py-3">{formatPercent((trade.win_prob_final ?? trade.win_prob) != null ? (trade.win_prob_final ?? trade.win_prob)! * 100 : null)}</td>
+                    <td className="px-4 py-3"><div>{trade.calibration_version ?? "-"} / {trade.calibration_method ?? (trade.calibration_applied ? "適用" : "未適用")}</div><div className="text-xs text-slate-400">{trade.calibration_scope ?? "-"} / n={trade.calibration_sample_size ?? "-"} / {formatPointShift(trade.calibration_shift != null ? trade.calibration_shift * 100 : null)}</div></td>
+                    <td className="px-4 py-3 text-slate-300">{trade.shadow_reason ?? "-"}</td>
+                    <td className="px-4 py-3"><div>{trade.actual_result ?? "-"}</div><div className="text-xs text-slate-400">MFE {trade.mfe_r?.toFixed(2) ?? "-"}R / MAE {trade.mae_r?.toFixed(2) ?? "-"}R</div></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
         <section className="mt-8 grid gap-5 lg:grid-cols-[0.95fr_1.05fr]">
           <article className="surface-panel rounded-[28px] p-6 backdrop-blur">
             <SectionTitle title="直近5件のEAログ" description="ペア・判断時間・勝率・実行可否・売買方向" />
@@ -687,6 +754,9 @@ export default async function Home({ searchParams }: PageProps) {
                     </div>
                   </div>
                   <p className="mt-3 text-sm leading-7 text-slate-100">{buildEaNarrative(log)}</p>
+                  {log.win_prob_raw != null ? <p className="mt-2 text-xs text-cyan-100/80">確率: Raw {formatPercent(log.win_prob_raw * 100)} → 補正後 {formatPercent((log.win_prob_calibrated ?? log.win_prob_raw) * 100)} → 最終 {formatPercent((log.win_prob_final ?? log.win_prob) != null ? (log.win_prob_final ?? log.win_prob)! * 100 : null)} / {log.calibration_method ?? "補正なし"} {log.calibration_scope ? `(${log.calibration_scope}, n=${log.calibration_sample_size ?? "-"})` : ""}</p> : null}
+                  {log.plan_effective_min_win_prob != null ? <p className="mt-2 text-xs text-slate-300">実行ゲート: AI {formatPercent((log.plan_base_min_win_prob ?? 0) * 100)} + {((log.plan_gate_adjustment ?? 0) * 100).toFixed(0)}pt = {formatPercent(log.plan_effective_min_win_prob * 100)}</p> : null}
+                  {log.h1_shadow_checked ? <p className={`mt-2 text-xs ${log.h1_shadow_would_block ? "text-amber-200" : "text-emerald-200/80"}`}>H1シャドー: {log.h1_shadow_would_block ? "旧判定なら停止（今回は継続）" : "通過"}{log.h1_shadow_reason ? ` / ${log.h1_shadow_reason}` : ""}</p> : null}
                   {log.decision_summary ? <p className="mt-3 overflow-hidden rounded-2xl border border-white/8 bg-slate-950/45 px-4 py-3 font-mono text-xs leading-6 break-all text-slate-400">診断ログ: {log.decision_summary}</p> : null}
                   <div className="mt-2 flex flex-col gap-2 text-xs text-slate-400 sm:flex-row sm:flex-wrap sm:gap-3">
                     {log.entry_method ? <span className="break-all">entry: {log.entry_method}</span> : null}

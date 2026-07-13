@@ -251,6 +251,8 @@ function clampWinProb(v: number): number {
 type CalibrationScope = "symbol_tf_dir" | "symbol_tf" | "symbol" | "timeframe" | "global";
 type CalibrationDebug = {
   applied: boolean;
+  version?: "v2";
+  source?: "raw" | "mixed_legacy";
   scope?: CalibrationScope;
   n?: number;
   avg_p?: number;
@@ -258,7 +260,7 @@ type CalibrationDebug = {
   bin?: number;
   bin_n?: number;
   bin_win_rate?: number;
-  method?: "bin_smoothed" | "mean_shift";
+  method?: "bin_smoothed" | "hierarchical_shift";
   note?: string;
 };
 
@@ -269,6 +271,7 @@ type CalibrationCacheEntry = {
   binWinRate: Record<string, { n: number; winRate: number }>;
   avgP: number;
   winRate: number;
+  source: "raw" | "mixed_legacy";
 };
 
 const calibrationCache = new Map<string, CalibrationCacheEntry>();
@@ -285,7 +288,7 @@ function round3(v: number): number {
 async function fetchCalibrationRows(
   scope: CalibrationScope,
   req: TradeRequest,
-): Promise<Array<{ win_prob: number; actual_result: string }>> {
+): Promise<Array<{ win_prob: number; actual_result: string; source: "raw" | "legacy" }>> {
   const lookbackDays = getCalibrationLookbackDays();
   const limit = getCalibrationLimit();
   const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
@@ -294,7 +297,7 @@ async function fetchCalibrationRows(
 
   let q = supabase
     .from("ai_signals")
-    .select("win_prob,actual_result")
+    .select("win_prob_raw,win_prob,actual_result")
     .gte("created_at", since)
     .eq("reverse_execution", false)
     .in("actual_result", ["WIN", "LOSS"])
@@ -323,13 +326,22 @@ async function fetchCalibrationRows(
     return [];
   }
 
-  const rows = (data ?? []) as Array<{ win_prob: number; actual_result: string }>;
+  const rows = (data ?? []) as Array<{ win_prob_raw: number | null; win_prob: number; actual_result: string }>;
   return rows
+    .map((r) => ({
+      win_prob: typeof r.win_prob_raw === "number" && Number.isFinite(r.win_prob_raw) ? r.win_prob_raw : r.win_prob,
+      actual_result: String(r.actual_result || ""),
+      source: typeof r.win_prob_raw === "number" && Number.isFinite(r.win_prob_raw) ? "raw" as const : "legacy" as const,
+    }))
     .filter((r) => typeof r.win_prob === "number" && Number.isFinite(r.win_prob))
-    .map((r) => ({ win_prob: clampWinProb(r.win_prob), actual_result: String(r.actual_result || "") }));
+    .map((r) => ({ ...r, win_prob: clampWinProb(r.win_prob) }));
 }
 
-function buildCalibrationCacheEntry(rows: Array<{ win_prob: number; actual_result: string }>, scope: CalibrationScope): CalibrationCacheEntry | null {
+function buildCalibrationCacheEntry(
+  rows: Array<{ win_prob: number; actual_result: string; source: "raw" | "legacy" }>,
+  scope: CalibrationScope,
+  source: "raw" | "mixed_legacy",
+): CalibrationCacheEntry | null {
   if (!rows || rows.length === 0) return null;
 
   let n = 0;
@@ -365,10 +377,11 @@ function buildCalibrationCacheEntry(rows: Array<{ win_prob: number; actual_resul
 
   return {
     expiresAt: Date.now() + 5 * 60 * 1000, // 5 min TTL
-    debug: { applied: true, scope, n, avg_p: avgP, win_rate: winRate },
+    debug: { applied: true, version: "v2", source, scope, n, avg_p: avgP, win_rate: winRate },
     binWinRate,
     avgP,
     winRate,
+    source,
   };
 }
 
@@ -380,14 +393,16 @@ async function getCalibrationEntry(req: TradeRequest): Promise<{ entry: Calibrat
   const minN = getCalibrationMinN();
 
   for (const scope of scopes) {
-    const key = `v1|${scope}|${req.symbol}|${req.timeframe}|${req.ea_suggestion.dir}`;
+    const key = `v2|${scope}|${req.symbol}|${req.timeframe}|${req.ea_suggestion.dir}`;
     const cached = calibrationCache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
       if ((cached.debug.n ?? 0) >= minN) return { entry: cached, scopeTried: scope };
     }
 
     const rows = await fetchCalibrationRows(scope, req);
-    const built = buildCalibrationCacheEntry(rows, scope);
+    const rawRows = rows.filter((row) => row.source === "raw");
+    const useRawOnly = rawRows.length >= minN;
+    const built = buildCalibrationCacheEntry(useRawOnly ? rawRows : rows, scope, useRawOnly ? "raw" : "mixed_legacy");
     if (built) calibrationCache.set(key, built);
     if (built && (built.debug.n ?? 0) >= minN) return { entry: built, scopeTried: scope };
   }
@@ -408,30 +423,35 @@ async function calibrateWinProb(req: TradeRequest, rawWinProb: number): Promise<
   const minBinN = getCalibrationMinBinN();
 
   let calibrated: number;
-  let method: "bin_smoothed" | "mean_shift";
+  let method: "bin_smoothed" | "hierarchical_shift";
   let bin_n = bin?.n ?? 0;
   let bin_wr = bin?.winRate;
 
-  const maxShift = getCalibrationMaxShift();
+  // Legacy rows contain the old final probability, not a true raw prediction.
+  // Keep their bootstrap influence small until enough clean v2 outcomes exist.
+  const maxShift = Math.min(getCalibrationMaxShift(), entry.source === "raw" ? 0.10 : 0.05);
 
   if (bin && bin.n >= minBinN) {
     // Blend raw with empirical bin win rate. Weight grows with bin sample size.
-    const w = Math.min(0.8, bin.n / 30);
+    const w = Math.min(0.8, bin.n / (bin.n + 20));
     const blended = raw * (1 - w) + bin.winRate * w;
     // Cap the total shift to prevent extreme corrections from noisy data.
     calibrated = raw + Math.max(-maxShift, Math.min(maxShift, blended - raw));
     method = "bin_smoothed";
   } else {
-    // Fallback: align mean prediction to realized mean in-scope (stable under small bins)
-    const shift = entry.winRate - entry.avgP;
+    // Hierarchical shrinkage: sparse scopes stay close to the original model.
+    const supportWeight = entry.debug.n! / (entry.debug.n! + 100);
+    const shift = (entry.winRate - entry.avgP) * supportWeight;
     calibrated = raw + Math.max(-maxShift, Math.min(maxShift, shift));
-    method = "mean_shift";
+    method = "hierarchical_shift";
   }
 
   calibrated = clampWinProb(calibrated);
 
   const debug: CalibrationDebug = {
     applied: true,
+    version: "v2",
+    source: entry.source,
     scope: scopeTried,
     n: entry.debug.n,
     avg_p: entry.avgP,
@@ -602,6 +622,17 @@ export interface TradeRequest {
 
 export interface TradeResponse {
   win_prob: number;
+  win_prob_raw?: number;
+  win_prob_calibrated?: number;
+  win_prob_final?: number;
+  calibration_applied?: boolean;
+  calibration_version?: string | null;
+  calibration_method?: string | null;
+  calibration_scope?: string | null;
+  calibration_sample_size?: number | null;
+  calibration_bin_sample_size?: number | null;
+  calibration_shift?: number;
+  probability_adjustments?: Record<string, number | string | boolean | null>;
   action: number;
   decision_summary?: string;
   // action=0 の場合でも「AIがより良いと見た方向」を返す（検証/学習用）
@@ -618,6 +649,8 @@ export interface TradeResponse {
   // Dynamic gating / EV
   recommended_min_win_prob?: number; // 0.60 - 0.75 (never higher to avoid reducing opportunities)
   expected_value_r?: number; // EV in R-multiples (loss=-1R, win=+1.5R)
+  reward_rr?: number;
+  risk_atr_mult?: number;
   // Cost diagnostics
   cost_r?: number;
   cost_r_source?: "real" | "assumed";
@@ -649,6 +682,10 @@ export interface TradeResponse {
   trade_plan_id?: number | null;
   plan_alignment?: string | null;
   event_risk?: string | null;
+  plan_base_min_win_prob?: number | null;
+  plan_gate_adjustment?: number;
+  plan_effective_min_win_prob?: number | null;
+  plan_gate_mode?: "ai" | "cautious" | "very_cautious";
   daily_plan?: DailyPlanContext | null;
 }
 
@@ -734,7 +771,7 @@ function buildDecisionSummary(opts: {
 }): string {
   const dirLabel = opts.dir === 1 ? "BUY" : opts.dir === -1 ? "SELL" : "HOLD";
   const status = opts.willExecute ? "実行" : "見送り";
-  const calLabel = opts.calibrationRequired ? (opts.calibrationApplied ? "ok" : "required_not_applied") : "off";
+  const calLabel = opts.calibrationApplied ? "ok" : (opts.calibrationRequired ? "required_not_applied" : "off");
   const parts = [
     `${status} ${dirLabel}`,
     `p=${round3(opts.winProb)}`,
@@ -795,6 +832,28 @@ function activeEventWindow(item: DailyPlanSymbol | null | undefined): NonNullabl
     }
   }
   return null;
+}
+
+function normalizeGateAdjustment(value: unknown): 0 | 0.05 | 0.10 {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (Math.abs(numeric - 0.10) < 0.0001) return 0.10;
+  if (Math.abs(numeric - 0.05) < 0.0001) return 0.05;
+  return 0;
+}
+
+function resolvePlanGateAdjustment(plan: DailyPlanContext, symbol: string): {
+  adjustment: 0 | 0.05 | 0.10;
+  mode: "ai" | "cautious" | "very_cautious";
+} {
+  const overrides = plan.plan_overrides ?? {};
+  const bySymbol = overrides.symbol_gate_adjustments;
+  const symbolKey = symbol.toUpperCase();
+  const symbolValue = bySymbol && typeof bySymbol === "object"
+    ? (bySymbol as Record<string, unknown>)[symbolKey]
+    : undefined;
+  const adjustment = normalizeGateAdjustment(symbolValue ?? overrides.gate_adjustment);
+  const mode = adjustment === 0.10 ? "very_cautious" : adjustment === 0.05 ? "cautious" : "ai";
+  return { adjustment, mode };
 }
 
 function htfOpposesDirection(req: TradeRequest, dir: number): boolean {
@@ -954,6 +1013,11 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
   const reasons: string[] = [];
   let eventRisk = "none";
   let alignment = response.plan_alignment ?? (item ? "aligned" : "symbol_not_in_daily_plan");
+  const gateOverride = resolvePlanGateAdjustment(plan, tradeReq.symbol);
+  const planBaseGate = typeof item?.min_win_prob === "number" ? clampWinProb(item.min_win_prob) : null;
+  const planEffectiveGate = planBaseGate === null
+    ? null
+    : clampWinProb(planBaseGate + gateOverride.adjustment);
 
   if (plan.plan_status === "paused") reasons.push("daily_plan_paused");
   if (!item) reasons.push("daily_plan_symbol_not_selected");
@@ -984,7 +1048,7 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
       alignment = "session_mismatch";
     }
 
-    if (typeof item.min_win_prob === "number" && response.win_prob < item.min_win_prob) {
+    if (planEffectiveGate !== null && response.win_prob < planEffectiveGate) {
       reasons.push("daily_plan_winprob_below_plan");
       alignment = "plan_gate_miss";
     }
@@ -1005,16 +1069,24 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
     `DAILY_PLAN(id=${plan.report_id ?? "na"} status=${plan.plan_status}` +
     ` align=${alignment} event=${eventRisk}` +
     `${item?.allowed_direction ? ` dir=${item.allowed_direction}` : ""}` +
-    `${item?.strategy ? ` strategy=${item.strategy}` : ""})`;
+    `${item?.strategy ? ` strategy=${item.strategy}` : ""}` +
+    `${planEffectiveGate !== null ? ` gate=${round3(planBaseGate!)}+${round3(gateOverride.adjustment)}=>${round3(planEffectiveGate)}` : ""})`;
 
   const withDiagnostics = {
     ...response,
     trade_plan_id: plan.report_id,
     plan_alignment: alignment,
     event_risk: eventRisk,
+    plan_base_min_win_prob: planBaseGate,
+    plan_gate_adjustment: gateOverride.adjustment,
+    plan_effective_min_win_prob: planEffectiveGate,
+    plan_gate_mode: gateOverride.mode,
     daily_plan: plan,
     reasoning: appendReasonText(response.reasoning, planTag),
     method_reason: appendReasonText(response.method_reason, planTag),
+    decision_summary: planEffectiveGate === null
+      ? response.decision_summary
+      : appendReasonText(response.decision_summary, `planGate=${round3(planBaseGate!)}+${round3(gateOverride.adjustment)}=>${round3(planEffectiveGate)}`),
   } as TradeResponse;
 
   if (actionDir === 0 || reasons.length === 0) return withDiagnostics;
@@ -1303,19 +1375,7 @@ function applyExecutionGuards(tradeReq: TradeRequest, response: TradeResponse): 
     reasons.push("XAGUSD requires ML-backed pattern support");
   }
 
-  // Emergency guard: cap XAUUSD lot scaling.
-  // Rationale: recent real-trade P/L indicates position sizing is too aggressive.
   if (symbol === "XAUUSD") {
-    const lm = (response as any).lot_multiplier;
-    if (typeof lm === "number" && isFinite(lm) && lm > 1.0) {
-      (response as any).lot_multiplier = 1.0;
-      (response as any).lot_level = "CAPPED (XAUUSD)";
-      const prevReason = typeof (response as any).lot_reason === "string" ? (response as any).lot_reason : "";
-      (response as any).lot_reason = prevReason
-        ? `${prevReason} | GUARD: XAUUSD cap lot_multiplier=1.0`
-        : "GUARD: XAUUSD cap lot_multiplier=1.0";
-    }
-
     const actionDir = typeof response.action === "number" ? response.action : 0;
     const lowAdx = adx !== null && adx < 18;
     const bearishMomentum = (macdCross !== null && macdCross < 0) || (diPlus !== null && diMinus !== null && diMinus > diPlus);
@@ -1511,10 +1571,31 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     action,
     decision_summary,
     expected_value_r,
+    reward_rr: round3(rt.rewardRR),
+    risk_atr_mult: round3(rt.riskAtrMult),
     cost_r: round3(rt.costR),
     cost_r_source: rt.costRSource,
     reasoning,
     win_prob_raw: round3(raw),
+    win_prob_calibrated: round3(calibrated),
+    win_prob_final: round3(winProbFinal),
+    calibration_applied: debug.applied,
+    calibration_version: debug.version ?? null,
+    calibration_method: debug.method ?? null,
+    calibration_scope: debug.scope ?? null,
+    calibration_sample_size: debug.n ?? null,
+    calibration_bin_sample_size: debug.bin_n ?? null,
+    calibration_shift: round3(calibrated - raw),
+    probability_adjustments: {
+      calibration_version: debug.version ?? null,
+      calibration_source: debug.source ?? null,
+      calibration: round3(calibrated - raw),
+      extreme_rsi: round3(afterRsi - calibrated),
+      rsi_mean_reversion: round3(afterRsiMr - afterRsi),
+      recent_performance: round3(afterRecentPerf - afterRsiMr),
+      loss_streak: round3(winProbFinal - afterRecentPerf),
+      total_post_calibration: round3(winProbFinal - calibrated),
+    },
     win_prob_calibration: debug,
     skip_reason,
   } as any;
@@ -1916,91 +1997,6 @@ function patternMatchesCurrentSetup(pattern: any, flags: StrictPatternFlags): bo
   }
 }
 
-/**
- * ML学習データに基づいてロット倍率を計算
- * レベル1: 通常 (1.0倍) - ML未学習 or 勝率60-70%
- * レベル2: やや自信あり (1.5倍) - 勝率70-80% + サンプル15件以上 + 過去5件中4勝以上
- * レベル3: 非常に自信あり (2.0倍) - 勝率80%以上 + サンプル20件以上 + 過去10件中8勝以上 + PF1.5以上
- * レベル4: 極めて自信あり (3.0倍) - 勝率85%以上 + サンプル30件以上 + 過去10件中9勝以上 + PF2.0以上
- */
-function calculateLotMultiplier(
-  matchedPattern: any | null,
-  historicalTrades: any[]
-): { multiplier: number; level: string; reason: string } {
-  // ML学習データなし → レベル1（通常）
-  const sampleTrades = matchedPattern?.real_trades ?? matchedPattern?.total_trades ?? 0;
-  if (!matchedPattern || !matchedPattern.win_rate || sampleTrades < 10) {
-    return {
-      multiplier: 1.0,
-      level: "Level 1 (通常)",
-      reason: "ML学習データ不足またはサンプル数10件未満"
-    };
-  }
-
-  const winRate = matchedPattern.win_rate;
-  const totalTrades = sampleTrades;
-  const profitFactor = matchedPattern.profit_factor || 1.0;
-
-  // 直近のパフォーマンスを分析（最新10件）
-  const recentTrades = historicalTrades
-    .filter((t: any) => t.actual_result === "WIN" || t.actual_result === "LOSS")
-    .slice(0, 10);
-  const recent10Wins = recentTrades.filter((t: any) => t.actual_result === "WIN").length;
-  
-  const recent5Trades = recentTrades.slice(0, 5);
-  const recent5Wins = recent5Trades.filter((t: any) => t.actual_result === "WIN").length;
-
-  // レベル4: 極めて自信あり (3.0倍)
-  if (
-    winRate >= 0.85 &&
-    totalTrades >= 30 &&
-    profitFactor >= 2.0 &&
-    recent10Wins >= 9
-  ) {
-    return {
-      multiplier: 3.0,
-      level: "Level 4 (極めて自信あり)",
-      reason: `勝率${(winRate * 100).toFixed(1)}% (${totalTrades}件), PF=${profitFactor.toFixed(2)}, 直近10件中${recent10Wins}勝`
-    };
-  }
-
-  // レベル3: 非常に自信あり (2.0倍)
-  if (
-    winRate >= 0.80 &&
-    totalTrades >= 20 &&
-    profitFactor >= 1.5 &&
-    recent10Wins >= 8
-  ) {
-    return {
-      multiplier: 2.0,
-      level: "Level 3 (非常に自信あり)",
-      reason: `勝率${(winRate * 100).toFixed(1)}% (${totalTrades}件), PF=${profitFactor.toFixed(2)}, 直近10件中${recent10Wins}勝`
-    };
-  }
-
-  // レベル2: やや自信あり (1.5倍)
-  if (
-    winRate >= 0.70 &&
-    totalTrades >= 15 &&
-    recent5Wins >= 4
-  ) {
-    return {
-      multiplier: 1.5,
-      level: "Level 2 (やや自信あり)",
-      reason: `勝率${(winRate * 100).toFixed(1)}% (${totalTrades}件), 直近5件中${recent5Wins}勝`
-    };
-  }
-
-  // レベル1: 通常 (1.0倍) - デフォルト
-  return {
-    multiplier: 1.0,
-    level: "Level 1 (通常)",
-    reason: winRate >= 0.60 ? 
-      `勝率${(winRate * 100).toFixed(1)}% (${totalTrades}件) - 基準未達` :
-      `勝率${(winRate * 100).toFixed(1)}% (${totalTrades}件) - 低勝率パターン`
-  };
-}
-
 // OpenAI APIを使用したAI予測
 async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<TradeResponse> {
   const { symbol, timeframe, rsi, atr, price, ea_suggestion } = req;
@@ -2079,7 +2075,6 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
   const ENABLE_ML_PATTERN_LOOKUP = ENABLE_ML_LEARNING && mlMode !== "off";
   const ENABLE_ML_CONTEXT_FOR_OPENAI = ENABLE_ML_LEARNING && mlMode === "on";
   const APPLY_ML_WIN_PROB_ADJUSTMENT = ENABLE_ML_CONTEXT_FOR_OPENAI;
-  const APPLY_ML_LOT_MULTIPLIER = ENABLE_ML_CONTEXT_FOR_OPENAI;
 
   console.log(`[AI] ML mode=${mlMode} (phase=${learningPhase})`);
   
@@ -2201,12 +2196,6 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
     console.log(`[AI] ⚠️ No ML pattern matched (phase=${learningPhase}) - Fallback to technical analysis`);
     mlContext = `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n⚙️  該当する学習パターンなし - テクニカル判定モード\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n条件に合う過去データが不足しているため、テクニカル指標のみで判断します。`;
   }
-  
-  // 📊 ロット倍率を計算（ML学習データ + 直近パフォーマンスに基づく）
-  const lotMultiplierResult = APPLY_ML_LOT_MULTIPLIER
-    ? calculateLotMultiplier(matchedPatterns.length > 0 ? matchedPatterns[0] : null, historicalTrades)
-    : { multiplier: 1.0, level: "Level 1 (通常)", reason: `ML disabled (mode=${mlMode})` };
-  console.log(`[AI] Lot Multiplier: ${lotMultiplierResult.multiplier}x (${lotMultiplierResult.level}) - ${lotMultiplierResult.reason}`);
   
   // 過去の成功事例を抽出
   if (historicalTrades && historicalTrades.length > 0) {
@@ -2789,8 +2778,7 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
     // 詳細ログ出力
     console.log(
       `[AI] OpenAI GPT-4 prediction: ${(win_prob * 100).toFixed(1)}% (${confidence}) - ${reasoning} | ` +
-      `ichimoku=${ichimoku_score?.toFixed(2) || "N/A"} quality=${signalQuality} | entry_method=${entry_method} | ` +
-      `lot=${lotMultiplierResult.multiplier}x (${lotMultiplierResult.level})`
+      `ichimoku=${ichimoku_score?.toFixed(2) || "N/A"} quality=${signalQuality} | entry_method=${entry_method} | lot=fixed`
     );
     
     // Put diagnostics first so they survive EA-side truncation.
@@ -2853,6 +2841,8 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       reasoning: `${tags} | ${reasoning}`,
       recommended_min_win_prob: recommended_min_win_prob ?? undefined,
       expected_value_r,
+      reward_rr: round3(rt.rewardRR),
+      risk_atr_mult: round3(rt.riskAtrMult),
       cost_r: round3(rt.costR),
       cost_r_source: rt.costRSource,
       skip_reason,
@@ -2860,14 +2850,30 @@ JSON形式で回答: {"win_prob": 0.XX, "recommended_min_win_prob": 0.70, "skip_
       entry_params,
       method_selected_by: "OpenAI",
       method_reason,
-      lot_multiplier: lotMultiplierResult.multiplier,
-      lot_level: lotMultiplierResult.level,
-      lot_reason: lotMultiplierResult.reason,
       ml_pattern_used: matchedPatterns && matchedPatterns.length > 0,
       ml_pattern_id: matchedPatterns && matchedPatterns.length > 0 ? matchedPatterns[0].id : null,
       ml_pattern_name: matchedPatterns && matchedPatterns.length > 0 ? matchedPatterns[0].pattern_name : null,
       ml_pattern_confidence: matchedPatterns && matchedPatterns.length > 0 ? Math.round(matchedPatterns[0].win_rate * 100 * 100) / 100 : null,
       win_prob_raw: round3(raw_win_prob),
+      win_prob_calibrated: round3(cal.winProb),
+      win_prob_final: round3(win_prob),
+      calibration_applied: cal.debug.applied,
+      calibration_version: cal.debug.version ?? null,
+      calibration_method: cal.debug.method ?? null,
+      calibration_scope: cal.debug.scope ?? null,
+      calibration_sample_size: cal.debug.n ?? null,
+      calibration_bin_sample_size: cal.debug.bin_n ?? null,
+      calibration_shift: round3(cal.winProb - raw_win_prob),
+      probability_adjustments: {
+        calibration_version: cal.debug.version ?? null,
+        calibration_source: cal.debug.source ?? null,
+        calibration: round3(cal.winProb - raw_win_prob),
+        extreme_rsi: round3(rsiGuard.winProb - cal.winProb),
+        rsi_mean_reversion: round3(rsiMrBonus.winProb - rsiGuard.winProb),
+        recent_performance: round3(recentPerfResult.winProb - rsiMrBonus.winProb),
+        loss_streak: round3(streakResult.winProb - recentPerfResult.winProb),
+        total_post_calibration: round3(win_prob - cal.winProb),
+      },
       win_prob_calibration: cal.debug,
       trade_plan_id: dailyPlanContext?.report_id ?? null,
       plan_alignment: dailyPlanContext?.item ? "model_context" : "no_symbol_plan",
@@ -3149,12 +3155,12 @@ serve(async (req: Request) => {
       } catch (aiError) {
         console.error(`[ai-trader] ❌ OpenAI prediction failed:`, aiError);
         console.warn(`[ai-trader] Switching to fallback calculation...`);
-        response = calculateSignalFallback(tradeReq);
+        response = await calculateSignalFallbackWithCalibration(tradeReq);
         predictionMethod = "Fallback-AfterAI-Error";
       }
     } else {
       console.warn(`[ai-trader] ⚠️ Using rule-based FALLBACK (no OpenAI key)`);
-      response = calculateSignalFallback(tradeReq);
+      response = await calculateSignalFallbackWithCalibration(tradeReq);
       predictionMethod = "Fallback-NoKey";
     }
 

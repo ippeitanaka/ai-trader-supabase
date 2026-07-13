@@ -61,8 +61,12 @@ type DailyTradePlan = {
 
 type PlanOverrides = {
   status?: "active" | "paused";
+  gate_adjustment?: 0 | 0.05 | 0.10;
+  gate_mode?: "ai" | "cautious" | "very_cautious";
+  symbol_gate_adjustments?: Record<string, 0 | 0.05 | 0.10>;
   note?: string;
   updated_at?: string;
+  history?: Array<Record<string, unknown>>;
 };
 
 type PairSelectorDigest = {
@@ -129,6 +133,22 @@ type EALogRecord = {
   action: string | null;
   trade_decision: string | null;
   win_prob: number | null;
+  win_prob_raw?: number | null;
+  win_prob_calibrated?: number | null;
+  win_prob_final?: number | null;
+  calibration_applied?: boolean | null;
+  calibration_version?: string | null;
+  calibration_method?: string | null;
+  calibration_scope?: string | null;
+  calibration_sample_size?: number | null;
+  calibration_shift?: number | null;
+  h1_shadow_checked?: boolean | null;
+  h1_shadow_would_block?: boolean | null;
+  h1_shadow_reason?: string | null;
+  plan_base_min_win_prob?: number | null;
+  plan_gate_adjustment?: number | null;
+  plan_effective_min_win_prob?: number | null;
+  plan_gate_mode?: string | null;
   decision_summary: string | null;
   skip_reason: string | null;
   entry_method: string | null;
@@ -147,6 +167,22 @@ type AISignalRecord = {
   timeframe: string | null;
   dir: number | null;
   win_prob: number | null;
+  win_prob_raw?: number | null;
+  win_prob_calibrated?: number | null;
+  win_prob_final?: number | null;
+  calibration_applied?: boolean | null;
+  calibration_version?: string | null;
+  calibration_method?: string | null;
+  calibration_scope?: string | null;
+  calibration_sample_size?: number | null;
+  calibration_shift?: number | null;
+  h1_shadow_checked?: boolean | null;
+  h1_shadow_would_block?: boolean | null;
+  h1_shadow_reason?: string | null;
+  plan_base_min_win_prob?: number | null;
+  plan_gate_adjustment?: number | null;
+  plan_effective_min_win_prob?: number | null;
+  plan_gate_mode?: string | null;
   entry_price: number | null;
   exit_price: number | null;
   profit_loss: number | null;
@@ -163,6 +199,36 @@ type AISignalRecord = {
   plan_alignment?: string | null;
   event_risk?: string | null;
   market_session?: string | null;
+  shadow_reason?: string | null;
+  mfe_r?: number | null;
+  mae_r?: number | null;
+};
+
+type ShadowAnalysis = {
+  candidateCount: number;
+  resolvedCount: number;
+  pendingCount: number;
+  avoidedLossCount: number;
+  missedWinCount: number;
+  shadowWinRate: number | null;
+  netR: number;
+  averageRawProb: number | null;
+  averageCalibratedProb: number | null;
+  averageFinalProb: number | null;
+  averageCalibrationShift: number | null;
+  rawBrierScore: number | null;
+  calibratedBrierScore: number | null;
+  rawEce: number | null;
+  calibratedEce: number | null;
+  recent: AISignalRecord[];
+};
+
+type H1AuditSummary = {
+  checkedCount: number;
+  wouldBlockCount: number;
+  resolvedWouldBlockCount: number;
+  wouldBlockWinRate: number | null;
+  wouldBlockNetR: number;
 };
 
 type DashboardSummary = {
@@ -189,6 +255,8 @@ type DashboardData = {
   recentEaLogs: EALogRecord[];
   recentTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
   openTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
+  shadowAnalysis: ShadowAnalysis;
+  h1Audit: H1AuditSummary;
   selectedPeriod: {
     key: string;
     label: string;
@@ -305,6 +373,85 @@ function summarizeTrades(trades: AISignalRecord[]): DashboardSummary {
   };
 }
 
+function average(values: Array<number | null | undefined>) {
+  const valid = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  if (valid.length === 0) return null;
+  return valid.reduce((sum, value) => sum + value, 0) / valid.length;
+}
+
+function averageProbabilityPercent(values: Array<number | null | undefined>) {
+  const value = average(values);
+  return value === null ? null : round2(value * 100);
+}
+
+function summarizeShadowTrades(trades: AISignalRecord[]): ShadowAnalysis {
+  const resolved = trades.filter((trade) => trade.actual_result === "WIN" || trade.actual_result === "LOSS");
+  const wins = resolved.filter((trade) => trade.actual_result === "WIN");
+  const losses = resolved.filter((trade) => trade.actual_result === "LOSS");
+  const rawBrier = resolved.map((trade) => {
+    if (trade.win_prob_raw == null) return null;
+    const outcome = trade.actual_result === "WIN" ? 1 : 0;
+    return (trade.win_prob_raw - outcome) ** 2;
+  });
+  const calibratedBrier = resolved.map((trade) => {
+    if (trade.win_prob_calibrated == null) return null;
+    const outcome = trade.actual_result === "WIN" ? 1 : 0;
+    return (trade.win_prob_calibrated - outcome) ** 2;
+  });
+  const expectedCalibrationError = (selector: (trade: AISignalRecord) => number | null | undefined) => {
+    if (resolved.length === 0) return null;
+    let weightedError = 0;
+    let measured = 0;
+    for (let bin = 0; bin < 10; bin += 1) {
+      const lower = bin / 10;
+      const upper = (bin + 1) / 10;
+      const rows = resolved.filter((trade) => {
+        const probability = selector(trade);
+        return probability != null && probability >= lower && (bin === 9 ? probability <= upper : probability < upper);
+      });
+      if (rows.length === 0) continue;
+      const meanProbability = average(rows.map(selector));
+      if (meanProbability === null) continue;
+      const realizedRate = rows.filter((trade) => trade.actual_result === "WIN").length / rows.length;
+      weightedError += Math.abs(meanProbability - realizedRate) * rows.length;
+      measured += rows.length;
+    }
+    return measured > 0 ? weightedError / measured : null;
+  };
+
+  return {
+    candidateCount: trades.length,
+    resolvedCount: resolved.length,
+    pendingCount: trades.filter((trade) => trade.actual_result === "PENDING" || trade.actual_result === "FILLED").length,
+    avoidedLossCount: losses.length,
+    missedWinCount: wins.length,
+    shadowWinRate: resolved.length > 0 ? round2((wins.length / resolved.length) * 100) : null,
+    netR: round2(resolved.reduce((sum, trade) => sum + (trade.profit_loss ?? 0), 0)) ?? 0,
+    averageRawProb: averageProbabilityPercent(trades.map((trade) => trade.win_prob_raw)),
+    averageCalibratedProb: averageProbabilityPercent(trades.map((trade) => trade.win_prob_calibrated)),
+    averageFinalProb: averageProbabilityPercent(trades.map((trade) => trade.win_prob_final ?? trade.win_prob)),
+    averageCalibrationShift: averageProbabilityPercent(trades.map((trade) => trade.calibration_shift)),
+    rawBrierScore: round2(average(rawBrier)),
+    calibratedBrierScore: round2(average(calibratedBrier)),
+    rawEce: round2(expectedCalibrationError((trade) => trade.win_prob_raw)),
+    calibratedEce: round2(expectedCalibrationError((trade) => trade.win_prob_calibrated)),
+    recent: trades.slice(0, 8),
+  };
+}
+
+function summarizeH1Audit(trades: AISignalRecord[]): H1AuditSummary {
+  const wouldBlock = trades.filter((trade) => trade.h1_shadow_would_block === true);
+  const resolved = wouldBlock.filter((trade) => trade.actual_result === "WIN" || trade.actual_result === "LOSS");
+  const wins = resolved.filter((trade) => trade.actual_result === "WIN").length;
+  return {
+    checkedCount: trades.length,
+    wouldBlockCount: wouldBlock.length,
+    resolvedWouldBlockCount: resolved.length,
+    wouldBlockWinRate: resolved.length > 0 ? round2((wins / resolved.length) * 100) : null,
+    wouldBlockNetR: round2(resolved.reduce((sum, trade) => sum + (trade.profit_loss ?? 0), 0)) ?? 0,
+  };
+}
+
 function buildSymbolBreakdown(trades: AISignalRecord[]): SymbolSummary[] {
   const bySymbol = new Map<string, AISignalRecord[]>();
   for (const trade of trades) {
@@ -385,6 +532,24 @@ export async function updateTradePlanOverrides(reportId: number, overrides: Plan
   const url = buildRestUrl("pair_selection_reports", {
     id: `eq.${reportId}`,
   });
+  const currentUrl = buildRestUrl("pair_selection_reports", {
+    id: `eq.${reportId}`,
+    select: "plan_overrides,plan_status",
+    limit: "1",
+  });
+  const currentRows = await fetchJson<Array<{ plan_overrides?: PlanOverrides; plan_status?: string }>>(currentUrl);
+  const current = currentRows[0]?.plan_overrides ?? {};
+  const updatedAt = new Date().toISOString();
+  const history = [
+    ...(Array.isArray(current.history) ? current.history : []),
+    { at: updatedAt, source: "dashboard", changes: overrides },
+  ].slice(-50);
+  const merged: PlanOverrides = {
+    ...current,
+    ...overrides,
+    history,
+    updated_at: updatedAt,
+  };
   const response = await fetch(url, {
     method: "PATCH",
     headers: {
@@ -393,11 +558,8 @@ export async function updateTradePlanOverrides(reportId: number, overrides: Plan
       Prefer: "return=representation",
     },
     body: JSON.stringify({
-      plan_overrides: {
-        ...overrides,
-        updated_at: new Date().toISOString(),
-      },
-      plan_status: overrides.status ?? "active",
+      plan_overrides: merged,
+      plan_status: overrides.status ?? current.status ?? currentRows[0]?.plan_status ?? "active",
     }),
     cache: "no-store",
   });
@@ -409,11 +571,34 @@ export async function updateTradePlanOverrides(reportId: number, overrides: Plan
 
 async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
   const url = buildRestUrl("ea-log", {
-    select: "id,created_at,at,sym,tf,action,trade_decision,win_prob,decision_summary,skip_reason,entry_method,trade_plan_id,plan_alignment,event_risk,market_session,ai_reasoning,order_ticket",
+    select: "id,created_at,at,sym,tf,action,trade_decision,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,decision_summary,skip_reason,entry_method,trade_plan_id,plan_alignment,event_risk,market_session,ai_reasoning,order_ticket",
     order: "at.desc",
     limit: "5",
   });
   return fetchJson<EALogRecord[]>(url);
+}
+
+async function fetchShadowTrades(): Promise<AISignalRecord[]> {
+  const url = buildRestUrl("ai_signals", {
+    select: "id,created_at,symbol,timeframe,dir,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session,shadow_reason,mfe_r,mae_r",
+    is_virtual: "eq.true",
+    reverse_execution: "eq.false",
+    created_at: `gte.${toIsoDaysAgo(30)}`,
+    order: "created_at.desc",
+    limit: "2000",
+  });
+  return fetchJson<AISignalRecord[]>(url);
+}
+
+async function fetchH1AuditTrades(): Promise<AISignalRecord[]> {
+  const url = buildRestUrl("ai_signals", {
+    select: "id,created_at,symbol,timeframe,dir,win_prob,profit_loss,actual_result,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,is_virtual",
+    h1_shadow_checked: "eq.true",
+    created_at: `gte.${toIsoDaysAgo(30)}`,
+    order: "created_at.desc",
+    limit: "2000",
+  });
+  return fetchJson<AISignalRecord[]>(url);
 }
 
 async function fetchRecentTrades(): Promise<AISignalRecord[]> {
@@ -464,13 +649,15 @@ async function fetchClosedTrades(period: string): Promise<AISignalRecord[]> {
 export async function getDashboardData(period = "30"): Promise<DashboardData> {
   requireEnv();
 
-  const [pairSelectorResult, recentEaLogsResult, recentTradesResult, openTradesResult, selectedTradesResult, totalTradesResult] = await Promise.all([
+  const [pairSelectorResult, recentEaLogsResult, recentTradesResult, openTradesResult, selectedTradesResult, totalTradesResult, shadowTradesResult, h1AuditResult] = await Promise.all([
     safeFetchWithError("pair-selector", fetchPairSelector, { latest: null, live_context: null }),
     safeFetchWithError("ea-log recent", fetchRecentEaLogs, []),
     safeFetchWithError("ai_signals recent", fetchRecentTrades, []),
     safeFetchWithError("ai_signals open", fetchOpenTrades, []),
     safeFetchWithError(`ai_signals period ${period}`, () => fetchClosedTrades(period), []),
     safeFetchWithError("ai_signals total", () => fetchClosedTrades("all"), []),
+    safeFetchWithError("ai_signals shadow", fetchShadowTrades, []),
+    safeFetchWithError("ai_signals H1 audit", fetchH1AuditTrades, []),
   ]);
 
   const pairSelector = pairSelectorResult.data;
@@ -479,6 +666,8 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
   const openTrades = openTradesResult.data;
   const selectedTrades = selectedTradesResult.data;
   const totalTrades = totalTradesResult.data;
+  const shadowTrades = shadowTradesResult.data;
+  const h1AuditTrades = h1AuditResult.data;
   const dataErrors = [
     pairSelectorResult.error,
     recentEaLogsResult.error,
@@ -486,6 +675,8 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
     openTradesResult.error,
     selectedTradesResult.error,
     totalTradesResult.error,
+    shadowTradesResult.error,
+    h1AuditResult.error,
   ].filter((value): value is string => Boolean(value));
 
   return {
@@ -495,6 +686,8 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
     recentEaLogs,
     recentTrades: decorateTrades(recentTrades),
     openTrades: decorateTrades(openTrades),
+    shadowAnalysis: summarizeShadowTrades(shadowTrades),
+    h1Audit: summarizeH1Audit(h1AuditTrades),
     selectedPeriod: {
       key: period,
       label: periodLabel(period),

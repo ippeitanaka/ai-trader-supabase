@@ -21,6 +21,23 @@ interface EALogEntry {
   sell_win_prob?: number;        // dir=0両方向評価のSELL勝率（0-1）
   trade_decision?: string;       // 実際の取引状況
   win_prob?: number;             // AIの算出した勝率
+  win_prob_raw?: number;
+  win_prob_calibrated?: number;
+  win_prob_final?: number;
+  calibration_applied?: boolean;
+  calibration_version?: string;
+  calibration_method?: string;
+  calibration_scope?: string;
+  calibration_sample_size?: number;
+  calibration_shift?: number;
+  probability_adjustments?: Record<string, unknown>;
+  h1_shadow_checked?: boolean;
+  h1_shadow_would_block?: boolean;
+  h1_shadow_reason?: string;
+  plan_base_min_win_prob?: number;
+  plan_gate_adjustment?: number;
+  plan_effective_min_win_prob?: number;
+  plan_gate_mode?: string;
   recommended_min_win_prob?: number;
   expected_value_r?: number;
   skip_reason?: string;
@@ -62,6 +79,23 @@ interface EALogInput {
   buy_win_prob?: number;
   sell_win_prob?: number;
   win_prob?: number;
+  win_prob_raw?: number;
+  win_prob_calibrated?: number;
+  win_prob_final?: number;
+  calibration_applied?: boolean;
+  calibration_version?: string;
+  calibration_method?: string;
+  calibration_scope?: string;
+  calibration_sample_size?: number;
+  calibration_shift?: number;
+  probability_adjustments?: Record<string, unknown>;
+  h1_shadow_checked?: boolean;
+  h1_shadow_would_block?: boolean;
+  h1_shadow_reason?: string;
+  plan_base_min_win_prob?: number;
+  plan_gate_adjustment?: number;
+  plan_effective_min_win_prob?: number;
+  plan_gate_mode?: string;
   offset_factor?: number;
   expiry_minutes?: number;
   reason?: string;
@@ -359,6 +393,25 @@ serve(async (req: Request) => {
       sell_win_prob: body.sell_win_prob !== undefined ? Number(body.sell_win_prob) : undefined,
       trade_decision: body.trade_decision || undefined,
       win_prob: body.win_prob !== undefined ? Number(body.win_prob) : undefined,
+      win_prob_raw: body.win_prob_raw !== undefined ? Number(body.win_prob_raw) : undefined,
+      win_prob_calibrated: body.win_prob_calibrated !== undefined ? Number(body.win_prob_calibrated) : undefined,
+      win_prob_final: body.win_prob_final !== undefined ? Number(body.win_prob_final) : undefined,
+      calibration_applied: typeof body.calibration_applied === "boolean" ? body.calibration_applied : undefined,
+      calibration_version: body.calibration_version || undefined,
+      calibration_method: body.calibration_method || undefined,
+      calibration_scope: body.calibration_scope || undefined,
+      calibration_sample_size: body.calibration_sample_size !== undefined ? Number(body.calibration_sample_size) : undefined,
+      calibration_shift: body.calibration_shift !== undefined ? Number(body.calibration_shift) : undefined,
+      probability_adjustments: body.probability_adjustments && typeof body.probability_adjustments === "object"
+        ? body.probability_adjustments
+        : undefined,
+      h1_shadow_checked: typeof body.h1_shadow_checked === "boolean" ? body.h1_shadow_checked : undefined,
+      h1_shadow_would_block: typeof body.h1_shadow_would_block === "boolean" ? body.h1_shadow_would_block : undefined,
+      h1_shadow_reason: body.h1_shadow_reason || undefined,
+      plan_base_min_win_prob: body.plan_base_min_win_prob !== undefined ? Number(body.plan_base_min_win_prob) : undefined,
+      plan_gate_adjustment: body.plan_gate_adjustment !== undefined ? Number(body.plan_gate_adjustment) : undefined,
+      plan_effective_min_win_prob: body.plan_effective_min_win_prob !== undefined ? Number(body.plan_effective_min_win_prob) : undefined,
+      plan_gate_mode: body.plan_gate_mode || undefined,
       recommended_min_win_prob: body.recommended_min_win_prob !== undefined ? Number(body.recommended_min_win_prob) : undefined,
       expected_value_r: body.expected_value_r !== undefined ? Number(body.expected_value_r) : undefined,
       skip_reason: body.skip_reason || undefined,
