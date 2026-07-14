@@ -31,6 +31,8 @@ const DEFAULT_UNIVERSE = [
 const DEFAULT_TIMEFRAME = "M15";
 const DEFAULT_LOOKBACK_DAYS = 21;
 const DEFAULT_TOP_N = 3;
+const SHADOW_EPISODE_MINUTES = 120;
+const MIN_BACKFILL_SCORE = 48;
 const GOOGLE_NEWS_RSS = "https://news.google.com/rss/search";
 const FOREX_FACTORY_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
 const FINNHUB_CALENDAR_URL = "https://finnhub.io/api/v1/economic-calendar";
@@ -67,6 +69,8 @@ type KeySource = "env" | "authorization";
 
 interface TradeRow {
   symbol: string;
+  created_at: string;
+  dir: number | null;
   actual_result: string | null;
   profit_loss: number | null;
   closed_at: string | null;
@@ -94,8 +98,22 @@ interface SymbolStats {
   pullback_trades: number;
   pullback_win_rate: number | null;
   virtual_trades: number;
+  virtual_raw_trades: number;
+  virtual_episode_trades: number;
   virtual_win_rate: number | null;
+  virtual_win_rate_bayesian: number | null;
   virtual_total_profit_loss: number;
+  real_win_rate_bayesian: number | null;
+  market_fit_score: number;
+  market_regime: "directional" | "noisy" | "mixed" | "unavailable";
+  market_eligible: boolean;
+  score_components: {
+    sample: number;
+    real: number;
+    recent: number;
+    virtual: number;
+    market: number;
+  };
   compatibility_score: number;
 }
 
@@ -159,12 +177,22 @@ interface DailyTradePlan {
   summary: string;
   market_themes: string[];
   symbols: TradePlanSymbol[];
+  selection_meta: SelectionMeta;
   global_rules: {
     avoid_high_impact_minutes_before: number;
     avoid_high_impact_minutes_after: number;
     require_higher_timeframe_alignment: boolean;
     max_open_positions: number;
   };
+}
+
+interface SelectionMeta {
+  requested_count: number;
+  selected_count: number;
+  eligible_count: number;
+  backfilled_count: number;
+  excluded_market_closed: string[];
+  complete: boolean;
 }
 
 interface NewsHeadline {
@@ -316,7 +344,15 @@ function summarizeStatsForPrompt(stats: SymbolStats[]) {
     pullback_trades: s.pullback_trades,
     pullback_win_rate: s.pullback_win_rate,
     virtual_trades: s.virtual_trades,
+    virtual_raw_trades: s.virtual_raw_trades,
+    virtual_episode_trades: s.virtual_episode_trades,
     virtual_win_rate: s.virtual_win_rate,
+    virtual_win_rate_bayesian: s.virtual_win_rate_bayesian,
+    real_win_rate_bayesian: s.real_win_rate_bayesian,
+    market_fit_score: s.market_fit_score,
+    market_regime: s.market_regime,
+    market_eligible: s.market_eligible,
+    score_components: s.score_components,
     compatibility_score: s.compatibility_score,
   }));
 }
@@ -339,6 +375,61 @@ function pairRegimeLabel(snapshot: MarketSnapshot | undefined, symbol: string): 
   if (vol >= volatilityThreshold(symbol) || absDay >= dayMoveThreshold(symbol)) return "noisy";
   if (absDay >= dayMoveThreshold(symbol) * 0.6 && vol <= volatilityThreshold(symbol) * 0.85) return "directional";
   return "mixed";
+}
+
+export function isMarketEligible(symbol: string, now = new Date()): boolean {
+  if (symbol === "BTCUSD") return true;
+  const day = now.getUTCDay();
+  const hour = now.getUTCHours();
+  // FX/metals are treated as closed from Friday 21:00 UTC until Sunday 21:00 UTC.
+  if (day === 6) return false;
+  if (day === 5 && hour >= 21) return false;
+  if (day === 0 && hour < 21) return false;
+  return true;
+}
+
+export function bayesianWinRate(wins: number, trades: number, priorRate: number, priorStrength: number): number {
+  return (wins + priorRate * priorStrength) / (trades + priorStrength);
+}
+
+export function collapseShadowEpisodes(rows: TradeRow[]): TradeRow[] {
+  const sorted = [...rows].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+  const episodes: TradeRow[] = [];
+  let blockedUntil = Number.NEGATIVE_INFINITY;
+  const episodeMs = SHADOW_EPISODE_MINUTES * 60 * 1000;
+
+  for (const row of sorted) {
+    const createdAt = Date.parse(row.created_at);
+    if (!Number.isFinite(createdAt)) continue;
+    if (createdAt < blockedUntil) continue;
+    episodes.push(row);
+    // The fixed horizon avoids source-time offsets from inflating one episode.
+    blockedUntil = createdAt + episodeMs;
+  }
+  return episodes;
+}
+
+function marketFitForSymbol(
+  symbol: string,
+  marketContext: MarketContext | null,
+  now: Date,
+): { score: number; regime: SymbolStats["market_regime"]; eligible: boolean } {
+  const eligible = isMarketEligible(symbol, now);
+  const snapshot = marketContext?.snapshots.find((item) => item.key === symbol);
+  if (!snapshot) return { score: eligible ? 48 : 0, regime: "unavailable", eligible };
+
+  const regime = pairRegimeLabel(snapshot, symbol);
+  const noteBias = marketContext?.pair_notes.find((item) => item.symbol === symbol)?.bias ?? "neutral";
+  const directionStrength = Math.min(1, Math.abs(snapshot.day_change_pct ?? 0) / Math.max(dayMoveThreshold(symbol), 0.01));
+  const weekConfirmation = Math.sign(snapshot.day_change_pct ?? 0) === Math.sign(snapshot.week_change_pct ?? 0) ? 1 : 0;
+  const regimePoints = regime === "directional" ? 7 : regime === "noisy" ? -5 : 0;
+  const biasPoints = noteBias === "supportive" ? 5 : noteBias === "cautious" ? -5 : 0;
+  const trendPoints = directionStrength * 5 + weekConfirmation * 2;
+  return {
+    score: eligible ? clamp(50 + regimePoints + biasPoints + trendPoints, 30, 70) : 0,
+    regime,
+    eligible,
+  };
 }
 
 function buildSystemFitNote(stats: SymbolStats, regime: "directional" | "noisy" | "mixed"): string | null {
@@ -364,7 +455,11 @@ function buildSystemFitNote(stats: SymbolStats, regime: "directional" | "noisy" 
 }
 
 function makeRecommendationFromStats(stats: SymbolStats, marketNote?: string): PairRecommendation {
-  const baseReason = `recent real=${stats.real_trades}, win_rate=${((stats.real_win_rate ?? 0) * 100).toFixed(1)}%, pnl=${stats.real_total_profit_loss.toFixed(0)}`;
+  const realBayesian = stats.real_win_rate_bayesian ?? stats.real_win_rate ?? 0.45;
+  const virtualBayesian = stats.virtual_win_rate_bayesian ?? stats.virtual_win_rate ?? 0.40;
+  const virtualEpisodes = stats.virtual_episode_trades ?? stats.virtual_trades ?? 0;
+  const marketFitScore = stats.market_fit_score ?? 50;
+  const baseReason = `実取引 ${stats.real_trades}件（補正勝率 ${(realBayesian * 100).toFixed(1)}%）、仮想 ${virtualEpisodes}エピソード（補正勝率 ${(virtualBayesian * 100).toFixed(1)}%）、市場適合 ${marketFitScore.toFixed(1)}`;
   return {
     symbol: stats.symbol,
     score: Math.round(stats.compatibility_score),
@@ -522,12 +617,24 @@ function attachPlanToRecommendations(recs: PairRecommendation[], plan: DailyTrad
   });
 }
 
+function defaultSelectionMeta(selectedCount: number): SelectionMeta {
+  return {
+    requested_count: selectedCount,
+    selected_count: selectedCount,
+    eligible_count: selectedCount,
+    backfilled_count: 0,
+    excluded_market_closed: [],
+    complete: true,
+  };
+}
+
 function buildFallbackTradePlan(
   selected: PairRecommendation[],
   stats: SymbolStats[],
   timeframe: string,
   marketContext: MarketContext | null,
   summary: string,
+  selectionMeta = defaultSelectionMeta(selected.length),
 ): DailyTradePlan {
   const now = new Date();
   const statsBySymbol = new Map(stats.map((item) => [item.symbol, item]));
@@ -545,6 +652,7 @@ function buildFallbackTradePlan(
     summary: summary || marketContext?.summary || "現在の市場環境とシステム実績から作成した日次トレード計画です。",
     market_themes: (marketContext?.themes ?? []).slice(0, 5),
     symbols,
+    selection_meta: selectionMeta,
     global_rules: {
       avoid_high_impact_minutes_before: 60,
       avoid_high_impact_minutes_after: 45,
@@ -561,16 +669,21 @@ function normalizeTradePlan(
   timeframe: string,
   marketContext: MarketContext | null,
   summary: string,
+  selectionMeta = defaultSelectionMeta(selected.length),
 ): DailyTradePlan {
-  const fallback = buildFallbackTradePlan(selected, stats, timeframe, marketContext, summary);
+  const fallback = buildFallbackTradePlan(selected, stats, timeframe, marketContext, summary, selectionMeta);
   if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
   const raw = value as any;
   const symbolsRaw = Array.isArray(raw.symbols) ? raw.symbols : [];
   const statsBySymbol = new Map(stats.map((item) => [item.symbol, item]));
   const validSelected = new Set(selected.map((rec) => rec.symbol));
-  const symbols = symbolsRaw
+  const aiSymbols: TradePlanSymbol[] = symbolsRaw
     .filter((item: any) => typeof item?.symbol === "string" && validSelected.has(item.symbol))
     .map((item: any) => makePlanSymbol(item as PairRecommendation, statsBySymbol.get(item.symbol), marketContext));
+  const aiBySymbol = new Map<string, TradePlanSymbol>(aiSymbols.map((item) => [item.symbol, item]));
+  const symbols = selected.map((rec) =>
+    aiBySymbol.get(rec.symbol) ?? makePlanSymbol(rec, statsBySymbol.get(rec.symbol), marketContext)
+  );
 
   return {
     ...fallback,
@@ -578,6 +691,7 @@ function normalizeTradePlan(
     market_themes: Array.isArray(raw.market_themes) ? raw.market_themes.filter((x: unknown) => typeof x === "string").slice(0, 5) : fallback.market_themes,
     risk_level: raw.risk_level === "low" || raw.risk_level === "medium" || raw.risk_level === "high" ? raw.risk_level : fallback.risk_level,
     symbols: symbols.length > 0 ? symbols : fallback.symbols,
+    selection_meta: selectionMeta,
     global_rules: {
       ...fallback.global_rules,
       ...(raw.global_rules && typeof raw.global_rules === "object" ? raw.global_rules : {}),
@@ -686,9 +800,9 @@ function buildSelectionView(
   const ranked_pairs = sortedStats.map((stat) => {
     const rec = bySymbol.get(stat.symbol) ?? makeRecommendationFromStats(stat);
     let category: "recommended" | "neutral" | "avoid";
-    if (aiSelectedSymbols.has(stat.symbol) || stat.compatibility_score >= 55) {
+    if (aiSelectedSymbols.has(stat.symbol)) {
       category = "recommended";
-    } else if (aiAvoidedSymbols.has(stat.symbol) || stat.compatibility_score < 45) {
+    } else if (stat.market_eligible === false || aiAvoidedSymbols.has(stat.symbol) || stat.compatibility_score < 45) {
       category = "avoid";
     } else {
       category = "neutral";
@@ -718,7 +832,9 @@ function buildSelectionView(
 }
 
 function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string, marketContext: MarketContext | null): AiSelectionResult {
-  const sorted = [...stats].sort((a, b) => b.compatibility_score - a.compatibility_score);
+  const sorted = [...stats]
+    .filter((s) => s.market_eligible)
+    .sort((a, b) => b.compatibility_score - a.compatibility_score);
   const selected_pairs = sorted
     .filter((s) => s.compatibility_score >= 55)
     .map((s) => makeRecommendationFromStats(s, noteForSymbol(marketContext, s.symbol)));
@@ -739,6 +855,81 @@ function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string
     selected_pairs: attachPlanToRecommendations(selected_pairs, trade_plan),
     avoided_pairs,
     trade_plan,
+  };
+}
+
+function appendCaution(current: string | undefined, caution: string): string {
+  if (!current) return caution;
+  const cautions = new Set(current.split(",").map((item) => item.trim()).filter(Boolean));
+  cautions.add(caution);
+  return [...cautions].join(",");
+}
+
+export function finalizeSelection(
+  aiSelection: AiSelectionResult,
+  stats: SymbolStats[],
+  topN: number,
+  marketContext: MarketContext | null,
+): { selected: PairRecommendation[]; avoided: PairRecommendation[]; meta: SelectionMeta } {
+  const statsBySymbol = new Map(stats.map((item) => [item.symbol, item]));
+  const marketClosed = stats.filter((item) => !item.market_eligible).map((item) => item.symbol);
+  const eligible = stats
+    .filter((item) => item.market_eligible && item.compatibility_score >= MIN_BACKFILL_SCORE)
+    .sort((a, b) => b.compatibility_score - a.compatibility_score);
+  const avoidedSymbols = new Set(aiSelection.avoided_pairs.map((item) => item.symbol));
+  const selected: PairRecommendation[] = [];
+  const selectedSymbols = new Set<string>();
+
+  for (const rec of aiSelection.selected_pairs) {
+    const stat = statsBySymbol.get(rec.symbol);
+    if (!stat?.market_eligible || avoidedSymbols.has(rec.symbol) || selectedSymbols.has(rec.symbol)) continue;
+    selected.push({
+      ...makeRecommendationFromStats(stat, noteForSymbol(marketContext, stat.symbol)),
+      ...rec,
+      symbol: stat.symbol,
+    });
+    selectedSymbols.add(stat.symbol);
+    if (selected.length >= topN) break;
+  }
+
+  const aiSelectedCount = selected.length;
+  for (const stat of eligible) {
+    if (selected.length >= topN) break;
+    if (selectedSymbols.has(stat.symbol) || avoidedSymbols.has(stat.symbol)) continue;
+    const recommendation = makeRecommendationFromStats(stat, noteForSymbol(marketContext, stat.symbol));
+    selected.push({
+      ...recommendation,
+      reason: `全銘柄市場スキャンから補充: ${recommendation.reason}`,
+      caution: appendCaution(recommendation.caution, "market_backfill"),
+    });
+    selectedSymbols.add(stat.symbol);
+  }
+
+  const avoided = [...aiSelection.avoided_pairs];
+  const avoidedSeen = new Set(avoided.map((item) => item.symbol));
+  for (const symbol of marketClosed) {
+    if (avoidedSeen.has(symbol)) continue;
+    const stat = statsBySymbol.get(symbol);
+    if (!stat) continue;
+    avoided.push({
+      ...makeRecommendationFromStats(stat, noteForSymbol(marketContext, symbol)),
+      score: 0,
+      reason: "対象市場が休場時間のため本日の候補から除外",
+      caution: appendCaution(undefined, "market_closed"),
+    });
+  }
+
+  return {
+    selected,
+    avoided,
+    meta: {
+      requested_count: topN,
+      selected_count: selected.length,
+      eligible_count: eligible.length,
+      backfilled_count: Math.max(0, selected.length - aiSelectedCount),
+      excluded_market_closed: marketClosed,
+      complete: selected.length >= topN,
+    },
   };
 }
 
@@ -1434,7 +1625,7 @@ async function fetchMarketContext(universe: string[]): Promise<MarketContext | n
 async function fetchTrades(universe: string[], timeframe: string, sinceIso: string, isVirtual: boolean): Promise<TradeRow[]> {
   const { data, error } = await supabase
     .from("ai_signals")
-    .select("symbol, actual_result, profit_loss, closed_at, win_prob, ml_pattern_used, entry_method")
+    .select("created_at, symbol, dir, actual_result, profit_loss, closed_at, win_prob, ml_pattern_used, entry_method")
     .in("symbol", universe)
     .eq("timeframe", timeframe)
     .eq("is_virtual", isVirtual)
@@ -1452,11 +1643,19 @@ async function fetchTrades(universe: string[], timeframe: string, sinceIso: stri
   return (data ?? []) as TradeRow[];
 }
 
-function buildStats(universe: string[], timeframe: string, realRows: TradeRow[], virtualRows: TradeRow[]): SymbolStats[] {
-  const recent7dCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+function buildStats(
+  universe: string[],
+  timeframe: string,
+  realRows: TradeRow[],
+  virtualRows: TradeRow[],
+  marketContext: MarketContext | null,
+  now = new Date(),
+): SymbolStats[] {
+  const recent7dCutoff = now.getTime() - 7 * 24 * 60 * 60 * 1000;
   return universe.map((symbol) => {
     const real = realRows.filter((r) => r.symbol === symbol);
-    const virtual = virtualRows.filter((r) => r.symbol === symbol);
+    const virtualRaw = virtualRows.filter((r) => r.symbol === symbol);
+    const virtual = collapseShadowEpisodes(virtualRaw);
     const realWins = real.filter((r) => r.actual_result === "WIN").length;
     const realLosses = real.filter((r) => r.actual_result === "LOSS").length;
     const realTrades = real.length;
@@ -1486,13 +1685,18 @@ function buildStats(universe: string[], timeframe: string, realRows: TradeRow[],
     const recent7dWinRate = recent7dTrades > 0 ? recent7dWins / recent7dTrades : null;
     const realAvgProfitLoss = realTrades > 0 ? realTotalProfitLoss / realTrades : null;
 
-    const sampleComponent = clamp(realTrades / 12, 0, 1) * 20;
-    const realWinComponent = ((realWinRate ?? 0.45) - 0.45) * 100;
-    const recentComponent = ((recent7dWinRate ?? realWinRate ?? 0.45) - 0.45) * 120;
-    const pnlComponent = clamp(realTotalProfitLoss / 150000, -1, 1) * 20;
-    const virtualComponent = ((virtualWinRate ?? 0.35) - 0.35) * 40;
-    const pullbackPenalty = pullbackTrades > 0 && marketTrades === 0 ? 8 : 0;
-    const compatibilityScore = clamp(50 + sampleComponent + realWinComponent + recentComponent + pnlComponent + virtualComponent - pullbackPenalty, 0, 100);
+    const realWinRateBayesian = bayesianWinRate(realWins, realTrades, 0.45, 8);
+    const recent7dWinRateBayesian = bayesianWinRate(recent7dWins, recent7dTrades, realWinRateBayesian, 6);
+    const virtualWinRateBayesian = bayesianWinRate(virtualWins, virtualTrades, 0.40, 16);
+    const marketFit = marketFitForSymbol(symbol, marketContext, now);
+    const sampleComponent = clamp(realTrades / 12, 0, 1) * 6;
+    const realWinComponent = (realWinRateBayesian - 0.45) * 55;
+    const recentComponent = (recent7dWinRateBayesian - realWinRateBayesian) * 35;
+    const virtualComponent = (virtualWinRateBayesian - 0.40) * 35;
+    const marketComponent = (marketFit.score - 50) * 0.65;
+    const compatibilityScore = marketFit.eligible
+      ? clamp(50 + sampleComponent + realWinComponent + recentComponent + virtualComponent + marketComponent, 0, 100)
+      : 0;
 
     return {
       symbol,
@@ -1513,8 +1717,22 @@ function buildStats(universe: string[], timeframe: string, realRows: TradeRow[],
       pullback_trades: pullbackTrades,
       pullback_win_rate: round3(pullbackTrades > 0 ? pullbackWins / pullbackTrades : null),
       virtual_trades: virtualTrades,
+      virtual_raw_trades: virtualRaw.length,
+      virtual_episode_trades: virtualTrades,
       virtual_win_rate: round3(virtualWinRate),
+      virtual_win_rate_bayesian: round3(virtualWinRateBayesian),
       virtual_total_profit_loss: round2(virtualTotalProfitLoss) ?? 0,
+      real_win_rate_bayesian: round3(realWinRateBayesian),
+      market_fit_score: Math.round(marketFit.score * 10) / 10,
+      market_regime: marketFit.regime,
+      market_eligible: marketFit.eligible,
+      score_components: {
+        sample: Math.round(sampleComponent * 10) / 10,
+        real: Math.round(realWinComponent * 10) / 10,
+        recent: Math.round(recentComponent * 10) / 10,
+        virtual: Math.round(virtualComponent * 10) / 10,
+        market: Math.round(marketComponent * 10) / 10,
+      },
       compatibility_score: Math.round(compatibilityScore * 10) / 10,
     };
   });
@@ -1550,10 +1768,12 @@ async function askOpenAi(stats: SymbolStats[], topN: number, cadence: string, ti
 
 重要条件:
 - 現在の市場ニュース、マクロ文脈、市場反応を最初に評価する
-- そのうえで実現損益と実現勝率をガードレールとして使う
+- market_eligible=true の銘柄だけを候補にする。false は絶対に選ばない
+- 実現勝率は real_win_rate_bayesian を主なガードレールとして使う
 - サンプル数が少ない銘柄は過信しない
 - 直近7日が悪化している銘柄は慎重に扱う
-- virtual成績は補助情報として使う
+- virtual成績は重複をまとめた virtual_episode_trades と virtual_win_rate_bayesian を補助情報として使う
+- 実績ゼロの銘柄も市場適合が高ければ候補から外さず、フィードバックループを避ける
 - このシステムは ${timeframe} を使う
 - top ${topN} 件を選ぶ
 - 理由は「現在の市場環境」と「このシステムの直近実績」の両方に触れる
@@ -1659,32 +1879,37 @@ JSONのみで回答:
 
 async function generateReport(body: any) {
   const { cadence, timeframe, lookbackDays, topN, universe, triggeredBy } = normalizeRequest(body);
-  const sinceIso = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
+  const now = new Date();
+  const sinceIso = new Date(now.getTime() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
 
   const [realRows, virtualRows, marketContext] = await Promise.all([
     fetchTrades(universe, timeframe, sinceIso, false),
     fetchTrades(universe, timeframe, sinceIso, true),
     fetchMarketContext(universe),
   ]);
-  const stats = buildStats(universe, timeframe, realRows, virtualRows);
+  const stats = buildStats(universe, timeframe, realRows, virtualRows, marketContext, now);
   const enrichedContext = applySystemFitToContext(marketContext, stats);
   const aiSelection = await askOpenAi(stats, topN, cadence, timeframe, enrichedContext);
+  const finalized = finalizeSelection(aiSelection, stats, topN, enrichedContext);
+  aiSelection.selected_pairs = finalized.selected;
+  aiSelection.avoided_pairs = finalized.avoided;
   const tradePlan = normalizeTradePlan(
     aiSelection.trade_plan,
-    aiSelection.selected_pairs.slice(0, topN),
+    finalized.selected,
     stats,
     timeframe,
     enrichedContext,
     aiSelection.summary || enrichedContext?.summary || "",
+    finalized.meta,
   );
   aiSelection.trade_plan = tradePlan;
   aiSelection.selected_pairs = attachPlanToRecommendations(aiSelection.selected_pairs, tradePlan);
   const selectionView = buildSelectionView(stats, aiSelection, topN, enrichedContext);
-  const selectedWithPlan = attachPlanToRecommendations(selectionView.recommended_pairs, tradePlan);
-  const topPicksWithPlan = attachPlanToRecommendations(selectionView.top_picks, tradePlan);
+  const selectedWithPlan = attachPlanToRecommendations(finalized.selected, tradePlan);
+  const topPicksWithPlan = selectedWithPlan.slice(0, topN);
 
   const payload = {
-    generated_at: new Date().toISOString(),
+    generated_at: now.toISOString(),
     cadence,
     timeframe,
     lookback_days: lookbackDays,
@@ -1742,7 +1967,7 @@ async function generateReport(body: any) {
   };
 }
 
-Deno.serve(async (req: Request) => {
+if (import.meta.main) Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders() });
   }

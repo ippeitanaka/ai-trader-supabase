@@ -418,6 +418,7 @@ export default async function Home({ searchParams }: PageProps) {
   const liveContext = data.pairSelector.live_context;
   const tradePlan = latest?.trade_plan;
   const planSymbols = tradePlan?.symbols ?? [];
+  const selectionMeta = tradePlan?.selection_meta;
   const planStatus = latest?.plan_overrides?.status ?? latest?.plan_status ?? "active";
   const globalGateAdjustment = latest?.plan_overrides?.gate_adjustment ?? 0;
   const symbolGateAdjustments = latest?.plan_overrides?.symbol_gate_adjustments ?? {};
@@ -561,16 +562,42 @@ export default async function Home({ searchParams }: PageProps) {
               </p>
             </div>
             <div className="flex flex-col gap-3 lg:items-end">
-              <span className={`w-fit rounded-full border px-3 py-1 text-xs ${
-                planStatus === "paused"
-                  ? "border-rose-300/30 bg-rose-300/10 text-rose-100"
-                  : "border-emerald-300/30 bg-emerald-300/10 text-emerald-100"
-              }`}>
-                {planStatus === "paused" ? "計画停止中" : "計画稼働中"}
-              </span>
+              <div className="flex flex-wrap justify-end gap-2">
+                <span className={`w-fit rounded-full border px-3 py-1 text-xs ${
+                  planStatus === "paused"
+                    ? "border-rose-300/30 bg-rose-300/10 text-rose-100"
+                    : "border-emerald-300/30 bg-emerald-300/10 text-emerald-100"
+                }`}>
+                  {planStatus === "paused" ? "計画停止中" : "計画稼働中"}
+                </span>
+                {selectionMeta ? (
+                  <span className={`w-fit rounded-full border px-3 py-1 text-xs ${
+                    selectionMeta.complete
+                      ? "border-cyan-300/30 bg-cyan-300/10 text-cyan-100"
+                      : "border-amber-300/30 bg-amber-300/10 text-amber-100"
+                  }`}>
+                    選定 {selectionMeta.selected_count}/{selectionMeta.requested_count}
+                  </span>
+                ) : null}
+                {(selectionMeta?.backfilled_count ?? 0) > 0 ? (
+                  <span className="w-fit rounded-full border border-violet-300/30 bg-violet-300/10 px-3 py-1 text-xs text-violet-100">
+                    市場補充 {selectionMeta?.backfilled_count}
+                  </span>
+                ) : null}
+              </div>
               <TradePlanControls reportId={latest?.id ?? null} status={planStatus} gateAdjustment={globalGateAdjustment} />
             </div>
           </div>
+
+          {selectionMeta && (!selectionMeta.complete || selectionMeta.excluded_market_closed.length > 0) ? (
+            <div className="mb-5 flex flex-wrap gap-x-5 gap-y-2 rounded-2xl border border-amber-300/18 bg-amber-300/8 px-4 py-3 text-xs leading-6 text-amber-50">
+              <span>市場適格 {selectionMeta.eligible_count}銘柄</span>
+              {!selectionMeta.complete ? <span>要求数に満たないため、適格銘柄のみで稼働</span> : null}
+              {selectionMeta.excluded_market_closed.length > 0 ? (
+                <span>休場除外: {selectionMeta.excluded_market_closed.join(" / ")}</span>
+              ) : null}
+            </div>
+          ) : null}
 
           <div className="grid gap-4 xl:grid-cols-3">
             {planSymbols.length > 0 ? planSymbols.map((item) => {

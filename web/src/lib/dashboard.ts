@@ -51,6 +51,14 @@ type DailyTradePlan = {
   summary?: string;
   market_themes?: string[];
   symbols?: TradePlanSymbol[];
+  selection_meta?: {
+    requested_count: number;
+    selected_count: number;
+    eligible_count: number;
+    backfilled_count: number;
+    excluded_market_closed: string[];
+    complete: boolean;
+  };
   global_rules?: {
     avoid_high_impact_minutes_before?: number;
     avoid_high_impact_minutes_after?: number;
