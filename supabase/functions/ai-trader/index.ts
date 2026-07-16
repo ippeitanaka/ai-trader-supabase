@@ -2,7 +2,9 @@ import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   collapseTimedEpisodes,
+  isMinuteWithinWindow,
   qualifiesForOpportunityOverride,
+  resolveManualProbabilityGate,
   resolveOpportunityGate,
 } from "./opportunity-policy.ts";
 
@@ -596,6 +598,14 @@ type DailyPlanSymbol = {
   setup_focus?: string[];
 };
 
+type GateAdjustment = -0.10 | -0.05 | 0 | 0.05 | 0.10;
+type PlanGateMode = "more_active" | "active" | "ai" | "cautious" | "very_cautious";
+type ManualSessionOverride = {
+  mode: "custom" | "all_day";
+  timezone?: string;
+  windows?: Array<{ label?: string; start_jst?: string; end_jst?: string }>;
+};
+
 type DailyPlanContext = {
   report_id: number | null;
   generated_at?: string | null;
@@ -774,7 +784,7 @@ export interface TradeResponse {
   plan_base_min_win_prob?: number | null;
   plan_gate_adjustment?: number;
   plan_effective_min_win_prob?: number | null;
-  plan_gate_mode?: "ai" | "cautious" | "very_cautious";
+  plan_gate_mode?: PlanGateMode;
   daily_plan?: DailyPlanContext | null;
 }
 
@@ -923,26 +933,86 @@ function activeEventWindow(item: DailyPlanSymbol | null | undefined): NonNullabl
   return null;
 }
 
-function normalizeGateAdjustment(value: unknown): 0 | 0.05 | 0.10 {
+function normalizeGateAdjustment(value: unknown): GateAdjustment {
   const numeric = typeof value === "number" ? value : Number(value);
   if (Math.abs(numeric - 0.10) < 0.0001) return 0.10;
   if (Math.abs(numeric - 0.05) < 0.0001) return 0.05;
+  if (Math.abs(numeric + 0.10) < 0.0001) return -0.10;
+  if (Math.abs(numeric + 0.05) < 0.0001) return -0.05;
   return 0;
 }
 
 function resolvePlanGateAdjustment(plan: DailyPlanContext, symbol: string): {
-  adjustment: 0 | 0.05 | 0.10;
-  mode: "ai" | "cautious" | "very_cautious";
+  adjustment: GateAdjustment;
+  mode: PlanGateMode;
+  manual: boolean;
 } {
   const overrides = plan.plan_overrides ?? {};
   const bySymbol = overrides.symbol_gate_adjustments;
   const symbolKey = symbol.toUpperCase();
-  const symbolValue = bySymbol && typeof bySymbol === "object"
-    ? (bySymbol as Record<string, unknown>)[symbolKey]
-    : undefined;
+  const symbolValues = bySymbol && typeof bySymbol === "object"
+    ? bySymbol as Record<string, unknown>
+    : {};
+  const hasSymbolValue = Object.prototype.hasOwnProperty.call(symbolValues, symbolKey);
+  const symbolValue = hasSymbolValue ? symbolValues[symbolKey] : undefined;
+  const hasGlobalValue = Object.prototype.hasOwnProperty.call(overrides, "gate_adjustment");
   const adjustment = normalizeGateAdjustment(symbolValue ?? overrides.gate_adjustment);
-  const mode = adjustment === 0.10 ? "very_cautious" : adjustment === 0.05 ? "cautious" : "ai";
-  return { adjustment, mode };
+  const mode = adjustment === 0.10
+    ? "very_cautious"
+    : adjustment === 0.05
+    ? "cautious"
+    : adjustment === -0.10
+    ? "more_active"
+    : adjustment === -0.05
+    ? "active"
+    : "ai";
+  return { adjustment, mode, manual: adjustment !== 0 && (hasSymbolValue || hasGlobalValue) };
+}
+
+function resolveManualExecutionGate(
+  plan: DailyPlanContext | null,
+  symbol: string,
+): { gate: number; adjustment: GateAdjustment; mode: PlanGateMode } | null {
+  if (!plan || typeof plan.item?.min_win_prob !== "number") return null;
+  const override = resolvePlanGateAdjustment(plan, symbol);
+  if (!override.manual) return null;
+  return {
+    gate: resolveManualProbabilityGate(plan.item.min_win_prob, override.adjustment),
+    adjustment: override.adjustment,
+    mode: override.mode,
+  };
+}
+
+function resolvePlanSessionOverride(plan: DailyPlanContext, symbol: string): ManualSessionOverride | null {
+  const raw = plan.plan_overrides?.symbol_session_overrides;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const value = (raw as Record<string, unknown>)[symbol.toUpperCase()];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const override = value as Record<string, unknown>;
+  if (override.mode === "all_day") return { mode: "all_day", timezone: "Asia/Tokyo" };
+  if (override.mode !== "custom" || !Array.isArray(override.windows)) return null;
+  const windows = override.windows
+    .filter((window): window is Record<string, unknown> => Boolean(window) && typeof window === "object" && !Array.isArray(window))
+    .map((window) => ({
+      label: typeof window.label === "string" ? window.label : "dashboard",
+      start_jst: typeof window.start_jst === "string" ? window.start_jst : undefined,
+      end_jst: typeof window.end_jst === "string" ? window.end_jst : undefined,
+    }))
+    .filter((window) => minutesFromTime(window.start_jst) !== null && minutesFromTime(window.end_jst) !== null)
+    .slice(0, 3);
+  return windows.length > 0 ? { mode: "custom", timezone: "Asia/Tokyo", windows } : null;
+}
+
+function isNowInJstSessionWindow(
+  window: NonNullable<ManualSessionOverride["windows"]>[number],
+  now = new Date(),
+): boolean {
+  const start = minutesFromTime(window.start_jst);
+  const end = minutesFromTime(window.end_jst);
+  if (start === null || end === null) return true;
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  const current = jst.getUTCHours() * 60 + jst.getUTCMinutes();
+  return isMinuteWithinWindow(current, start, end);
 }
 
 function htfOpposesDirection(req: TradeRequest, dir: number): boolean {
@@ -1006,7 +1076,7 @@ function buildDailyPlanPrompt(plan: DailyPlanContext | null, req: TradeRequest):
   if (!plan) {
     return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n最新の日次計画は取得できませんでした。EAの上位足/セッション/構造情報を通常の判断補助として使ってください。\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}`;
   }
-  return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• report_id=${plan.report_id ?? "N/A"} status=${plan.plan_status} risk=${plan.risk_level ?? "unknown"}\n• summary=${plan.summary ?? "N/A"}\n• themes=${(plan.market_themes ?? []).join(" / ") || "N/A"}\n• symbol_plan=${JSON.stringify(plan.item ?? null)}\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}\n\nこの日次計画に反する方向・時間帯・イベント直前直後・上位足逆行・節目直前・異常コストのエントリーは、勝率を保守的に見積もってください。`;
+  return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• report_id=${plan.report_id ?? "N/A"} status=${plan.plan_status} risk=${plan.risk_level ?? "unknown"}\n• summary=${plan.summary ?? "N/A"}\n• themes=${(plan.market_themes ?? []).join(" / ") || "N/A"}\n• symbol_plan=${JSON.stringify(plan.item ?? null)}\n• manual_overrides=${JSON.stringify(plan.plan_overrides ?? {})}\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}\n\nこの日次計画に反する方向・時間帯・イベント直前直後・上位足逆行・節目直前・異常コストのエントリーは、勝率を保守的に見積もってください。ダッシュボードの手動設定はAI推奨より優先してください。`;
 }
 
 function contextNumber(source: Record<string, number | string | null> | undefined, key: string): number | null {
@@ -1116,7 +1186,7 @@ function applyChartQualityGuard(tradeReq: TradeRequest, response: TradeResponse)
 }
 
 async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeResponse): Promise<TradeResponse> {
-  const plan = await fetchDailyPlanContext(tradeReq);
+  const plan = response.daily_plan ?? await fetchDailyPlanContext(tradeReq);
   if (!plan) return response;
 
   const item = plan.item ?? null;
@@ -1126,10 +1196,11 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
   let eventRisk = "none";
   let alignment = response.plan_alignment ?? (item ? "aligned" : "symbol_not_in_daily_plan");
   const gateOverride = resolvePlanGateAdjustment(plan, tradeReq.symbol);
+  const sessionOverride = resolvePlanSessionOverride(plan, tradeReq.symbol);
   const planBaseGate = typeof item?.min_win_prob === "number" ? clampWinProb(item.min_win_prob) : null;
   const planEffectiveGate = planBaseGate === null
     ? null
-    : clampWinProb(planBaseGate + gateOverride.adjustment);
+    : resolveManualProbabilityGate(planBaseGate, gateOverride.adjustment);
 
   if (plan.plan_status === "paused") hardReasons.push("daily_plan_paused");
   if (!item) hardReasons.push("daily_plan_symbol_not_selected");
@@ -1154,14 +1225,22 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
       alignment = "direction_mismatch";
     }
 
-    const sessions = item.session_windows ?? [];
-    if (sessions.length > 0 && !sessions.some((window) => isNowInSessionWindow(window, tradeReq.utc_hour))) {
-      softReasons.push("daily_plan_session_closed");
-      alignment = "session_mismatch";
+    if (sessionOverride?.mode === "custom") {
+      const manualWindows = sessionOverride.windows ?? [];
+      if (manualWindows.length > 0 && !manualWindows.some((window) => isNowInJstSessionWindow(window))) {
+        hardReasons.push("daily_plan_manual_session_closed");
+        alignment = "manual_session_mismatch";
+      }
+    } else if (sessionOverride?.mode !== "all_day") {
+      const sessions = item.session_windows ?? [];
+      if (sessions.length > 0 && !sessions.some((window) => isNowInSessionWindow(window, tradeReq.utc_hour))) {
+        softReasons.push("daily_plan_session_closed");
+        alignment = "session_mismatch";
+      }
     }
 
     if (planEffectiveGate !== null && response.win_prob < planEffectiveGate) {
-      if (gateOverride.adjustment > 0) {
+      if (gateOverride.manual) {
         hardReasons.push("daily_plan_manual_gate");
       } else {
         softReasons.push("daily_plan_winprob_below_plan");
@@ -1186,6 +1265,7 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
     ` align=${alignment} event=${eventRisk}` +
     `${item?.allowed_direction ? ` dir=${item.allowed_direction}` : ""}` +
     `${item?.strategy ? ` strategy=${item.strategy}` : ""}` +
+    `${sessionOverride ? ` session=${sessionOverride.mode}_jst` : " session=ai"}` +
     `${planEffectiveGate !== null ? ` gate=${round3(planBaseGate!)}+${round3(gateOverride.adjustment)}=>${round3(planEffectiveGate)}` : ""})`;
 
   const withDiagnostics = {
@@ -1561,6 +1641,7 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
 
 async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promise<TradeResponse> {
   const base = calculateSignalFallback(req);
+  const dailyPlanContext = await fetchDailyPlanContext(req);
   const rt = await getRuntimeTradeParams(req);
   const calibrationMode = getCalibrationMode();
   const calibrationRequired = calibrationMode === "on" && isCalibrationRequired();
@@ -1602,12 +1683,14 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
   const modelHealth = await getExecutionModelHealth(req.timeframe);
   const winProbFinal = shrinkProbabilityToNeutral(modelWinProb, modelHealth.weight);
 
-  const effective_gate = resolveOpportunityGate({
+  const adaptiveGate = resolveOpportunityGate({
     clientMinWinProb: client_min_win_prob,
     evGateMinWinProb,
     floor: minWinProbFloor,
     gateReduction: rsiMrBonus.gateReduction,
   });
+  const manualGate = resolveManualExecutionGate(dailyPlanContext, req.symbol);
+  const effective_gate = manualGate?.gate ?? adaptiveGate;
 
   const expected_value_r = computeExpectedValueR(winProbFinal, rt.rewardRR, rt.costR);
   const costOk = rt.costR <= maxCostR;
@@ -1638,6 +1721,7 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
   const gateTag =
     `GATE(EV>=${minEvR.toFixed(2)}R rr=${round3(rt.rewardRR)} costR=${round3(rt.costR)} ` +
     `costSrc=${rt.costRSource} maxCostR=${round3(maxCostR)} gateP=${round3(effective_gate)} ` +
+    `gateSrc=${manualGate ? `manual_${manualGate.mode}` : "adaptive"} ` +
     `calReq=${calibrationRequired ? 1 : 0} calApplied=${debug.applied ? 1 : 0})`;
 
   const calTag = debug.applied
@@ -1703,6 +1787,7 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     },
     win_prob_calibration: debug,
     skip_reason,
+    daily_plan: dailyPlanContext,
   } as any;
 }
 
@@ -2796,12 +2881,14 @@ ${candleBarsSummary}
     const modelHealth = await getExecutionModelHealth(req.timeframe);
     win_prob = shrinkProbabilityToNeutral(model_win_prob, modelHealth.weight);
 
-    const effective_gate = resolveOpportunityGate({
+    const adaptiveGate = resolveOpportunityGate({
       clientMinWinProb: client_min_win_prob,
       evGateMinWinProb,
       floor: minWinProbFloor,
       gateReduction: rsiMrBonus.gateReduction,
     });
+    const manualGate = resolveManualExecutionGate(dailyPlanContext, req.symbol);
+    const effective_gate = manualGate?.gate ?? adaptiveGate;
 
     const expected_value_r = computeExpectedValueR(win_prob, rt.rewardRR, rt.costR);
     let skip_reason = typeof aiResult.skip_reason === "string" ? aiResult.skip_reason : "";
@@ -2819,6 +2906,7 @@ ${candleBarsSummary}
     const gateTag =
       `GATE(EV>=${minEvR.toFixed(2)}R rr=${round3(rt.rewardRR)} costR=${round3(rt.costR)} ` +
       `costSrc=${rt.costRSource} maxCostR=${round3(maxCostR)} gateP=${round3(effective_gate)} ` +
+      `gateSrc=${manualGate ? `manual_${manualGate.mode}` : "adaptive"} ` +
       `calReq=${calibrationRequired ? 1 : 0} calApplied=${cal.debug.applied ? 1 : 0})`;
 
     const calTag = cal.debug.applied
@@ -3053,7 +3141,7 @@ serve(async (req: Request) => {
       JSON.stringify({ 
         ok: true, 
         service: "ai-trader with OpenAI + Comprehensive Technical Analysis", 
-        version: "2.11.0-adaptive-opportunity",
+        version: "2.12.0-operator-overrides",
         mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
         ml_learning_enabled: mlLearningEnabled,
@@ -3077,6 +3165,8 @@ serve(async (req: Request) => {
           "atr",
           "ichimoku_full",
           "daily_trade_plan_guard",
+          "operator_probability_override",
+          "operator_jst_session_override",
           "higher_timeframe_context",
           "chart_structure_guard",
           "volatility_cost_context",

@@ -11,6 +11,21 @@ function clampProbability(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
 
+export function resolveManualProbabilityGate(
+  baseGate: number,
+  adjustment: number,
+  minGate = 0.50,
+  maxGate = 0.95,
+): number {
+  const resolved = Math.max(minGate, Math.min(maxGate, baseGate + adjustment));
+  return Math.round(resolved * 1000) / 1000;
+}
+
+export function isMinuteWithinWindow(current: number, start: number, end: number): boolean {
+  if (start <= end) return current >= start && current <= end;
+  return current >= start || current <= end;
+}
+
 export function resolveOpportunityGate(input: {
   clientMinWinProb: number;
   evGateMinWinProb: number;

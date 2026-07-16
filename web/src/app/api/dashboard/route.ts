@@ -26,18 +26,59 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: "report_id is required" }, { status: 400 });
       }
       const status = body?.status === "paused" ? "paused" : body?.status === "active" ? "active" : undefined;
-      const allowedAdjustments = new Set([0, 0.05, 0.1]);
+      const allowedAdjustments = new Set([-0.1, -0.05, 0, 0.05, 0.1]);
       const gateAdjustment = allowedAdjustments.has(Number(body?.gate_adjustment))
-        ? Number(body.gate_adjustment) as 0 | 0.05 | 0.10
+        ? Number(body.gate_adjustment) as -0.10 | -0.05 | 0 | 0.05 | 0.10
         : undefined;
       const rawSymbolAdjustments = body?.symbol_gate_adjustments;
-      const symbolGateAdjustments: Record<string, 0 | 0.05 | 0.10> = {};
+      const symbolGateAdjustments: Record<string, -0.10 | -0.05 | 0 | 0.05 | 0.10> = {};
       if (rawSymbolAdjustments && typeof rawSymbolAdjustments === "object" && !Array.isArray(rawSymbolAdjustments)) {
         for (const [symbol, value] of Object.entries(rawSymbolAdjustments)) {
           const normalizedSymbol = symbol.trim().toUpperCase();
           const numeric = Number(value);
           if (normalizedSymbol && allowedAdjustments.has(numeric)) {
-            symbolGateAdjustments[normalizedSymbol] = numeric as 0 | 0.05 | 0.10;
+            symbolGateAdjustments[normalizedSymbol] = numeric as -0.10 | -0.05 | 0 | 0.05 | 0.10;
+          }
+        }
+      }
+      const rawSessionOverrides = body?.symbol_session_overrides;
+      const symbolSessionOverrides: Record<string, {
+        mode: "custom" | "all_day";
+        timezone: "Asia/Tokyo";
+        windows?: Array<{ label?: string; start_jst: string; end_jst: string }>;
+      }> = {};
+      if (rawSessionOverrides && typeof rawSessionOverrides === "object" && !Array.isArray(rawSessionOverrides)) {
+        const validTime = (value: unknown) => typeof value === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+        for (const [symbol, rawOverride] of Object.entries(rawSessionOverrides)) {
+          const normalizedSymbol = symbol.trim().toUpperCase();
+          if (!normalizedSymbol || !rawOverride || typeof rawOverride !== "object" || Array.isArray(rawOverride)) continue;
+          const override = rawOverride as Record<string, unknown>;
+          if (override.mode === "all_day") {
+            symbolSessionOverrides[normalizedSymbol] = {
+              mode: "all_day",
+              timezone: "Asia/Tokyo",
+            };
+            continue;
+          }
+          const windows = Array.isArray(override.windows)
+            ? override.windows
+                .filter((window): window is Record<string, unknown> => Boolean(window) && typeof window === "object" && !Array.isArray(window))
+                .map((window) => ({
+                  label: typeof window.label === "string" ? window.label.slice(0, 40) : "手動設定",
+                  start_jst: window.start_jst,
+                  end_jst: window.end_jst,
+                }))
+                .filter((window): window is { label: string; start_jst: string; end_jst: string } =>
+                  validTime(window.start_jst) && validTime(window.end_jst)
+                )
+                .slice(0, 3)
+            : [];
+          if (override.mode === "custom" && windows.length > 0) {
+            symbolSessionOverrides[normalizedSymbol] = {
+              mode: "custom",
+              timezone: "Asia/Tokyo",
+              windows,
+            };
           }
         }
       }
@@ -47,11 +88,22 @@ export async function POST(request: Request) {
         ...(gateAdjustment !== undefined
           ? {
               gate_adjustment: gateAdjustment,
-              gate_mode: gateAdjustment === 0.1 ? "very_cautious" : gateAdjustment === 0.05 ? "cautious" : "ai",
+              gate_mode: gateAdjustment === 0.1
+                ? "very_cautious"
+                : gateAdjustment === 0.05
+                ? "cautious"
+                : gateAdjustment === -0.1
+                ? "more_active"
+                : gateAdjustment === -0.05
+                ? "active"
+                : "ai",
             }
           : {}),
         ...(rawSymbolAdjustments && typeof rawSymbolAdjustments === "object"
           ? { symbol_gate_adjustments: symbolGateAdjustments }
+          : {}),
+        ...(rawSessionOverrides && typeof rawSessionOverrides === "object"
+          ? { symbol_session_overrides: symbolSessionOverrides }
           : {}),
         note,
       });

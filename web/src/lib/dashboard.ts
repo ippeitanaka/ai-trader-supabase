@@ -69,9 +69,18 @@ type DailyTradePlan = {
 
 type PlanOverrides = {
   status?: "active" | "paused";
-  gate_adjustment?: 0 | 0.05 | 0.10;
-  gate_mode?: "ai" | "cautious" | "very_cautious";
-  symbol_gate_adjustments?: Record<string, 0 | 0.05 | 0.10>;
+  gate_adjustment?: -0.10 | -0.05 | 0 | 0.05 | 0.10;
+  gate_mode?: "more_active" | "active" | "ai" | "cautious" | "very_cautious";
+  symbol_gate_adjustments?: Record<string, -0.10 | -0.05 | 0 | 0.05 | 0.10>;
+  symbol_session_overrides?: Record<string, {
+    mode: "custom" | "all_day";
+    timezone: "Asia/Tokyo";
+    windows?: Array<{
+      label?: string;
+      start_jst: string;
+      end_jst: string;
+    }>;
+  }>;
   note?: string;
   updated_at?: string;
   history?: Array<Record<string, unknown>>;

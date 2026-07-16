@@ -1,6 +1,8 @@
 import {
   collapseTimedEpisodes,
+  isMinuteWithinWindow,
   qualifiesForOpportunityOverride,
+  resolveManualProbabilityGate,
   resolveOpportunityGate,
 } from "./opportunity-policy.ts";
 
@@ -25,6 +27,20 @@ Deno.test("opportunity gate keeps an absolute probability floor", () => {
     floor: 0.48,
   });
   assert(gate === 0.48, `expected 0.48 floor, received ${gate}`);
+});
+
+Deno.test("manual probability adjustment can lower or raise the final plan gate", () => {
+  assert(resolveManualProbabilityGate(0.58, -0.05) === 0.53, "manual -5pt should produce a 53% gate");
+  assert(resolveManualProbabilityGate(0.52, 0.10) === 0.62, "manual +10pt should produce a 62% gate");
+  assert(resolveManualProbabilityGate(0.52, -0.10) === 0.50, "manual gate should keep the 50% lower bound");
+});
+
+Deno.test("manual JST window supports ranges that cross midnight", () => {
+  const start = 22 * 60;
+  const end = 2 * 60;
+  assert(isMinuteWithinWindow(23 * 60, start, end), "23:00 JST should be inside the overnight window");
+  assert(isMinuteWithinWindow(60, start, end), "01:00 JST should be inside the overnight window");
+  assert(!isMinuteWithinWindow(12 * 60, start, end), "12:00 JST should be outside the overnight window");
 });
 
 Deno.test("strong low-cost EV can override soft planning guards", () => {

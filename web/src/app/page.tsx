@@ -1,6 +1,6 @@
 import { getDashboardData } from "@/lib/dashboard";
 import { AiRefreshButton } from "@/components/ai-refresh-button";
-import { SymbolGateControl, TradePlanControls } from "@/components/trade-plan-controls";
+import { SymbolGateControl, SymbolSessionControl, TradePlanControls } from "@/components/trade-plan-controls";
 
 export const dynamic = "force-dynamic";
 
@@ -38,6 +38,7 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   recent_perf_penalty: "直近成績の悪化を考慮して抑制したため",
   streak_guard: "連敗ガードを優先したため",
   daily_plan_manual_gate: "ダッシュボードで指定した追加ゲートを下回ったため",
+  daily_plan_manual_session_closed: "ダッシュボードで指定した取引時間外のため",
 };
 
 function parseMt5DateTime(value: string) {
@@ -423,6 +424,7 @@ export default async function Home({ searchParams }: PageProps) {
   const planStatus = latest?.plan_overrides?.status ?? latest?.plan_status ?? "active";
   const globalGateAdjustment = latest?.plan_overrides?.gate_adjustment ?? 0;
   const symbolGateAdjustments = latest?.plan_overrides?.symbol_gate_adjustments ?? {};
+  const symbolSessionOverrides = latest?.plan_overrides?.symbol_session_overrides ?? {};
   const marketPulse = buildMarketPulse(
     liveContext?.themes?.length ?? 0,
     data.openTrades.length,
@@ -605,7 +607,9 @@ export default async function Home({ searchParams }: PageProps) {
               const symbolKey = item.symbol.toUpperCase();
               const hasSymbolAdjustment = Object.prototype.hasOwnProperty.call(symbolGateAdjustments, symbolKey);
               const gateAdjustment = hasSymbolAdjustment ? symbolGateAdjustments[symbolKey] : globalGateAdjustment;
-              const effectiveGate = Math.min(0.95, (item.min_win_prob ?? 0) + gateAdjustment);
+              const effectiveGate = Math.max(0.50, Math.min(0.95, (item.min_win_prob ?? 0) + gateAdjustment));
+              const sessionOverride = symbolSessionOverrides[symbolKey];
+              const manualSessionWindow = sessionOverride?.windows?.[0];
               return (
               <article key={`plan-${item.symbol}`} className="rounded-3xl border border-cyan-300/16 bg-cyan-300/7 p-5">
                 <div className="flex items-start justify-between gap-4">
@@ -627,8 +631,10 @@ export default async function Home({ searchParams }: PageProps) {
                   <div className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-3">
                     <p className="text-xs text-slate-400">計画ゲート目安</p>
                     <p className="mt-1 font-medium text-white">p≥{(effectiveGate * 100).toFixed(0)}% / cost≤{item.max_cost_r?.toFixed?.(2) ?? "-"}</p>
-                    <p className="mt-1 text-xs text-slate-400">AI {(item.min_win_prob * 100).toFixed(0)}% {gateAdjustment > 0 ? `+ ${(gateAdjustment * 100).toFixed(0)}pt` : ""}</p>
-                    <p className="mt-1 text-xs leading-5 text-slate-500">{gateAdjustment > 0 ? "手動追加分は必須条件" : "期待値が強ければ自動調整"}</p>
+                    <p className="mt-1 text-xs text-slate-400">
+                      AI {(item.min_win_prob * 100).toFixed(0)}% {gateAdjustment !== 0 ? `${gateAdjustment > 0 ? "+" : ""} ${(gateAdjustment * 100).toFixed(0)}pt` : ""}
+                    </p>
+                    <p className="mt-1 text-xs leading-5 text-slate-500">{gateAdjustment !== 0 ? "手動設定を最終ゲートに使用" : "期待値が強ければ自動調整"}</p>
                   </div>
                 </div>
 
@@ -638,15 +644,31 @@ export default async function Home({ searchParams }: PageProps) {
                   globalAdjustment={globalGateAdjustment}
                   symbolAdjustments={symbolGateAdjustments}
                 />
+                <SymbolSessionControl
+                  key={`${latest?.id ?? "none"}-${symbolKey}-${sessionOverride?.mode ?? "ai"}-${manualSessionWindow?.start_jst ?? ""}-${manualSessionWindow?.end_jst ?? ""}`}
+                  reportId={latest?.id ?? null}
+                  symbol={item.symbol}
+                  sessionOverrides={symbolSessionOverrides}
+                />
 
                 <p className="mt-4 text-sm leading-7 text-slate-200">{item.reason}</p>
 
                 <div className="mt-4 space-y-2">
-                  {(item.session_windows ?? []).slice(0, 3).map((window) => (
-                    <div key={`${item.symbol}-${window.label}-${window.start_utc}`} className="rounded-2xl border border-white/8 bg-white/5 px-4 py-3 text-xs text-slate-300">
-                      <span className="text-white">{window.label ?? "session"}</span> / {formatUtcWindow(window.start_utc, window.end_utc)}
+                  {sessionOverride?.mode === "all_day" ? (
+                    <div className="rounded-2xl border border-emerald-300/20 bg-emerald-300/8 px-4 py-3 text-xs text-emerald-50">
+                      手動設定 / 終日許可（JST）
                     </div>
-                  ))}
+                  ) : sessionOverride?.mode === "custom" && manualSessionWindow ? (
+                    <div className="rounded-2xl border border-cyan-300/20 bg-cyan-300/8 px-4 py-3 text-xs text-cyan-50">
+                      手動設定 / {manualSessionWindow.start_jst}-{manualSessionWindow.end_jst} JST
+                    </div>
+                  ) : (
+                    (item.session_windows ?? []).slice(0, 3).map((window) => (
+                      <div key={`${item.symbol}-${window.label}-${window.start_utc}`} className="rounded-2xl border border-white/8 bg-white/5 px-4 py-3 text-xs text-slate-300">
+                        <span className="text-white">{window.label ?? "session"}</span> / {formatUtcWindow(window.start_utc, window.end_utc)}
+                      </div>
+                    ))
+                  )}
                   {(item.avoid_event_windows ?? []).slice(0, 2).map((event) => (
                     <div key={`${item.symbol}-${event.label}-${event.start_at}`} className="rounded-2xl border border-amber-300/18 bg-amber-300/8 px-4 py-3 text-xs leading-6 text-amber-50">
                       回避: {event.label ?? "重要イベント"} / {event.start_at ? formatDateTime(event.start_at) : "-"} から
