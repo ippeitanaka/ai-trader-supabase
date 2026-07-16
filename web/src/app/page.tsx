@@ -37,6 +37,7 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   rsi_mr_bonus: "逆張り補正は入ったが実行基準には届かなかったため",
   recent_perf_penalty: "直近成績の悪化を考慮して抑制したため",
   streak_guard: "連敗ガードを優先したため",
+  daily_plan_manual_gate: "ダッシュボードで指定した追加ゲートを下回ったため",
 };
 
 function parseMt5DateTime(value: string) {
@@ -624,9 +625,10 @@ export default async function Home({ searchParams }: PageProps) {
                     <p className="mt-1 font-medium text-white">{formatAllowedDirection(item.allowed_direction)}</p>
                   </div>
                   <div className="rounded-2xl border border-white/8 bg-slate-950/35 px-4 py-3">
-                    <p className="text-xs text-slate-400">実行ゲート</p>
+                    <p className="text-xs text-slate-400">計画ゲート目安</p>
                     <p className="mt-1 font-medium text-white">p≥{(effectiveGate * 100).toFixed(0)}% / cost≤{item.max_cost_r?.toFixed?.(2) ?? "-"}</p>
                     <p className="mt-1 text-xs text-slate-400">AI {(item.min_win_prob * 100).toFixed(0)}% {gateAdjustment > 0 ? `+ ${(gateAdjustment * 100).toFixed(0)}pt` : ""}</p>
+                    <p className="mt-1 text-xs leading-5 text-slate-500">{gateAdjustment > 0 ? "手動追加分は必須条件" : "期待値が強ければ自動調整"}</p>
                   </div>
                 </div>
 
@@ -726,6 +728,96 @@ export default async function Home({ searchParams }: PageProps) {
             <StatCard label="シャドー勝率" value={formatPercent(data.shadowAnalysis.shadowWinRate)} sublabel={`合計 ${data.shadowAnalysis.netR >= 0 ? "+" : ""}${data.shadowAnalysis.netR.toFixed(2)}R`} />
             <StatCard label="平均確率" value={`${formatPercent(data.shadowAnalysis.averageRawProb)} → ${formatPercent(data.shadowAnalysis.averageFinalProb)}`} sublabel={`補正直後 ${formatPercent(data.shadowAnalysis.averageCalibratedProb)}`} />
             <StatCard label="確率精度" value={`Brier ${data.shadowAnalysis.rawBrierScore?.toFixed(2) ?? "-"} → ${data.shadowAnalysis.calibratedBrierScore?.toFixed(2) ?? "-"}`} sublabel={`ECE ${data.shadowAnalysis.rawEce?.toFixed(2) ?? "-"} → ${data.shadowAnalysis.calibratedEce?.toFixed(2) ?? "-"}（小さいほど正確）`} />
+          </div>
+
+          <div className="mt-6 border-y border-cyan-300/14 bg-cyan-300/5 py-5">
+            <div className="flex flex-col gap-2 px-1 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <p className="text-xs uppercase tracking-[0.2em] text-cyan-100/70">Opportunity Audit</p>
+                <h3 className="mt-1 text-lg font-semibold text-white">収益機会診断（直近{data.opportunityAnalysis.periodDays}日）</h3>
+              </div>
+              <p className="max-w-2xl text-xs leading-6 text-slate-400">
+                2時間以内の同一銘柄・同方向シグナルを1件にまとめ、新しい期待値ゲートを過去の仮想結果へ当てた参考値です。
+              </p>
+            </div>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <div className="border-l-2 border-cyan-300/40 px-4 py-2">
+                <p className="text-xs text-slate-400">生シグナル → 独立機会</p>
+                <p className="mt-1 text-xl font-semibold text-white">{data.opportunityAnalysis.rawSignalCount} → {data.opportunityAnalysis.independentEpisodeCount}</p>
+              </div>
+              <div className="border-l-2 border-cyan-300/40 px-4 py-2">
+                <p className="text-xs text-slate-400">新ゲート通過候補</p>
+                <p className="mt-1 text-xl font-semibold text-white">{data.opportunityAnalysis.eligibleEpisodeCount} 件</p>
+                <p className="mt-1 text-xs text-slate-500">AI確率の信頼重み {data.opportunityAnalysis.modelReliabilityWeight.toFixed(1)}% / 勝敗分離 {formatPointShift(data.opportunityAnalysis.modelProbabilitySeparation)}</p>
+              </div>
+              <div className="border-l-2 border-emerald-300/40 px-4 py-2">
+                <p className="text-xs text-slate-400">決着済み勝率</p>
+                <p className="mt-1 text-xl font-semibold text-emerald-100">{formatPercent(data.opportunityAnalysis.eligibleWinRate)}</p>
+              </div>
+              <div className="border-l-2 border-amber-300/40 px-4 py-2">
+                <p className="text-xs text-slate-400">決着 {data.opportunityAnalysis.resolvedEligibleCount} 件の合計</p>
+                <p className="mt-1 text-xl font-semibold text-amber-100">{data.opportunityAnalysis.eligibleNetR >= 0 ? "+" : ""}{data.opportunityAnalysis.eligibleNetR.toFixed(2)}R</p>
+              </div>
+            </div>
+
+            <div className="mt-5 grid gap-5 lg:grid-cols-2">
+              <div className="overflow-x-auto border-t border-white/8 lg:col-span-2">
+                <table className="min-w-full text-sm">
+                  <thead className="text-slate-400">
+                    <tr>
+                      <th className="px-2 py-3 text-left font-medium">実行方針の比較</th>
+                      <th className="px-2 py-3 text-right font-medium">候補</th>
+                      <th className="px-2 py-3 text-right font-medium">決着</th>
+                      <th className="px-2 py-3 text-right font-medium">勝率</th>
+                      <th className="px-2 py-3 text-right font-medium">合計R</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/6 text-slate-200">
+                    {data.opportunityAnalysis.policyScenarios.map((row) => (
+                      <tr key={`policy-${row.label}`}>
+                        <td className="px-2 py-2.5">{row.label}</td>
+                        <td className="px-2 py-2.5 text-right">{row.candidateCount}</td>
+                        <td className="px-2 py-2.5 text-right">{row.resolvedCount}</td>
+                        <td className="px-2 py-2.5 text-right">{formatPercent(row.winRate)}</td>
+                        <td className="px-2 py-2.5 text-right">{row.netR >= 0 ? "+" : ""}{row.netR.toFixed(2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {[
+                { title: "補正後勝率帯", rows: data.opportunityAnalysis.probabilityCohorts },
+                { title: "取引コスト帯", rows: data.opportunityAnalysis.costCohorts },
+                { title: "銘柄別", rows: data.opportunityAnalysis.symbolCohorts },
+                { title: "方向別", rows: data.opportunityAnalysis.directionCohorts },
+              ].map((group) => (
+                <div key={group.title} className="overflow-x-auto border-t border-white/8">
+                  <table className="min-w-full text-sm">
+                    <thead className="text-slate-400">
+                      <tr>
+                        <th className="px-2 py-3 text-left font-medium">{group.title}</th>
+                        <th className="px-2 py-3 text-right font-medium">候補</th>
+                        <th className="px-2 py-3 text-right font-medium">決着</th>
+                        <th className="px-2 py-3 text-right font-medium">勝率</th>
+                        <th className="px-2 py-3 text-right font-medium">合計R</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/6 text-slate-200">
+                      {group.rows.map((row) => (
+                        <tr key={`${group.title}-${row.label}`}>
+                          <td className="px-2 py-2.5">{row.label}</td>
+                          <td className="px-2 py-2.5 text-right">{row.candidateCount}</td>
+                          <td className="px-2 py-2.5 text-right">{row.resolvedCount}</td>
+                          <td className="px-2 py-2.5 text-right">{formatPercent(row.winRate)}</td>
+                          <td className="px-2 py-2.5 text-right">{row.netR >= 0 ? "+" : ""}{row.netR.toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ))}
+            </div>
           </div>
 
           <div className="mt-4 flex flex-col gap-2 border-y border-white/8 py-4 text-sm text-slate-200 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">

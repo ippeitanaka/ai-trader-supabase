@@ -6,7 +6,8 @@ let SUPABASE_SERVICE_ROLE_KEY =
   Deno.env.get("SERVICE_ROLE_KEY") ??
   "";
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
-const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") ?? "gpt-4.1-mini";
+const PAIR_SELECTOR_MODEL = Deno.env.get("PAIR_SELECTOR_MODEL") ?? "gpt-5-mini";
+const PAIR_SELECTOR_FALLBACK_MODEL = Deno.env.get("OPENAI_MODEL") ?? "gpt-4.1-mini";
 const FINNHUB_API_KEY = Deno.env.get("FINNHUB_API_KEY") ?? "";
 
 let supabase = createClient(
@@ -112,6 +113,7 @@ interface SymbolStats {
     real: number;
     recent: number;
     virtual: number;
+    virtual_profit?: number;
     market: number;
   };
   compatibility_score: number;
@@ -555,10 +557,10 @@ function eventWindowsForSymbol(symbol: string, marketContext: MarketContext | nu
 }
 
 function planGatesForSymbol(symbol: string, riskLevel: MarketContext["risk_level"] | undefined): { min_win_prob: number; max_cost_r: number } {
-  const baseMin = riskLevel === "high" ? 0.60 : riskLevel === "medium" ? 0.57 : 0.55;
-  const baseCost = riskLevel === "high" ? 0.14 : riskLevel === "medium" ? 0.17 : 0.20;
-  if (symbol === "BTCUSD") return { min_win_prob: baseMin + 0.02, max_cost_r: Math.min(baseCost, 0.16) };
-  if (symbol === "XAUUSD" || symbol === "XAGUSD") return { min_win_prob: baseMin + 0.03, max_cost_r: Math.min(baseCost, 0.15) };
+  const baseMin = riskLevel === "high" ? 0.52 : riskLevel === "medium" ? 0.50 : 0.48;
+  const baseCost = 0.20;
+  if (symbol === "BTCUSD") return { min_win_prob: baseMin + 0.01, max_cost_r: baseCost };
+  if (symbol === "XAUUSD" || symbol === "XAGUSD") return { min_win_prob: baseMin + 0.02, max_cost_r: 0.18 };
   return { min_win_prob: baseMin, max_cost_r: baseCost };
 }
 
@@ -589,8 +591,10 @@ function makePlanSymbol(
     strategy,
     session_windows: rec.session_windows?.length ? rec.session_windows : defaultSessionWindows(rec.symbol, marketContext?.risk_level),
     avoid_event_windows: rec.avoid_event_windows?.length ? rec.avoid_event_windows : eventWindowsForSymbol(rec.symbol, marketContext),
-    min_win_prob: typeof rec.min_win_prob === "number" ? clamp(rec.min_win_prob, 0.45, 0.75) : gates.min_win_prob,
-    max_cost_r: typeof rec.max_cost_r === "number" ? clamp(rec.max_cost_r, 0.05, 0.35) : gates.max_cost_r,
+    min_win_prob: typeof rec.min_win_prob === "number" ? clamp(rec.min_win_prob, 0.45, 0.65) : gates.min_win_prob,
+    max_cost_r: typeof rec.max_cost_r === "number"
+      ? Math.min(clamp(rec.max_cost_r, 0.05, 0.20), gates.max_cost_r)
+      : gates.max_cost_r,
     confidence: rec.confidence ?? scoreToConfidence(stats?.real_trades ?? 0),
     score: Number.isFinite(rec.score) ? Math.round(rec.score) : Math.round(stats?.compatibility_score ?? 50),
     reason: rec.reason || (stats ? makeRecommendationFromStats(stats, noteForSymbol(marketContext, rec.symbol)).reason : "AI selected"),
@@ -1692,10 +1696,11 @@ function buildStats(
     const sampleComponent = clamp(realTrades / 12, 0, 1) * 6;
     const realWinComponent = (realWinRateBayesian - 0.45) * 55;
     const recentComponent = (recent7dWinRateBayesian - realWinRateBayesian) * 35;
-    const virtualComponent = (virtualWinRateBayesian - 0.40) * 35;
+    const virtualComponent = (virtualWinRateBayesian - 0.40) * 55;
+    const virtualProfitComponent = clamp(virtualTotalProfitLoss / 5, -1, 1) * 8;
     const marketComponent = (marketFit.score - 50) * 0.65;
     const compatibilityScore = marketFit.eligible
-      ? clamp(50 + sampleComponent + realWinComponent + recentComponent + virtualComponent + marketComponent, 0, 100)
+      ? clamp(50 + sampleComponent + realWinComponent + recentComponent + virtualComponent + virtualProfitComponent + marketComponent, 0, 100)
       : 0;
 
     return {
@@ -1731,6 +1736,7 @@ function buildStats(
         real: Math.round(realWinComponent * 10) / 10,
         recent: Math.round(recentComponent * 10) / 10,
         virtual: Math.round(virtualComponent * 10) / 10,
+        virtual_profit: Math.round(virtualProfitComponent * 10) / 10,
         market: Math.round(marketComponent * 10) / 10,
       },
       compatibility_score: Math.round(compatibilityScore * 10) / 10,
@@ -1758,6 +1764,50 @@ function applySystemFitToContext(marketContext: MarketContext | null, stats: Sym
   };
 }
 
+async function requestPairSelection(prompt: string): Promise<string | null> {
+  const models = [...new Set([PAIR_SELECTOR_MODEL, PAIR_SELECTOR_FALLBACK_MODEL].filter(Boolean))];
+  for (const model of models) {
+    try {
+      const isReasoningModel = /^gpt-5/i.test(model);
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model,
+          response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "system",
+              content: "市場環境と運用実績から、コスト控除後の期待値が高い銘柄を順位付けする。取引回避を目的化せず、サンプル不足と過信を避けてJSONで返す。",
+            },
+            { role: "user", content: prompt },
+          ],
+          ...(isReasoningModel
+            ? { reasoning_effort: "low", max_completion_tokens: 1600 }
+            : { temperature: 0.1, max_tokens: 1200 }),
+        }),
+      });
+
+      if (!response.ok) {
+        console.error(`[pair-selector] OpenAI ${model} failed: ${response.status} ${await response.text()}`);
+        continue;
+      }
+      const data = await response.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (typeof content === "string" && content.trim()) {
+        console.log(`[pair-selector] Selection model: ${model}`);
+        return content;
+      }
+    } catch (error) {
+      console.error(`[pair-selector] OpenAI ${model} exception:`, error instanceof Error ? error.message : String(error));
+    }
+  }
+  return null;
+}
+
 async function askOpenAi(stats: SymbolStats[], topN: number, cadence: string, timeframe: string, marketContext: MarketContext | null): Promise<AiSelectionResult> {
   if (!OPENAI_API_KEY) {
     return fallbackSelection(stats, topN, timeframe, marketContext);
@@ -1778,6 +1828,10 @@ async function askOpenAi(stats: SymbolStats[], topN: number, cadence: string, ti
 - top ${topN} 件を選ぶ
 - 理由は「現在の市場環境」と「このシステムの直近実績」の両方に触れる
 - 選んだ銘柄ごとに、今日だけ許可する方向・戦略・取引時間帯・避けるイベント・実行ゲートを決める
+- 勝率の最大化ではなく、RR=1.5と取引コストを踏まえた期待値を最大化する
+- 勝率50%前後でもコスト控除後の期待値が正なら候補として残す
+- min_win_probは通常0.48～0.55。根拠なく0.60以上へ引き上げない
+- max_cost_rは直近の独立機会でプラスだった0.20R以下を基本にする
 - allowed_direction は buy/sell/both/none のいずれか。迷うなら both ではなく根拠のある方向へ絞る
 - strategy は trend_follow/pullback/mean_revert/breakout/standby のいずれか
 - 高重要イベントに影響される銘柄は、その前後を avoid_event_windows に入れる
@@ -1792,7 +1846,7 @@ JSONのみで回答:
 {
   "summary": "日本語で、市場環境とシステム適合性を2-3文で要約",
   "selected_pairs": [
-    {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"...","allowed_direction":"buy|sell|both|none","strategy":"trend_follow|pullback|mean_revert|breakout|standby","min_win_prob":0.55,"max_cost_r":0.16}
+    {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"...","allowed_direction":"buy|sell|both|none","strategy":"trend_follow|pullback|mean_revert|breakout|standby","min_win_prob":0.50,"max_cost_r":0.20}
   ],
   "avoided_pairs": [
     {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"..."}
@@ -1806,8 +1860,8 @@ JSONのみで回答:
         "symbol": "X",
         "allowed_direction": "buy|sell|both|none",
         "strategy": "trend_follow|pullback|mean_revert|breakout|standby",
-        "min_win_prob": 0.55,
-        "max_cost_r": 0.16,
+        "min_win_prob": 0.50,
+        "max_cost_r": 0.20,
         "confidence": "high|medium|low",
         "score": 0-100,
         "reason": "日本語で具体的に",
@@ -1823,32 +1877,8 @@ JSONのみで回答:
   }
 }`;
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      temperature: 0.1,
-      max_tokens: 1200,
-      messages: [
-        {
-          role: "system",
-          content: "短期運用の実績データから、今の相場で相性の良い銘柄を選ぶ。過信せず、サンプル数不足には保守的に対応する。",
-        },
-        { role: "user", content: prompt },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    return fallbackSelection(stats, topN, timeframe, marketContext);
-  }
-
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content ?? "";
+  const content = await requestPairSelection(prompt);
+  if (!content) return fallbackSelection(stats, topN, timeframe, marketContext);
   const jsonMatch = typeof content === "string" ? content.match(/\{[\s\S]*\}/) : null;
   if (!jsonMatch) {
     return fallbackSelection(stats, topN, timeframe, marketContext);
@@ -1922,7 +1952,7 @@ async function generateReport(body: any) {
     trade_plan: tradePlan,
     plan_status: "active",
     plan_overrides: {},
-    model: OPENAI_MODEL,
+    model: PAIR_SELECTOR_MODEL,
     triggered_by: triggeredBy,
     status: "active",
   };

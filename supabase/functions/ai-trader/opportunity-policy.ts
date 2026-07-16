@@ -1,0 +1,57 @@
+export type OpportunityOverrideInput = {
+  winProb: number;
+  expectedValueR: number;
+  costR: number;
+  strict?: boolean;
+  minExpectedValueR?: number;
+  maxCostR?: number;
+};
+
+function clampProbability(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+export function resolveOpportunityGate(input: {
+  clientMinWinProb: number;
+  evGateMinWinProb: number;
+  floor: number;
+  gateReduction?: number;
+}): number {
+  const advisoryGate = Math.min(input.clientMinWinProb, input.evGateMinWinProb);
+  return clampProbability(
+    Math.max(input.floor, advisoryGate - (input.gateReduction ?? 0)),
+  );
+}
+
+export function qualifiesForOpportunityOverride(
+  input: OpportunityOverrideInput,
+): boolean {
+  const requiredEv = input.minExpectedValueR ?? (input.strict ? 0.18 : 0.12);
+  const maxCostR = input.maxCostR ?? (input.strict ? 0.18 : 0.20);
+  return input.winProb >= 0.50 &&
+    input.expectedValueR >= requiredEv &&
+    input.costR <= maxCostR;
+}
+
+export function collapseTimedEpisodes<T extends {
+  created_at: string;
+  symbol: string;
+  dir: number | null;
+}>(rows: T[], episodeMinutes = 120): T[] {
+  const sorted = [...rows].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+  const lastEpisodeAt = new Map<string, number>();
+  const episodes: T[] = [];
+  const episodeMs = episodeMinutes * 60 * 1000;
+
+  for (const row of sorted) {
+    const createdAt = Date.parse(row.created_at);
+    if (!Number.isFinite(createdAt)) continue;
+    const key = `${row.symbol}:${row.dir ?? 0}`;
+    const previous = lastEpisodeAt.get(key);
+    if (previous != null && createdAt - previous < episodeMs) continue;
+    lastEpisodeAt.set(key, createdAt);
+    episodes.push(row);
+  }
+
+  return episodes;
+}

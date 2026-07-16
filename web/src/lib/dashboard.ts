@@ -231,6 +231,31 @@ type ShadowAnalysis = {
   recent: AISignalRecord[];
 };
 
+type OpportunityCohort = {
+  label: string;
+  candidateCount: number;
+  resolvedCount: number;
+  winRate: number | null;
+  netR: number;
+};
+
+type OpportunityAnalysis = {
+  periodDays: number;
+  rawSignalCount: number;
+  independentEpisodeCount: number;
+  modelReliabilityWeight: number;
+  modelProbabilitySeparation: number | null;
+  eligibleEpisodeCount: number;
+  resolvedEligibleCount: number;
+  eligibleWinRate: number | null;
+  eligibleNetR: number;
+  policyScenarios: OpportunityCohort[];
+  probabilityCohorts: OpportunityCohort[];
+  costCohorts: OpportunityCohort[];
+  symbolCohorts: OpportunityCohort[];
+  directionCohorts: OpportunityCohort[];
+};
+
 type H1AuditSummary = {
   checkedCount: number;
   wouldBlockCount: number;
@@ -264,6 +289,7 @@ type DashboardData = {
   recentTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
   openTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
   shadowAnalysis: ShadowAnalysis;
+  opportunityAnalysis: OpportunityAnalysis;
   h1Audit: H1AuditSummary;
   selectedPeriod: {
     key: string;
@@ -444,6 +470,190 @@ function summarizeShadowTrades(trades: AISignalRecord[]): ShadowAnalysis {
     rawEce: round2(expectedCalibrationError((trade) => trade.win_prob_raw)),
     calibratedEce: round2(expectedCalibrationError((trade) => trade.win_prob_calibrated)),
     recent: trades.slice(0, 8),
+  };
+}
+
+function parseOpportunityDecision(trade: AISignalRecord) {
+  const summary = trade.decision_summary ?? "";
+  const read = (pattern: RegExp) => {
+    const value = summary.match(pattern)?.[1];
+    const parsed = value == null ? Number.NaN : Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  return {
+    modelWinProb: trade.win_prob_calibrated ?? trade.win_prob_raw ?? read(/\bp=(-?\d+(?:\.\d+)?)/),
+    costR: read(/\bcost=(-?\d+(?:\.\d+)?)\//),
+  };
+}
+
+function collapseOpportunityEpisodes(trades: AISignalRecord[], episodeMinutes = 120) {
+  const sorted = [...trades].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+  const lastEpisodeAt = new Map<string, number>();
+  const episodes: AISignalRecord[] = [];
+  const episodeMs = episodeMinutes * 60 * 1000;
+
+  for (const trade of sorted) {
+    const createdAt = Date.parse(trade.created_at);
+    if (!Number.isFinite(createdAt)) continue;
+    const key = `${trade.symbol}:${trade.dir ?? 0}`;
+    const previous = lastEpisodeAt.get(key);
+    if (previous != null && createdAt - previous < episodeMs) continue;
+    lastEpisodeAt.set(key, createdAt);
+    episodes.push(trade);
+  }
+  return episodes;
+}
+
+function summarizeOpportunityCohort(label: string, trades: AISignalRecord[]): OpportunityCohort {
+  const resolved = trades.filter((trade) => trade.actual_result === "WIN" || trade.actual_result === "LOSS");
+  const wins = resolved.filter((trade) => trade.actual_result === "WIN").length;
+  return {
+    label,
+    candidateCount: trades.length,
+    resolvedCount: resolved.length,
+    winRate: resolved.length > 0 ? round2((wins / resolved.length) * 100) : null,
+    netR: round2(resolved.reduce((sum, trade) => sum + (trade.profit_loss ?? 0), 0)) ?? 0,
+  };
+}
+
+function summarizeOpportunityAnalysis(trades: AISignalRecord[], periodDays = 7): OpportunityAnalysis {
+  const since = Date.now() - periodDays * 24 * 60 * 60 * 1000;
+  const recent = trades.filter((trade) => Date.parse(trade.created_at) >= since);
+  const episodes = collapseOpportunityEpisodes(recent);
+  const hardBlockTokens = [
+    "daily_plan_paused",
+    "daily_plan_symbol_not_selected",
+    "daily_plan_expired",
+    "daily_plan_event_window",
+    "daily_plan_direction_mismatch",
+    "daily_plan_manual_gate",
+    "chart_structure_opposes_entry",
+    "bad_inputs",
+    "emergency_stop",
+  ];
+  const isHardBlocked = (trade: AISignalRecord) => {
+    const diagnostics = `${trade.decision_summary ?? ""}|${trade.shadow_reason ?? ""}`.toLowerCase();
+    return hardBlockTokens.some((token) => diagnostics.includes(token));
+  };
+  const withDecision = episodes.map((trade) => ({ trade, decision: parseOpportunityDecision(trade) }));
+  const resolvedWithProbability = withDecision.filter(({ trade, decision }) =>
+    (trade.actual_result === "WIN" || trade.actual_result === "LOSS") && decision.modelWinProb !== null
+  );
+  const winningProbabilities = resolvedWithProbability
+    .filter(({ trade }) => trade.actual_result === "WIN")
+    .map(({ decision }) => decision.modelWinProb!);
+  const losingProbabilities = resolvedWithProbability
+    .filter(({ trade }) => trade.actual_result === "LOSS")
+    .map(({ decision }) => decision.modelWinProb!);
+  const averageNumber = (values: number[]) =>
+    values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+  const winAverage = averageNumber(winningProbabilities);
+  const lossAverage = averageNumber(losingProbabilities);
+  const probabilitySeparation = winAverage !== null && lossAverage !== null ? winAverage - lossAverage : null;
+  const sampleFactor = Math.max(0, Math.min(1, (resolvedWithProbability.length - 20) / 40));
+  const rankStrength = probabilitySeparation !== null
+    ? Math.max(0, Math.min(1, (probabilitySeparation - 0.01) / 0.09))
+    : 0;
+  const modelReliabilityWeight = sampleFactor * rankStrength;
+  const adaptiveMatches = ({ trade, decision }: typeof withDecision[number]) => {
+    if (isHardBlocked(trade) || decision.modelWinProb === null || decision.costR === null || decision.costR > 0.20) return false;
+    const executionProbability = 0.50 + modelReliabilityWeight * (decision.modelWinProb - 0.50);
+    const expectedValueR = executionProbability * 1.5 - (1 - executionProbability) - decision.costR;
+    const dynamicGate = Math.max(0.48, (1 + decision.costR + 0.05) / 2.5);
+    return executionProbability >= dynamicGate && expectedValueR >= 0.05;
+  };
+  const eligible = withDecision.filter(adaptiveMatches).map(({ trade }) => trade);
+  const resolvedEligible = eligible.filter((trade) => trade.actual_result === "WIN" || trade.actual_result === "LOSS");
+  const eligibleWins = resolvedEligible.filter((trade) => trade.actual_result === "WIN").length;
+  const probabilityCohorts = [
+    { label: "p<48%", min: -Infinity, max: 0.48 },
+    { label: "48-50%", min: 0.48, max: 0.50 },
+    { label: "50-55%", min: 0.50, max: 0.55 },
+    { label: "p≥55%", min: 0.55, max: Infinity },
+  ].map((bucket) => summarizeOpportunityCohort(
+    bucket.label,
+    withDecision
+      .filter(({ decision }) => decision.modelWinProb !== null && decision.modelWinProb >= bucket.min && decision.modelWinProb < bucket.max)
+      .map(({ trade }) => trade),
+  ));
+  const costCohorts = [
+    { label: "cost≤0.15R", min: -Infinity, max: 0.15, inclusive: true },
+    { label: "0.15-0.20R", min: 0.15, max: 0.20 },
+    { label: "0.20-0.25R", min: 0.20, max: 0.25 },
+    { label: "0.25-0.30R", min: 0.25, max: 0.30 },
+    { label: "cost>0.30R", min: 0.30, max: Infinity },
+  ].map((bucket) => summarizeOpportunityCohort(
+    bucket.label,
+    withDecision
+      .filter(({ decision }) => decision.costR !== null &&
+        (bucket.inclusive ? decision.costR <= bucket.max : decision.costR > bucket.min && decision.costR <= bucket.max))
+      .map(({ trade }) => trade),
+  ));
+  const policyScenarios = [
+    {
+      label: "採用: 自動信頼度",
+      matches: adaptiveMatches,
+    },
+    {
+      label: "現行基礎ゲート",
+      matches: ({ trade, decision }: typeof withDecision[number]) =>
+        !isHardBlocked(trade) &&
+        decision.modelWinProb !== null && decision.modelWinProb >= 0.55 &&
+        decision.costR !== null &&
+        decision.modelWinProb * 1.5 - (1 - decision.modelWinProb) - decision.costR >= 0.05 &&
+        decision.costR <= 0.20,
+    },
+    {
+      label: "単純緩和案",
+      matches: ({ trade, decision }: typeof withDecision[number]) =>
+        !isHardBlocked(trade) &&
+        decision.modelWinProb !== null && decision.modelWinProb >= 0.48 &&
+        decision.costR !== null &&
+        decision.modelWinProb * 1.5 - (1 - decision.modelWinProb) - decision.costR >= 0.05 &&
+        decision.costR <= 0.30,
+    },
+    {
+      label: "50%縮約 25%",
+      matches: ({ trade, decision }: typeof withDecision[number]) => {
+        if (isHardBlocked(trade) || decision.modelWinProb === null || decision.costR === null || decision.costR > 0.25) return false;
+        const shrunkProbability = 0.50 + 0.25 * (decision.modelWinProb - 0.50);
+        const expectedValueR = shrunkProbability * 1.5 - (1 - shrunkProbability) - decision.costR;
+        const dynamicGate = Math.max(0.48, (1 + decision.costR + 0.05) / 2.5);
+        return shrunkProbability >= dynamicGate && expectedValueR >= 0.05;
+      },
+    },
+    {
+      label: "コスト≤0.20R参考",
+      matches: ({ trade, decision }: typeof withDecision[number]) =>
+        !isHardBlocked(trade) && decision.costR !== null && decision.costR <= 0.20,
+    },
+  ].map((scenario) => summarizeOpportunityCohort(
+    scenario.label,
+    withDecision.filter(scenario.matches).map(({ trade }) => trade),
+  ));
+  const symbolCohorts = [...new Set(episodes.map((trade) => trade.symbol))]
+    .map((symbol) => summarizeOpportunityCohort(symbol, episodes.filter((trade) => trade.symbol === symbol)))
+    .sort((a, b) => b.netR - a.netR);
+  const directionCohorts = [
+    summarizeOpportunityCohort("BUY", episodes.filter((trade) => trade.dir === 1)),
+    summarizeOpportunityCohort("SELL", episodes.filter((trade) => trade.dir === -1)),
+  ];
+
+  return {
+    periodDays,
+    rawSignalCount: recent.length,
+    independentEpisodeCount: episodes.length,
+    modelReliabilityWeight: round2(modelReliabilityWeight * 100) ?? 0,
+    modelProbabilitySeparation: probabilitySeparation === null ? null : round2(probabilitySeparation * 100),
+    eligibleEpisodeCount: eligible.length,
+    resolvedEligibleCount: resolvedEligible.length,
+    eligibleWinRate: resolvedEligible.length > 0 ? round2((eligibleWins / resolvedEligible.length) * 100) : null,
+    eligibleNetR: round2(resolvedEligible.reduce((sum, trade) => sum + (trade.profit_loss ?? 0), 0)) ?? 0,
+    policyScenarios,
+    probabilityCohorts,
+    costCohorts,
+    symbolCohorts,
+    directionCohorts,
   };
 }
 
@@ -695,6 +905,7 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
     recentTrades: decorateTrades(recentTrades),
     openTrades: decorateTrades(openTrades),
     shadowAnalysis: summarizeShadowTrades(shadowTrades),
+    opportunityAnalysis: summarizeOpportunityAnalysis(shadowTrades),
     h1Audit: summarizeH1Audit(h1AuditTrades),
     selectedPeriod: {
       key: period,
