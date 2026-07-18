@@ -26,6 +26,29 @@ export function isMinuteWithinWindow(current: number, start: number, end: number
   return current >= start || current <= end;
 }
 
+export function finalizeDecisionSummaryText(input: {
+  summary?: string;
+  action: number;
+  suggestedDir?: number;
+  skipReason?: string;
+}): string {
+  const summary = input.summary?.trim() ?? "";
+  const headline = summary.match(/^(実行|見送り)\s+(BUY|SELL|HOLD)/);
+  const direction = input.action > 0
+    ? "BUY"
+    : input.action < 0
+    ? "SELL"
+    : headline?.[2] ?? (input.suggestedDir && input.suggestedDir < 0 ? "SELL" : input.suggestedDir && input.suggestedDir > 0 ? "BUY" : "HOLD");
+  const status = input.action === 0 ? "見送り" : "実行";
+  const normalized = summary
+    ? headline
+      ? summary.replace(/^(実行|見送り)\s+(BUY|SELL|HOLD)/, `${status} ${direction}`)
+      : `${status} ${direction} | ${summary}`
+    : `${status} ${direction}`;
+  if (input.action !== 0 || !input.skipReason || /(?:^|\s\|\s)skip=/.test(normalized)) return normalized;
+  return `${normalized} | skip=${input.skipReason}`;
+}
+
 export function resolveOpportunityGate(input: {
   clientMinWinProb: number;
   evGateMinWinProb: number;

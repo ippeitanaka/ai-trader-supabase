@@ -2,6 +2,7 @@ import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   collapseTimedEpisodes,
+  finalizeDecisionSummaryText,
   isMinuteWithinWindow,
   qualifiesForOpportunityOverride,
   resolveManualProbabilityGate,
@@ -3141,7 +3142,7 @@ serve(async (req: Request) => {
       JSON.stringify({ 
         ok: true, 
         service: "ai-trader with OpenAI + Comprehensive Technical Analysis", 
-        version: "2.12.0-operator-overrides",
+        version: "2.12.1-final-decision-summary",
         mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
         ml_learning_enabled: mlLearningEnabled,
@@ -3167,6 +3168,7 @@ serve(async (req: Request) => {
           "daily_trade_plan_guard",
           "operator_probability_override",
           "operator_jst_session_override",
+          "final_decision_summary",
           "higher_timeframe_context",
           "chart_structure_guard",
           "volatility_cost_context",
@@ -3314,6 +3316,16 @@ serve(async (req: Request) => {
 
       console.warn(`[ai-trader] 🚨 ${stopReason}`);
     }
+
+    response = {
+      ...response,
+      decision_summary: finalizeDecisionSummaryText({
+        summary: response.decision_summary,
+        action: response.action,
+        suggestedDir: response.suggested_dir,
+        skipReason: response.skip_reason,
+      }),
+    };
 
     // Attach market regime classification for logging/analysis.
     // Keep this deterministic so it exists even when OpenAI is unavailable.

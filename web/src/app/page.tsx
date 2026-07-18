@@ -39,6 +39,15 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   streak_guard: "連敗ガードを優先したため",
   daily_plan_manual_gate: "ダッシュボードで指定した追加ゲートを下回ったため",
   daily_plan_manual_session_closed: "ダッシュボードで指定した取引時間外のため",
+  spread_atr_too_high: "スプレッドが現在の値動き幅に対して高すぎるため",
+  volatility_too_compressed: "値動きが小さく、コスト負担が相対的に大きいため",
+  chart_structure_opposes_entry: "チャート構造がエントリー方向と反対のため",
+  near_resistance_without_break: "抵抗帯に近く、上抜けを確認できないため",
+  near_support_without_break: "支持帯に近く、下抜けを確認できないため",
+  long_at_range_extreme: "レンジ上限付近での買いとなるため",
+  short_at_range_extreme: "レンジ下限付近での売りとなるため",
+  breakout_without_volume: "出来高を伴うブレイクを確認できないため",
+  conflict: "売買根拠が競合しているため",
 };
 
 function parseMt5DateTime(value: string) {
@@ -229,12 +238,35 @@ function translateSkipReasons(skip: string | null | undefined) {
     .map((part) => SKIP_REASON_LABELS[part] ?? part.replace(/_/g, " "));
 }
 
+function isFinalEaSkip(log: EALogRecord) {
+  const action = log.action?.trim().toUpperCase();
+  const decision = log.trade_decision?.trim().toUpperCase() ?? "";
+  return action === "HOLD" || decision.startsWith("SKIPPED") || decision === "NO_TRADE";
+}
+
+function normalizedDecisionSummary(log: EALogRecord) {
+  const summary = log.decision_summary?.trim() ?? "";
+  if (!summary || !isFinalEaSkip(log)) return summary;
+  const normalized = summary.replace(/^実行\s+(BUY|SELL|HOLD)/, "見送り $1");
+  if (!log.skip_reason || /(?:^|\s\|\s)skip=/.test(normalized)) return normalized;
+  return `${normalized} | skip=${log.skip_reason}`;
+}
+
+function formatTradeDecision(log: EALogRecord) {
+  if (isFinalEaSkip(log)) return "見送り";
+  if (log.order_ticket) return "約定";
+  return log.trade_decision ?? "-";
+}
+
 function buildEaNarrative(log: EALogRecord) {
-  const parsed = parseDecisionSummary(log.decision_summary);
+  const original = parseDecisionSummary(log.decision_summary);
+  const parsed = parseDecisionSummary(normalizedDecisionSummary(log));
   if (!parsed) return log.decision_summary ?? log.ai_reasoning ?? "要約なし";
 
   const sentences: string[] = [];
-  if (parsed.status === "実行") {
+  if (parsed.status === "見送り" && original?.status === "実行") {
+    sentences.push(`${parsed.direction} 方向の基礎条件は満たしましたが、後段ガードにより最終的にエントリーを見送りました。`);
+  } else if (parsed.status === "実行") {
     sentences.push(`${parsed.direction} 方向の条件が揃ったため、今回はエントリー実行の判断です。`);
   } else if (parsed.status === "見送り") {
     sentences.push(`${parsed.direction} 方向のシグナルはありましたが、今回はエントリーを見送りました。`);
@@ -890,7 +922,7 @@ export default async function Home({ searchParams }: PageProps) {
                     </div>
                     <div className="flex flex-wrap gap-2 text-xs sm:justify-end">
                       <span className="max-w-full rounded-full bg-cyan-300/10 px-3 py-1 text-cyan-100">{formatDirection(log.action)}</span>
-                      <span className="max-w-full rounded-full bg-white/8 px-3 py-1 text-slate-200">{log.trade_decision ?? "-"}</span>
+                      <span className="max-w-full rounded-full bg-white/8 px-3 py-1 text-slate-200">{formatTradeDecision(log)}</span>
                       <span className="max-w-full rounded-full bg-emerald-300/10 px-3 py-1 text-emerald-100">勝率 {formatPercent(log.win_prob != null ? log.win_prob * 100 : null)}</span>
                     </div>
                   </div>
@@ -898,7 +930,7 @@ export default async function Home({ searchParams }: PageProps) {
                   {log.win_prob_raw != null ? <p className="mt-2 text-xs text-cyan-100/80">確率: Raw {formatPercent(log.win_prob_raw * 100)} → 補正後 {formatPercent((log.win_prob_calibrated ?? log.win_prob_raw) * 100)} → 最終 {formatPercent((log.win_prob_final ?? log.win_prob) != null ? (log.win_prob_final ?? log.win_prob)! * 100 : null)} / {log.calibration_method ?? "補正なし"} {log.calibration_scope ? `(${log.calibration_scope}, n=${log.calibration_sample_size ?? "-"})` : ""}</p> : null}
                   {log.plan_effective_min_win_prob != null ? <p className="mt-2 text-xs text-slate-300">実行ゲート: AI {formatPercent((log.plan_base_min_win_prob ?? 0) * 100)} + {((log.plan_gate_adjustment ?? 0) * 100).toFixed(0)}pt = {formatPercent(log.plan_effective_min_win_prob * 100)}</p> : null}
                   {log.h1_shadow_checked ? <p className={`mt-2 text-xs ${log.h1_shadow_would_block ? "text-amber-200" : "text-emerald-200/80"}`}>H1シャドー: {log.h1_shadow_would_block ? "旧判定なら停止（今回は継続）" : "通過"}{log.h1_shadow_reason ? ` / ${log.h1_shadow_reason}` : ""}</p> : null}
-                  {log.decision_summary ? <p className="mt-3 overflow-hidden rounded-2xl border border-white/8 bg-slate-950/45 px-4 py-3 font-mono text-xs leading-6 break-all text-slate-400">診断ログ: {log.decision_summary}</p> : null}
+                  {log.decision_summary ? <p className="mt-3 overflow-hidden rounded-2xl border border-white/8 bg-slate-950/45 px-4 py-3 font-mono text-xs leading-6 break-all text-slate-400">最終診断: {normalizedDecisionSummary(log)}</p> : null}
                   <div className="mt-2 flex flex-col gap-2 text-xs text-slate-400 sm:flex-row sm:flex-wrap sm:gap-3">
                     {log.entry_method ? <span className="break-all">entry: {log.entry_method}</span> : null}
                     {log.skip_reason ? <span className="break-all">skip: {log.skip_reason}</span> : null}

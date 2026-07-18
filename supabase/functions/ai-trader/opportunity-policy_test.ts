@@ -1,5 +1,6 @@
 import {
   collapseTimedEpisodes,
+  finalizeDecisionSummaryText,
   isMinuteWithinWindow,
   qualifiesForOpportunityOverride,
   resolveManualProbabilityGate,
@@ -41,6 +42,17 @@ Deno.test("manual JST window supports ranges that cross midnight", () => {
   assert(isMinuteWithinWindow(23 * 60, start, end), "23:00 JST should be inside the overnight window");
   assert(isMinuteWithinWindow(60, start, end), "01:00 JST should be inside the overnight window");
   assert(!isMinuteWithinWindow(12 * 60, start, end), "12:00 JST should be outside the overnight window");
+});
+
+Deno.test("final decision summary reflects a guard that changed execution to hold", () => {
+  const summary = finalizeDecisionSummaryText({
+    summary: "実行 BUY | p=0.5 | gate=0.493 | chart_block=spread_atr_too_high",
+    action: 0,
+    suggestedDir: 1,
+    skipReason: "spread_atr_too_high",
+  });
+  assert(summary.startsWith("見送り BUY"), `unexpected final headline: ${summary}`);
+  assert(summary.includes("skip=spread_atr_too_high"), "final skip reason should be included");
 });
 
 Deno.test("strong low-cost EV can override soft planning guards", () => {
