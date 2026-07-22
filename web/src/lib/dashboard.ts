@@ -532,6 +532,8 @@ function summarizeOpportunityAnalysis(trades: AISignalRecord[], periodDays = 7):
   const hardBlockTokens = [
     "daily_plan_paused",
     "daily_plan_symbol_not_selected",
+    "daily_plan_symbol_avoided",
+    "daily_plan_symbol_unlisted",
     "daily_plan_expired",
     "daily_plan_event_window",
     "daily_plan_direction_mismatch",

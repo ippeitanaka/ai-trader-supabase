@@ -1,4 +1,5 @@
 import {
+  classifyDailyPlanMembership,
   collapseTimedEpisodes,
   finalizeDecisionSummaryText,
   isMinuteWithinWindow,
@@ -42,6 +43,31 @@ Deno.test("manual JST window supports ranges that cross midnight", () => {
   assert(isMinuteWithinWindow(23 * 60, start, end), "23:00 JST should be inside the overnight window");
   assert(isMinuteWithinWindow(60, start, end), "01:00 JST should be inside the overnight window");
   assert(!isMinuteWithinWindow(12 * 60, start, end), "12:00 JST should be outside the overnight window");
+});
+
+Deno.test("daily plan membership keeps selected pairs highest priority", () => {
+  const membership = classifyDailyPlanMembership(
+    "EURUSD",
+    ["eurusd"],
+    ["EURUSD"],
+    ["EURUSD", "USDJPY"],
+  );
+  assert(membership === "selected", `expected selected, received ${membership}`);
+});
+
+Deno.test("daily plan membership blocks explicitly avoided pairs", () => {
+  const membership = classifyDailyPlanMembership("GBPUSD", ["EURUSD"], ["gbpusd"], ["EURUSD", "GBPUSD"]);
+  assert(membership === "avoided", `expected avoided, received ${membership}`);
+});
+
+Deno.test("daily plan membership permits unselected pairs in the selector universe", () => {
+  const membership = classifyDailyPlanMembership("USDJPY", ["EURUSD"], ["GBPUSD"], ["EURUSD", "GBPUSD", "USDJPY"]);
+  assert(membership === "eligible_unselected", `expected eligible_unselected, received ${membership}`);
+});
+
+Deno.test("daily plan membership blocks symbols outside the selector universe", () => {
+  const membership = classifyDailyPlanMembership("XAUUSD", ["EURUSD"], ["GBPUSD"], ["EURUSD", "GBPUSD", "USDJPY"]);
+  assert(membership === "unlisted", `expected unlisted, received ${membership}`);
 });
 
 Deno.test("final decision summary reflects a guard that changed execution to hold", () => {

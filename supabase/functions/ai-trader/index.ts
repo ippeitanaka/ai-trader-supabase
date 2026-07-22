@@ -1,12 +1,14 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
+  classifyDailyPlanMembership,
   collapseTimedEpisodes,
   finalizeDecisionSummaryText,
   isMinuteWithinWindow,
   qualifiesForOpportunityOverride,
   resolveManualProbabilityGate,
   resolveOpportunityGate,
+  type DailyPlanMembership,
 } from "./opportunity-policy.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -611,6 +613,8 @@ type DailyPlanContext = {
   report_id: number | null;
   generated_at?: string | null;
   plan_status: "active" | "paused" | "unknown";
+  membership: DailyPlanMembership;
+  avoid_reason?: string | null;
   summary?: string | null;
   risk_level?: "low" | "medium" | "high";
   market_themes?: string[];
@@ -973,12 +977,17 @@ function resolvePlanGateAdjustment(plan: DailyPlanContext, symbol: string): {
 function resolveManualExecutionGate(
   plan: DailyPlanContext | null,
   symbol: string,
+  fallbackBaseGate?: number,
 ): { gate: number; adjustment: GateAdjustment; mode: PlanGateMode } | null {
-  if (!plan || typeof plan.item?.min_win_prob !== "number") return null;
+  if (!plan) return null;
   const override = resolvePlanGateAdjustment(plan, symbol);
   if (!override.manual) return null;
+  const baseGate = typeof plan.item?.min_win_prob === "number"
+    ? plan.item.min_win_prob
+    : fallbackBaseGate;
+  if (typeof baseGate !== "number") return null;
   return {
-    gate: resolveManualProbabilityGate(plan.item.min_win_prob, override.adjustment),
+    gate: resolveManualProbabilityGate(baseGate, override.adjustment),
     adjustment: override.adjustment,
     mode: override.mode,
   };
@@ -1029,7 +1038,7 @@ function htfOpposesDirection(req: TradeRequest, dir: number): boolean {
 async function fetchDailyPlanContext(req: TradeRequest): Promise<DailyPlanContext | null> {
   let primary: any = await supabase
     .from("pair_selection_reports")
-    .select("id, generated_at, timeframe, selected_pairs, summary, trade_plan, plan_overrides, plan_status")
+    .select("id, generated_at, timeframe, universe, selected_pairs, avoided_pairs, summary, trade_plan, plan_overrides, plan_status")
     .eq("status", "active")
     .order("created_at", { ascending: false })
     .limit(5);
@@ -1037,7 +1046,7 @@ async function fetchDailyPlanContext(req: TradeRequest): Promise<DailyPlanContex
   if (primary.error && /trade_plan|plan_status|plan_overrides|column/i.test(String(primary.error.message ?? ""))) {
     primary = await supabase
       .from("pair_selection_reports")
-      .select("id, generated_at, timeframe, selected_pairs, summary")
+      .select("id, generated_at, timeframe, universe, selected_pairs, avoided_pairs, summary")
       .eq("status", "active")
       .order("created_at", { ascending: false })
       .limit(5);
@@ -1048,10 +1057,28 @@ async function fetchDailyPlanContext(req: TradeRequest): Promise<DailyPlanContex
   const report = (primary.data.find((row: any) => row?.timeframe === req.timeframe) ?? primary.data[0]) as any;
   const plan = report?.trade_plan && typeof report.trade_plan === "object" ? report.trade_plan : null;
   const selectedPairs = Array.isArray(report?.selected_pairs) ? report.selected_pairs : [];
+  const avoidedPairs = Array.isArray(report?.avoided_pairs) ? report.avoided_pairs : [];
+  const universe = Array.isArray(report?.universe) ? report.universe : [];
   const planSymbols = Array.isArray(plan?.symbols) ? plan.symbols : [];
   const item = [...planSymbols, ...selectedPairs].find((row: any) => {
     return typeof row?.symbol === "string" && row.symbol.toUpperCase() === req.symbol.toUpperCase();
   }) ?? null;
+  const extractSymbols = (values: unknown[]) => values.flatMap((value: unknown) => {
+    if (typeof value === "string") return [value];
+    if (value && typeof value === "object" && typeof (value as { symbol?: unknown }).symbol === "string") {
+      return [(value as { symbol: string }).symbol];
+    }
+    return [];
+  });
+  const avoidedItem = avoidedPairs.find((row: any) => {
+    return typeof row?.symbol === "string" && row.symbol.toUpperCase() === req.symbol.toUpperCase();
+  }) ?? null;
+  const membership = classifyDailyPlanMembership(
+    req.symbol,
+    extractSymbols([...planSymbols, ...selectedPairs]),
+    extractSymbols(avoidedPairs),
+    extractSymbols(universe),
+  );
   const overrides = report?.plan_overrides && typeof report.plan_overrides === "object" ? report.plan_overrides : {};
   const overrideStatus = typeof (overrides as any).status === "string" ? String((overrides as any).status) : "";
   const planStatus = overrideStatus === "paused" || report?.plan_status === "paused" ? "paused" : "active";
@@ -1060,6 +1087,8 @@ async function fetchDailyPlanContext(req: TradeRequest): Promise<DailyPlanContex
     report_id: typeof report?.id === "number" ? report.id : Number(report?.id ?? null) || null,
     generated_at: typeof report?.generated_at === "string" ? report.generated_at : null,
     plan_status: planStatus,
+    membership,
+    avoid_reason: typeof avoidedItem?.reason === "string" ? avoidedItem.reason : null,
     summary: typeof plan?.summary === "string" ? plan.summary : (typeof report?.summary === "string" ? report.summary : null),
     risk_level: plan?.risk_level === "low" || plan?.risk_level === "medium" || plan?.risk_level === "high" ? plan.risk_level : undefined,
     market_themes: Array.isArray(plan?.market_themes) ? plan.market_themes.filter((v: unknown) => typeof v === "string").slice(0, 5) : [],
@@ -1077,7 +1106,7 @@ function buildDailyPlanPrompt(plan: DailyPlanContext | null, req: TradeRequest):
   if (!plan) {
     return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n最新の日次計画は取得できませんでした。EAの上位足/セッション/構造情報を通常の判断補助として使ってください。\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}`;
   }
-  return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• report_id=${plan.report_id ?? "N/A"} status=${plan.plan_status} risk=${plan.risk_level ?? "unknown"}\n• summary=${plan.summary ?? "N/A"}\n• themes=${(plan.market_themes ?? []).join(" / ") || "N/A"}\n• symbol_plan=${JSON.stringify(plan.item ?? null)}\n• manual_overrides=${JSON.stringify(plan.plan_overrides ?? {})}\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}\n\nこの日次計画に反する方向・時間帯・イベント直前直後・上位足逆行・節目直前・異常コストのエントリーは、勝率を保守的に見積もってください。ダッシュボードの手動設定はAI推奨より優先してください。`;
+  return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• report_id=${plan.report_id ?? "N/A"} status=${plan.plan_status} risk=${plan.risk_level ?? "unknown"}\n• symbol_membership=${plan.membership}\n• avoid_reason=${plan.avoid_reason ?? "N/A"}\n• summary=${plan.summary ?? "N/A"}\n• themes=${(plan.market_themes ?? []).join(" / ") || "N/A"}\n• symbol_plan=${JSON.stringify(plan.item ?? null)}\n• manual_overrides=${JSON.stringify(plan.plan_overrides ?? {})}\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}\n\nselected は日次計画の方向・時間帯・個別ゲートを適用します。eligible_unselected は通常の勝率・期待値・コスト・チャート・イベント条件を満たせば取引可能です。avoided と unlisted は取引禁止です。日次計画に反する方向・時間帯・イベント直前直後・上位足逆行・節目直前・異常コストのエントリーは、勝率を保守的に見積もってください。ダッシュボードの手動設定はAI推奨より優先してください。`;
 }
 
 function contextNumber(source: Record<string, number | string | null> | undefined, key: string): number | null {
@@ -1195,7 +1224,15 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
   const hardReasons: string[] = [];
   const softReasons: string[] = [];
   let eventRisk = "none";
-  let alignment = response.plan_alignment ?? (item ? "aligned" : "symbol_not_in_daily_plan");
+  let alignment = response.plan_alignment ?? (
+    plan.membership === "selected"
+      ? "aligned"
+      : plan.membership === "eligible_unselected"
+      ? "eligible_unselected"
+      : plan.membership === "avoided"
+      ? "symbol_avoided"
+      : "symbol_unlisted"
+  );
   const gateOverride = resolvePlanGateAdjustment(plan, tradeReq.symbol);
   const sessionOverride = resolvePlanSessionOverride(plan, tradeReq.symbol);
   const planBaseGate = typeof item?.min_win_prob === "number" ? clampWinProb(item.min_win_prob) : null;
@@ -1204,7 +1241,8 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
     : resolveManualProbabilityGate(planBaseGate, gateOverride.adjustment);
 
   if (plan.plan_status === "paused") hardReasons.push("daily_plan_paused");
-  if (!item) hardReasons.push("daily_plan_symbol_not_selected");
+  if (plan.membership === "avoided") hardReasons.push("daily_plan_symbol_avoided");
+  if (plan.membership === "unlisted") hardReasons.push("daily_plan_symbol_unlisted");
 
   const expiresAt = (item as any)?.expires_at ?? (plan as any)?.expires_at;
   if (typeof expiresAt === "string") {
@@ -1263,7 +1301,7 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
 
   const planTag =
     `DAILY_PLAN(id=${plan.report_id ?? "na"} status=${plan.plan_status}` +
-    ` align=${alignment} event=${eventRisk}` +
+    ` membership=${plan.membership} align=${alignment} event=${eventRisk}` +
     `${item?.allowed_direction ? ` dir=${item.allowed_direction}` : ""}` +
     `${item?.strategy ? ` strategy=${item.strategy}` : ""}` +
     `${sessionOverride ? ` session=${sessionOverride.mode}_jst` : " session=ai"}` +
@@ -1690,7 +1728,7 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     floor: minWinProbFloor,
     gateReduction: rsiMrBonus.gateReduction,
   });
-  const manualGate = resolveManualExecutionGate(dailyPlanContext, req.symbol);
+  const manualGate = resolveManualExecutionGate(dailyPlanContext, req.symbol, adaptiveGate);
   const effective_gate = manualGate?.gate ?? adaptiveGate;
 
   const expected_value_r = computeExpectedValueR(winProbFinal, rt.rewardRR, rt.costR);
@@ -2888,7 +2926,7 @@ ${candleBarsSummary}
       floor: minWinProbFloor,
       gateReduction: rsiMrBonus.gateReduction,
     });
-    const manualGate = resolveManualExecutionGate(dailyPlanContext, req.symbol);
+    const manualGate = resolveManualExecutionGate(dailyPlanContext, req.symbol, adaptiveGate);
     const effective_gate = manualGate?.gate ?? adaptiveGate;
 
     const expected_value_r = computeExpectedValueR(win_prob, rt.rewardRR, rt.costR);
@@ -3004,7 +3042,7 @@ ${candleBarsSummary}
       },
       win_prob_calibration: cal.debug,
       trade_plan_id: dailyPlanContext?.report_id ?? null,
-      plan_alignment: dailyPlanContext?.item ? "model_context" : "no_symbol_plan",
+      plan_alignment: dailyPlanContext?.item ? "model_context" : (dailyPlanContext?.membership ?? "no_daily_plan"),
       event_risk: activeEventWindow(dailyPlanContext?.item) ? "high" : "none",
       daily_plan: dailyPlanContext,
     } as any;
@@ -3142,7 +3180,7 @@ serve(async (req: Request) => {
       JSON.stringify({ 
         ok: true, 
         service: "ai-trader with OpenAI + Comprehensive Technical Analysis", 
-        version: "2.12.1-final-decision-summary",
+        version: "2.13.0-eligible-unselected-pairs",
         mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
         ml_learning_enabled: mlLearningEnabled,
@@ -3166,6 +3204,7 @@ serve(async (req: Request) => {
           "atr",
           "ichimoku_full",
           "daily_trade_plan_guard",
+          "eligible_unselected_pair_execution",
           "operator_probability_override",
           "operator_jst_session_override",
           "final_decision_summary",

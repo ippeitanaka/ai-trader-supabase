@@ -39,6 +39,9 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   streak_guard: "連敗ガードを優先したため",
   daily_plan_manual_gate: "ダッシュボードで指定した追加ゲートを下回ったため",
   daily_plan_manual_session_closed: "ダッシュボードで指定した取引時間外のため",
+  daily_plan_symbol_avoided: "本日の非推奨ペアに指定されているため",
+  daily_plan_symbol_unlisted: "AI判定対象外の銘柄であるため",
+  daily_plan_symbol_not_selected: "旧ルールで本日の推奨ペア外だったため",
   spread_atr_too_high: "スプレッドが現在の値動き幅に対して高すぎるため",
   volatility_too_compressed: "値動きが小さく、コスト負担が相対的に大きいため",
   chart_structure_opposes_entry: "チャート構造がエントリー方向と反対のため",
@@ -729,7 +732,7 @@ export default async function Home({ searchParams }: PageProps) {
 
         <section className="mt-8 grid gap-5 xl:grid-cols-2">
           <article className="surface-panel rounded-[28px] p-6 backdrop-blur">
-            <SectionTitle title="本日の推奨ペア" description="リアルタイム更新の推奨・非推奨リスト" />
+            <SectionTitle title="本日の推奨ペア" description="日次計画を優先適用" />
             <div className="grid gap-4 md:grid-cols-2">
               {(latest?.recommended_pairs ?? []).slice(0, 4).map((pair) => (
                 <div key={`rec-${pair.symbol}`} className="rounded-3xl border border-emerald-400/18 bg-emerald-400/8 p-4">
@@ -769,6 +772,31 @@ export default async function Home({ searchParams }: PageProps) {
                   {pair.caution ? <p className="mt-2 text-xs text-amber-200/80">注意: {pair.caution}</p> : null}
                 </div>
               ))}
+            </div>
+          </article>
+
+          <article className="surface-panel rounded-[28px] p-6 backdrop-blur xl:col-span-2">
+            <SectionTitle title="本日の条件付き許可ペア" description="推奨外・回避外 / 通常ガード適用" />
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              {(latest?.neutral_pairs ?? []).slice(0, 8).map((pair) => (
+                <div key={`neutral-${pair.symbol}`} className="rounded-3xl border border-cyan-300/16 bg-cyan-300/6 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-lg font-semibold text-white">{pair.symbol}</p>
+                      <p className="text-xs uppercase tracking-[0.18em] text-cyan-100/70">条件付き許可</p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-2xl font-semibold text-cyan-50">{pair.score}</p>
+                      <p className="text-xs text-slate-300">{pair.confidence}</p>
+                    </div>
+                  </div>
+                  <p className="mt-3 text-sm leading-7 text-slate-200">{pair.reason}</p>
+                  {pair.caution ? <p className="mt-2 text-xs text-amber-200/80">注意: {pair.caution}</p> : null}
+                </div>
+              ))}
+              {(latest?.neutral_pairs?.length ?? 0) === 0 ? (
+                <p className="text-sm text-slate-400">本日の条件付き許可ペアはありません。</p>
+              ) : null}
             </div>
           </article>
         </section>

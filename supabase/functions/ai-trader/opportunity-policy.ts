@@ -7,6 +7,23 @@ export type OpportunityOverrideInput = {
   maxCostR?: number;
 };
 
+export type DailyPlanMembership = "selected" | "eligible_unselected" | "avoided" | "unlisted";
+
+export function classifyDailyPlanMembership(
+  symbol: string,
+  selectedSymbols: string[],
+  avoidedSymbols: string[],
+  universe: string[],
+): DailyPlanMembership {
+  const key = symbol.trim().toUpperCase();
+  const includes = (symbols: string[]) => symbols.some((candidate) => candidate.trim().toUpperCase() === key);
+
+  if (includes(selectedSymbols)) return "selected";
+  if (includes(avoidedSymbols)) return "avoided";
+  if (includes(universe)) return "eligible_unselected";
+  return "unlisted";
+}
+
 function clampProbability(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
