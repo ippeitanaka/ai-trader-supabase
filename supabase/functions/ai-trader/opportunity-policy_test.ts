@@ -4,6 +4,7 @@ import {
   finalizeDecisionSummaryText,
   isMinuteWithinWindow,
   qualifiesForOpportunityOverride,
+  resolveDetailedFinalProbability,
   resolveManualProbabilityGate,
   resolveOpportunityGate,
 } from "./opportunity-policy.ts";
@@ -29,6 +30,11 @@ Deno.test("opportunity gate keeps an absolute probability floor", () => {
     floor: 0.48,
   });
   assert(gate === 0.48, `expected 0.48 floor, received ${gate}`);
+});
+
+Deno.test("detailed final probability preserves calibrated variation around 50 percent", () => {
+  assert(resolveDetailedFinalProbability(0.537) === 0.537, "53.7% must not be collapsed to 50%");
+  assert(resolveDetailedFinalProbability(0.482) === 0.482, "48.2% must remain distinguishable from 50%");
 });
 
 Deno.test("manual probability adjustment can lower or raise the final plan gate", () => {

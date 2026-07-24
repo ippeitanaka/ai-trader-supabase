@@ -193,6 +193,7 @@ type AISignalRecord = {
   calibration_scope?: string | null;
   calibration_sample_size?: number | null;
   calibration_shift?: number | null;
+  probability_adjustments?: Record<string, unknown> | null;
   h1_shadow_checked?: boolean | null;
   h1_shadow_would_block?: boolean | null;
   h1_shadow_reason?: string | null;
@@ -489,8 +490,16 @@ function parseOpportunityDecision(trade: AISignalRecord) {
     const parsed = value == null ? Number.NaN : Number(value);
     return Number.isFinite(parsed) ? parsed : null;
   };
+  const calibratedProbability = trade.win_prob_calibrated ?? trade.win_prob_raw ?? read(/\bp=(-?\d+(?:\.\d+)?)/);
+  const adjustments = trade.probability_adjustments ?? {};
+  const adjustmentTotal = ["extreme_rsi", "rsi_mean_reversion", "recent_performance", "loss_streak"]
+    .map((key) => adjustments[key])
+    .reduce<number>((sum, value) => sum + (typeof value === "number" && Number.isFinite(value) ? value : 0), 0);
+  const finalProbability = calibratedProbability === null
+    ? null
+    : Math.max(0, Math.min(1, calibratedProbability + adjustmentTotal));
   return {
-    modelWinProb: trade.win_prob_calibrated ?? trade.win_prob_raw ?? read(/\bp=(-?\d+(?:\.\d+)?)/),
+    modelWinProb: finalProbability,
     costR: read(/\bcost=(-?\d+(?:\.\d+)?)\//),
   };
 }
@@ -568,7 +577,7 @@ function summarizeOpportunityAnalysis(trades: AISignalRecord[], periodDays = 7):
   const modelReliabilityWeight = sampleFactor * rankStrength;
   const adaptiveMatches = ({ trade, decision }: typeof withDecision[number]) => {
     if (isHardBlocked(trade) || decision.modelWinProb === null || decision.costR === null || decision.costR > 0.20) return false;
-    const executionProbability = 0.50 + modelReliabilityWeight * (decision.modelWinProb - 0.50);
+    const executionProbability = decision.modelWinProb;
     const expectedValueR = executionProbability * 1.5 - (1 - executionProbability) - decision.costR;
     const dynamicGate = Math.max(0.48, (1 + decision.costR + 0.05) / 2.5);
     return executionProbability >= dynamicGate && expectedValueR >= 0.05;
@@ -602,7 +611,7 @@ function summarizeOpportunityAnalysis(trades: AISignalRecord[], periodDays = 7):
   ));
   const policyScenarios = [
     {
-      label: "採用: 自動信頼度",
+      label: "採用: 補正後確率",
       matches: adaptiveMatches,
     },
     {
@@ -809,7 +818,7 @@ async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
 
 async function fetchShadowTrades(): Promise<AISignalRecord[]> {
   const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session,shadow_reason,mfe_r,mae_r",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,probability_adjustments,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session,shadow_reason,mfe_r,mae_r",
     is_virtual: "eq.true",
     reverse_execution: "eq.false",
     created_at: `gte.${toIsoDaysAgo(30)}`,

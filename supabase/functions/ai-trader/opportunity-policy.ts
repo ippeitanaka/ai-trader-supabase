@@ -28,6 +28,10 @@ function clampProbability(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
 
+export function resolveDetailedFinalProbability(adjustedProbability: number): number {
+  return clampProbability(adjustedProbability);
+}
+
 export function resolveManualProbabilityGate(
   baseGate: number,
   adjustment: number,

@@ -831,7 +831,7 @@ export default async function Home({ searchParams }: PageProps) {
               <div className="border-l-2 border-cyan-300/40 px-4 py-2">
                 <p className="text-xs text-slate-400">新ゲート通過候補</p>
                 <p className="mt-1 text-xl font-semibold text-white">{data.opportunityAnalysis.eligibleEpisodeCount} 件</p>
-                <p className="mt-1 text-xs text-slate-500">AI確率の信頼重み {data.opportunityAnalysis.modelReliabilityWeight.toFixed(1)}% / 勝敗分離 {formatPointShift(data.opportunityAnalysis.modelProbabilitySeparation)}</p>
+                <p className="mt-1 text-xs text-slate-500">参考信頼度 {data.opportunityAnalysis.modelReliabilityWeight.toFixed(1)}%（実行確率には未適用） / 勝敗分離 {formatPointShift(data.opportunityAnalysis.modelProbabilitySeparation)}</p>
               </div>
               <div className="border-l-2 border-emerald-300/40 px-4 py-2">
                 <p className="text-xs text-slate-400">決着済み勝率</p>

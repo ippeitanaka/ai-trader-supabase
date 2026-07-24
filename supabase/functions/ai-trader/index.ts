@@ -6,6 +6,7 @@ import {
   finalizeDecisionSummaryText,
   isMinuteWithinWindow,
   qualifiesForOpportunityOverride,
+  resolveDetailedFinalProbability,
   resolveManualProbabilityGate,
   resolveOpportunityGate,
   type DailyPlanMembership,
@@ -568,10 +569,6 @@ async function getExecutionModelHealth(timeframe: string): Promise<ExecutionMode
   };
   executionModelHealthCache.set(timeframe, { expiresAt: Date.now() + 15 * 60 * 1000, health });
   return health;
-}
-
-function shrinkProbabilityToNeutral(modelProbability: number, modelWeight: number): number {
-  return clampWinProb(0.50 + Math.max(0, Math.min(1, modelWeight)) * (modelProbability - 0.50));
 }
 
 type HigherTimeframeSnapshot = {
@@ -1720,7 +1717,7 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     : await applyStreakGuard(req, dir, afterRecentPerf);
   const modelWinProb = streakResult.winProb;
   const modelHealth = await getExecutionModelHealth(req.timeframe);
-  const winProbFinal = shrinkProbabilityToNeutral(modelWinProb, modelHealth.weight);
+  const winProbFinal = resolveDetailedFinalProbability(modelWinProb);
 
   const adaptiveGate = resolveOpportunityGate({
     clientMinWinProb: client_min_win_prob,
@@ -1771,8 +1768,8 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
   const recentPerfTag = recentPerfResult.guardTag;
   const streakTag = streakResult.guardTag;
   const reliabilityTag =
-    `MODEL_RELIABILITY(weight=${round3(modelHealth.weight)} n=${modelHealth.episodes} ` +
-    `sep=${modelHealth.separation ?? "na"} modelP=${round3(modelWinProb)}=>execP=${round3(winProbFinal)})`;
+    `MODEL_DIAGNOSTIC(weight=${round3(modelHealth.weight)} n=${modelHealth.episodes} ` +
+    `sep=${modelHealth.separation ?? "na"} applied=0 finalP=${round3(winProbFinal)})`;
 
   const baseReasoning = typeof base.reasoning === "string" ? base.reasoning.trim() : "";
   const tags = [gateTag, calTag, reliabilityTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
@@ -1821,7 +1818,8 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
       recent_performance: round3(afterRecentPerf - afterRsiMr),
       loss_streak: round3(modelWinProb - afterRecentPerf),
       execution_model_weight: round3(modelHealth.weight),
-      execution_reliability: round3(winProbFinal - modelWinProb),
+      execution_reliability: 0,
+      execution_reliability_applied: false,
       total_post_calibration: round3(winProbFinal - calibrated),
     },
     win_prob_calibration: debug,
@@ -2918,7 +2916,7 @@ ${candleBarsSummary}
       : await applyStreakGuard(req, dir, win_prob);
     const model_win_prob = streakResult.winProb;
     const modelHealth = await getExecutionModelHealth(req.timeframe);
-    win_prob = shrinkProbabilityToNeutral(model_win_prob, modelHealth.weight);
+    win_prob = resolveDetailedFinalProbability(model_win_prob);
 
     const adaptiveGate = resolveOpportunityGate({
       clientMinWinProb: client_min_win_prob,
@@ -2956,8 +2954,8 @@ ${candleBarsSummary}
     const recentPerfTag = recentPerfResult.guardTag;
     const streakTag = streakResult.guardTag;
     const reliabilityTag =
-      `MODEL_RELIABILITY(weight=${round3(modelHealth.weight)} n=${modelHealth.episodes} ` +
-      `sep=${modelHealth.separation ?? "na"} modelP=${round3(model_win_prob)}=>execP=${round3(win_prob)})`;
+      `MODEL_DIAGNOSTIC(weight=${round3(modelHealth.weight)} n=${modelHealth.episodes} ` +
+      `sep=${modelHealth.separation ?? "na"} applied=0 finalP=${round3(win_prob)})`;
 
     const tags = [gateTag, calTag, reliabilityTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
 
@@ -3037,7 +3035,8 @@ ${candleBarsSummary}
         recent_performance: round3(recentPerfResult.winProb - rsiMrBonus.winProb),
         loss_streak: round3(streakResult.winProb - recentPerfResult.winProb),
         execution_model_weight: round3(modelHealth.weight),
-        execution_reliability: round3(win_prob - model_win_prob),
+        execution_reliability: 0,
+        execution_reliability_applied: false,
         total_post_calibration: round3(win_prob - cal.winProb),
       },
       win_prob_calibration: cal.debug,
@@ -3180,7 +3179,7 @@ serve(async (req: Request) => {
       JSON.stringify({ 
         ok: true, 
         service: "ai-trader with OpenAI + Comprehensive Technical Analysis", 
-        version: "2.13.0-eligible-unselected-pairs",
+        version: "2.14.0-detailed-win-probability",
         mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
         ml_learning_enabled: mlLearningEnabled,
@@ -3208,6 +3207,7 @@ serve(async (req: Request) => {
           "operator_probability_override",
           "operator_jst_session_override",
           "final_decision_summary",
+          "detailed_final_probability",
           "higher_timeframe_context",
           "chart_structure_guard",
           "volatility_cost_context",
