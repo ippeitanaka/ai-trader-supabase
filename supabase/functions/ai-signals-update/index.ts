@@ -172,6 +172,10 @@ interface SignalUpdateRequest {
   order_ticket: number | string;
   entry_price?: number;
   actual_result?: string;
+  mt5_position_id?: number | string;
+  mt5_position_ticket?: number | string;
+  entry_deal_ticket?: number | string;
+  tracking_version?: string;
   symbol?: string;
   timeframe?: string;
   dir?: number;
@@ -264,6 +268,14 @@ serve(async (req: Request) => {
     if (body.actual_result) {
       updateData.actual_result = body.actual_result;
     }
+
+    const mt5PositionId = parseOrderTicket(body.mt5_position_id);
+    const mt5PositionTicket = parseOrderTicket(body.mt5_position_ticket);
+    const entryDealTicket = parseOrderTicket(body.entry_deal_ticket);
+    if (mt5PositionId) updateData.mt5_position_id = mt5PositionId;
+    if (mt5PositionTicket) updateData.mt5_position_ticket = mt5PositionTicket;
+    if (entryDealTicket) updateData.entry_deal_ticket = entryDealTicket;
+    if (safeText(body.tracking_version)) updateData.tracking_version = safeText(body.tracking_version);
     
     // フィールドが何もない場合
     if (Object.keys(updateData).length === 0) {
@@ -314,6 +326,10 @@ serve(async (req: Request) => {
         dir: body.dir === 1 || body.dir === -1 ? body.dir : null,
         price: body.entry_price ?? null,
         entry_price: body.entry_price ?? null,
+        mt5_position_id: mt5PositionId,
+        mt5_position_ticket: mt5PositionTicket,
+        entry_deal_ticket: entryDealTicket,
+        tracking_version: safeText(body.tracking_version),
         reason: safeText(body.reason) ?? "rehydrated_existing_position",
         instance: safeText(body.instance),
         model_version: safeText(body.model_version),

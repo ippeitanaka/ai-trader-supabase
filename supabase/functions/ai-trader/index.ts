@@ -133,7 +133,9 @@ async function applyRecentPerfGuard(
     .limit(lookback);
 
   if (!includeVirtualInPerfGuards()) {
-    q = q.eq("is_virtual", false);
+    q = q
+      .eq("is_virtual", false)
+      .or("result_consistent.is.null,result_consistent.eq.true");
   }
 
   const { data, error } = await q;
@@ -217,7 +219,9 @@ async function applyStreakGuard(
     .limit(lookback);
 
   if (!includeVirtualInPerfGuards()) {
-    q = q.eq("is_virtual", false);
+    q = q
+      .eq("is_virtual", false)
+      .or("result_consistent.is.null,result_consistent.eq.true");
   }
 
   const { data, error } = await q;
@@ -320,7 +324,9 @@ async function fetchCalibrationRows(
   // By default use only real trades for calibration to avoid virtual-mode bias.
   // Set AI_TRADER_CALIBRATION_INCLUDE_VIRTUAL=on when virtual trades dominate.
   if (!includeVirtual) {
-    q = q.eq("is_virtual", false);
+    q = q
+      .eq("is_virtual", false)
+      .or("result_consistent.is.null,result_consistent.eq.true");
   }
 
   if (scope === "symbol_tf_dir") {
@@ -2318,7 +2324,8 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
     .select("*", { count: "exact", head: true })
     .in("actual_result", ["WIN", "LOSS"])
     .eq("reverse_execution", false)
-    .eq("is_virtual", false);
+    .eq("is_virtual", false)
+    .or("result_consistent.is.null,result_consistent.eq.true");
   
   const totalCompletedTrades = completedTradesCount || 0;
   console.log(`[AI] 📊 Total completed trades: ${totalCompletedTrades}`);
@@ -2408,6 +2415,7 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
       .in("actual_result", ["WIN", "LOSS"])
       .eq("reverse_execution", false)
       .eq("is_virtual", false)
+      .or("result_consistent.is.null,result_consistent.eq.true")
       .order("created_at", { ascending: false })
       .limit(30);
     historicalTrades = trades || [];
@@ -3164,7 +3172,8 @@ serve(async (req: Request) => {
       .select("*", { count: "exact", head: true })
       .in("actual_result", ["WIN", "LOSS"])
       .eq("reverse_execution", false)
-      .eq("is_virtual", false);
+      .eq("is_virtual", false)
+      .or("result_consistent.is.null,result_consistent.eq.true");
     const totalCompletedTrades = completedTradesCount || 0;
     const learningPhase = totalCompletedTrades < 80
       ? "PHASE1_TECHNICAL"

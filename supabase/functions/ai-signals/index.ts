@@ -394,6 +394,10 @@ interface AISignalEntry {
   
   // 注文情報
   order_ticket?: number | string;
+  mt5_position_id?: number | string;
+  mt5_position_ticket?: number | string;
+  entry_deal_ticket?: number | string;
+  exit_deal_ticket?: number | string;
   entry_price?: number;
   
   // 結果情報（後で更新）
@@ -405,6 +409,12 @@ interface AISignalEntry {
   cancelled_reason?: string;
   sl_hit?: boolean;
   tp_hit?: boolean;
+  realized_commission?: number;
+  realized_swap?: number;
+  realized_fee?: number;
+  result_consistent?: boolean;
+  result_quality_reason?: string | null;
+  tracking_version?: string;
 }
 
 function safeText(value: unknown): string | null {
@@ -663,6 +673,10 @@ serve(async (req: Request) => {
 
       const requestedActualResult = normalizeActualResult(body.actual_result) ?? "PENDING";
       const orderTicket = parseOrderTicket(body.order_ticket);
+      const mt5PositionId = parseOrderTicket(body.mt5_position_id);
+      const mt5PositionTicket = parseOrderTicket(body.mt5_position_ticket);
+      const entryDealTicket = parseOrderTicket(body.entry_deal_ticket);
+      const exitDealTicket = parseOrderTicket(body.exit_deal_ticket);
       const hasValidTicket = typeof orderTicket === "string";
       const actualResult = (requestedActualResult === "FILLED" && !hasValidTicket) ? "PENDING" : requestedActualResult;
 
@@ -756,7 +770,12 @@ serve(async (req: Request) => {
         
         // エントリー手法
         order_ticket: orderTicket ?? undefined,
+        mt5_position_id: mt5PositionId ?? undefined,
+        mt5_position_ticket: mt5PositionTicket ?? undefined,
+        entry_deal_ticket: entryDealTicket ?? undefined,
+        exit_deal_ticket: exitDealTicket ?? undefined,
         entry_price: body.entry_price,
+        tracking_version: safeText(body.tracking_version) ?? undefined,
         entry_method: body.entry_method ?? null,
         entry_params: body.entry_params ?? null,
         method_selected_by: body.method_selected_by ?? null,
@@ -939,6 +958,16 @@ serve(async (req: Request) => {
         hold_duration_minutes,
         sl_hit,
         tp_hit,
+        mt5_position_id,
+        mt5_position_ticket,
+        entry_deal_ticket,
+        exit_deal_ticket,
+        realized_commission,
+        realized_swap,
+        realized_fee,
+        result_consistent,
+        result_quality_reason,
+        tracking_version,
         cancelled_reason,
         // virtual
         is_virtual,
@@ -989,6 +1018,20 @@ serve(async (req: Request) => {
       if (hold_duration_minutes !== undefined) updateData.hold_duration_minutes = hold_duration_minutes;
       if (sl_hit !== undefined) updateData.sl_hit = sl_hit;
       if (tp_hit !== undefined) updateData.tp_hit = tp_hit;
+      const parsedPositionId = parseOrderTicket(mt5_position_id);
+      const parsedPositionTicket = parseOrderTicket(mt5_position_ticket);
+      const parsedEntryDealTicket = parseOrderTicket(entry_deal_ticket);
+      const parsedExitDealTicket = parseOrderTicket(exit_deal_ticket);
+      if (parsedPositionId) updateData.mt5_position_id = parsedPositionId;
+      if (parsedPositionTicket) updateData.mt5_position_ticket = parsedPositionTicket;
+      if (parsedEntryDealTicket) updateData.entry_deal_ticket = parsedEntryDealTicket;
+      if (parsedExitDealTicket) updateData.exit_deal_ticket = parsedExitDealTicket;
+      if (isFiniteNumber(realized_commission)) updateData.realized_commission = realized_commission;
+      if (isFiniteNumber(realized_swap)) updateData.realized_swap = realized_swap;
+      if (isFiniteNumber(realized_fee)) updateData.realized_fee = realized_fee;
+      if (typeof result_consistent === "boolean") updateData.result_consistent = result_consistent;
+      if (result_quality_reason !== undefined) updateData.result_quality_reason = safeText(result_quality_reason);
+      if (tracking_version !== undefined) updateData.tracking_version = safeText(tracking_version);
 
         if (cancelled_reason) updateData.cancelled_reason = cancelled_reason;
 
@@ -1046,12 +1089,12 @@ serve(async (req: Request) => {
         const { data: existingRow, error: existingErr } = signal_id
           ? await supabase
               .from("ai_signals")
-              .select("id, actual_result")
+              .select("id, actual_result, dir, entry_price")
               .eq("id", signal_id)
               .maybeSingle()
           : await supabase
               .from("ai_signals")
-              .select("id, actual_result")
+              .select("id, actual_result, dir, entry_price")
               .eq("order_ticket", parsedOrderTicket as string)
               .maybeSingle();
 
@@ -1069,6 +1112,23 @@ serve(async (req: Request) => {
               }),
               { status: 409, headers: corsHeaders() }
             );
+          }
+
+          if (
+            ["WIN", "LOSS", "BREAK_EVEN"].includes(next) &&
+            isFiniteNumber(exit_price) &&
+            isFiniteNumber(profit_loss) &&
+            isFiniteNumber(existingRow.entry_price) &&
+            (existingRow.dir === 1 || existingRow.dir === -1)
+          ) {
+            const directionalMove = (exit_price - existingRow.entry_price) * existingRow.dir;
+            if (profit_loss > 0.01 && directionalMove < 0) {
+              updateData.result_consistent = false;
+              updateData.result_quality_reason = "positive_pnl_against_recorded_direction";
+            } else if (typeof result_consistent !== "boolean") {
+              updateData.result_consistent = true;
+              updateData.result_quality_reason = null;
+            }
           }
         }
       }

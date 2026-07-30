@@ -207,6 +207,16 @@ type AISignalRecord = {
   closed_at: string | null;
   actual_result: string | null;
   order_ticket: number | null;
+  mt5_position_id?: number | null;
+  mt5_position_ticket?: number | null;
+  entry_deal_ticket?: number | null;
+  exit_deal_ticket?: number | null;
+  realized_commission?: number | null;
+  realized_swap?: number | null;
+  realized_fee?: number | null;
+  result_consistent?: boolean | null;
+  result_quality_reason?: string | null;
+  tracking_version?: string | null;
   reason: string | null;
   decision_summary?: string | null;
   entry_method?: string | null;
@@ -282,6 +292,24 @@ type DashboardSummary = {
   winRate: number | null;
   totalPnl: number;
   averagePnl: number | null;
+  grossProfit: number;
+  grossLoss: number;
+  profitFactor: number | null;
+  qualityExcludedCount: number;
+};
+
+type DataIntegritySummary = {
+  checkedCount: number;
+  inconsistentCount: number;
+  unknownCount: number;
+  staleOpenCount: number;
+  learningEligibleCount: number;
+  issues: Array<{
+    id: number;
+    symbol: string;
+    reason: string;
+    orderTicket: number | null;
+  }>;
 };
 
 type SymbolSummary = {
@@ -301,6 +329,7 @@ type DashboardData = {
   shadowAnalysis: ShadowAnalysis;
   opportunityAnalysis: OpportunityAnalysis;
   h1Audit: H1AuditSummary;
+  dataIntegrity: DataIntegritySummary;
   selectedPeriod: {
     key: string;
     label: string;
@@ -406,6 +435,9 @@ function summarizeTrades(trades: AISignalRecord[]): DashboardSummary {
   const lossCount = trades.filter((trade) => trade.actual_result === "LOSS").length;
   const breakevenCount = trades.filter((trade) => trade.actual_result === "BREAK_EVEN").length;
   const totalPnl = trades.reduce((sum, trade) => sum + (trade.profit_loss ?? 0), 0);
+  const grossProfit = trades.reduce((sum, trade) => sum + Math.max(0, trade.profit_loss ?? 0), 0);
+  const grossLoss = Math.abs(trades.reduce((sum, trade) => sum + Math.min(0, trade.profit_loss ?? 0), 0));
+  const qualityExcludedCount = trades.filter((trade) => trade.result_consistent === false).length;
   return {
     tradeCount,
     winCount,
@@ -414,6 +446,38 @@ function summarizeTrades(trades: AISignalRecord[]): DashboardSummary {
     winRate: tradeCount > 0 ? round2((winCount / tradeCount) * 100) : null,
     totalPnl: round2(totalPnl) ?? 0,
     averagePnl: tradeCount > 0 ? round2(totalPnl / tradeCount) : null,
+    grossProfit: round2(grossProfit) ?? 0,
+    grossLoss: round2(grossLoss) ?? 0,
+    profitFactor: grossLoss > 0 ? round2(grossProfit / grossLoss) : null,
+    qualityExcludedCount,
+  };
+}
+
+function summarizeDataIntegrity(closedTrades: AISignalRecord[], openTrades: AISignalRecord[]): DataIntegritySummary {
+  const checked = closedTrades.filter((trade) => trade.result_consistent !== null && trade.result_consistent !== undefined);
+  const inconsistent = closedTrades.filter((trade) => trade.result_consistent === false);
+  const staleCutoff = Date.now() - 36 * 60 * 60 * 1000;
+  const staleOpen = openTrades.filter((trade) => Date.parse(trade.created_at) < staleCutoff);
+  return {
+    checkedCount: checked.length,
+    inconsistentCount: inconsistent.length,
+    unknownCount: closedTrades.length - checked.length,
+    staleOpenCount: staleOpen.length,
+    learningEligibleCount: closedTrades.filter((trade) => trade.result_consistent !== false).length,
+    issues: [
+      ...inconsistent.map((trade) => ({
+        id: trade.id,
+        symbol: trade.symbol,
+        reason: trade.result_quality_reason ?? "result_inconsistent",
+        orderTicket: trade.order_ticket,
+      })),
+      ...staleOpen.map((trade) => ({
+        id: trade.id,
+        symbol: trade.symbol,
+        reason: "filled_over_36h",
+        orderTicket: trade.order_ticket,
+      })),
+    ].slice(0, 8),
   };
 }
 
@@ -818,7 +882,7 @@ async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
 
 async function fetchShadowTrades(): Promise<AISignalRecord[]> {
   const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,probability_adjustments,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session,shadow_reason,mfe_r,mae_r",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,probability_adjustments,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session,shadow_reason,mfe_r,mae_r",
     is_virtual: "eq.true",
     reverse_execution: "eq.false",
     created_at: `gte.${toIsoDaysAgo(30)}`,
@@ -841,7 +905,7 @@ async function fetchH1AuditTrades(): Promise<AISignalRecord[]> {
 
 async function fetchRecentTrades(): Promise<AISignalRecord[]> {
   const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
     is_virtual: "eq.false",
     or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
     reverse_execution: "eq.false",
@@ -855,7 +919,7 @@ async function fetchRecentTrades(): Promise<AISignalRecord[]> {
 
 async function fetchOpenTrades(): Promise<AISignalRecord[]> {
   const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
     is_virtual: "eq.false",
     or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
     actual_result: "eq.FILLED",
@@ -868,7 +932,7 @@ async function fetchOpenTrades(): Promise<AISignalRecord[]> {
 
 async function fetchClosedTrades(period: string): Promise<AISignalRecord[]> {
   const params: Record<string, string> = {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
+    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
     is_virtual: "eq.false",
     or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
     reverse_execution: "eq.false",
@@ -927,6 +991,7 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
     shadowAnalysis: summarizeShadowTrades(shadowTrades),
     opportunityAnalysis: summarizeOpportunityAnalysis(shadowTrades),
     h1Audit: summarizeH1Audit(h1AuditTrades),
+    dataIntegrity: summarizeDataIntegrity(totalTrades, openTrades),
     selectedPeriod: {
       key: period,
       label: periodLabel(period),

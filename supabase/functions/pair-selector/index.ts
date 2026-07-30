@@ -78,6 +78,7 @@ interface TradeRow {
   win_prob: number | null;
   ml_pattern_used: boolean | null;
   entry_method: string | null;
+  result_consistent: boolean | null;
 }
 
 interface SymbolStats {
@@ -89,6 +90,7 @@ interface SymbolStats {
   real_win_rate: number | null;
   real_total_profit_loss: number;
   real_avg_profit_loss: number | null;
+  real_profit_factor: number | null;
   avg_win_prob: number | null;
   recent_7d_trades: number;
   recent_7d_win_rate: number | null;
@@ -114,6 +116,7 @@ interface SymbolStats {
     recent: number;
     virtual: number;
     virtual_profit?: number;
+    profit_factor?: number;
     market: number;
   };
   compatibility_score: number;
@@ -336,6 +339,7 @@ function summarizeStatsForPrompt(stats: SymbolStats[]) {
     real_trades: s.real_trades,
     real_win_rate: s.real_win_rate,
     real_total_profit_loss: s.real_total_profit_loss,
+    real_profit_factor: s.real_profit_factor,
     avg_win_prob: s.avg_win_prob,
     recent_7d_trades: s.recent_7d_trades,
     recent_7d_win_rate: s.recent_7d_win_rate,
@@ -461,7 +465,8 @@ function makeRecommendationFromStats(stats: SymbolStats, marketNote?: string): P
   const virtualBayesian = stats.virtual_win_rate_bayesian ?? stats.virtual_win_rate ?? 0.40;
   const virtualEpisodes = stats.virtual_episode_trades ?? stats.virtual_trades ?? 0;
   const marketFitScore = stats.market_fit_score ?? 50;
-  const baseReason = `実取引 ${stats.real_trades}件（補正勝率 ${(realBayesian * 100).toFixed(1)}%）、仮想 ${virtualEpisodes}エピソード（補正勝率 ${(virtualBayesian * 100).toFixed(1)}%）、市場適合 ${marketFitScore.toFixed(1)}`;
+  const profitFactorLabel = stats.real_profit_factor === null ? "PF 未確定" : `PF ${stats.real_profit_factor.toFixed(2)}`;
+  const baseReason = `実取引 ${stats.real_trades}件（補正勝率 ${(realBayesian * 100).toFixed(1)}%、${profitFactorLabel}）、仮想 ${virtualEpisodes}エピソード（補正勝率 ${(virtualBayesian * 100).toFixed(1)}%）、市場適合 ${marketFitScore.toFixed(1)}`;
   return {
     symbol: stats.symbol,
     score: Math.round(stats.compatibility_score),
@@ -1627,9 +1632,9 @@ async function fetchMarketContext(universe: string[]): Promise<MarketContext | n
 }
 
 async function fetchTrades(universe: string[], timeframe: string, sinceIso: string, isVirtual: boolean): Promise<TradeRow[]> {
-  const { data, error } = await supabase
+  let query = supabase
     .from("ai_signals")
-    .select("created_at, symbol, dir, actual_result, profit_loss, closed_at, win_prob, ml_pattern_used, entry_method")
+    .select("created_at, symbol, dir, actual_result, profit_loss, closed_at, win_prob, ml_pattern_used, entry_method, result_consistent")
     .in("symbol", universe)
     .eq("timeframe", timeframe)
     .eq("is_virtual", isVirtual)
@@ -1640,6 +1645,12 @@ async function fetchTrades(universe: string[], timeframe: string, sinceIso: stri
     .not("closed_at", "is", null)
     .order("closed_at", { ascending: false })
     .limit(5000);
+
+  if (!isVirtual) {
+    query = query.or("result_consistent.is.null,result_consistent.eq.true");
+  }
+
+  const { data, error } = await query;
 
   if (error) {
     throw new Error(`failed to fetch ${isVirtual ? "virtual" : "real"} trades: ${error.message}`);
@@ -1664,6 +1675,9 @@ function buildStats(
     const realLosses = real.filter((r) => r.actual_result === "LOSS").length;
     const realTrades = real.length;
     const realTotalProfitLoss = real.reduce((sum, r) => sum + (Number(r.profit_loss ?? 0) || 0), 0);
+    const grossProfit = real.reduce((sum, r) => sum + Math.max(0, Number(r.profit_loss ?? 0) || 0), 0);
+    const grossLoss = Math.abs(real.reduce((sum, r) => sum + Math.min(0, Number(r.profit_loss ?? 0) || 0), 0));
+    const realProfitFactor = grossLoss > 0 ? grossProfit / grossLoss : null;
     const avgWinProb = realTrades > 0
       ? real.reduce((sum, r) => sum + (Number(r.win_prob ?? 0) || 0), 0) / realTrades
       : null;
@@ -1698,9 +1712,12 @@ function buildStats(
     const recentComponent = (recent7dWinRateBayesian - realWinRateBayesian) * 35;
     const virtualComponent = (virtualWinRateBayesian - 0.40) * 55;
     const virtualProfitComponent = clamp(virtualTotalProfitLoss / 5, -1, 1) * 8;
+    const profitFactorComponent = realProfitFactor === null
+      ? (grossProfit > 0 ? 10 * clamp(realTrades / 12, 0, 1) : 0)
+      : clamp(Math.log(Math.max(0.25, Math.min(4, realProfitFactor))), -1, 1) * 10 * clamp(realTrades / 12, 0, 1);
     const marketComponent = (marketFit.score - 50) * 0.65;
     const compatibilityScore = marketFit.eligible
-      ? clamp(50 + sampleComponent + realWinComponent + recentComponent + virtualComponent + virtualProfitComponent + marketComponent, 0, 100)
+      ? clamp(50 + sampleComponent + realWinComponent + recentComponent + virtualComponent + virtualProfitComponent + profitFactorComponent + marketComponent, 0, 100)
       : 0;
 
     return {
@@ -1712,6 +1729,7 @@ function buildStats(
       real_win_rate: round3(realWinRate),
       real_total_profit_loss: round2(realTotalProfitLoss) ?? 0,
       real_avg_profit_loss: round2(realAvgProfitLoss),
+      real_profit_factor: round3(realProfitFactor),
       avg_win_prob: round3(avgWinProb),
       recent_7d_trades: recent7dTrades,
       recent_7d_win_rate: round3(recent7dWinRate),
@@ -1737,6 +1755,7 @@ function buildStats(
         recent: Math.round(recentComponent * 10) / 10,
         virtual: Math.round(virtualComponent * 10) / 10,
         virtual_profit: Math.round(virtualProfitComponent * 10) / 10,
+        profit_factor: Math.round(profitFactorComponent * 10) / 10,
         market: Math.round(marketComponent * 10) / 10,
       },
       compatibility_score: Math.round(compatibilityScore * 10) / 10,

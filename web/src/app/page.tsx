@@ -1025,13 +1025,30 @@ export default async function Home({ searchParams }: PageProps) {
               );
             })}
           </div>
-          <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-6">
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
             <StatCard label={`${data.selectedPeriod.label} 勝率`} value={formatPercent(data.selectedPeriod.summary.winRate)} sublabel={`取引数 ${data.selectedPeriod.summary.tradeCount}`} />
             <StatCard label={`${data.selectedPeriod.label} 総損益`} value={formatMoney(data.selectedPeriod.summary.totalPnl)} sublabel={`平均 ${formatMoney(data.selectedPeriod.summary.averagePnl)}`} />
+            <StatCard label={`${data.selectedPeriod.label} Profit Factor`} value={data.selectedPeriod.summary.profitFactor?.toFixed(2) ?? (data.selectedPeriod.summary.grossProfit > 0 && data.selectedPeriod.summary.grossLoss === 0 ? "∞" : "-")} sublabel={`総利益 ${formatMoney(data.selectedPeriod.summary.grossProfit)} / 総損失 ${formatMoney(-data.selectedPeriod.summary.grossLoss)}`} />
             <StatCard label={`${data.selectedPeriod.label} WIN`} value={String(data.selectedPeriod.summary.winCount)} sublabel={`LOSS ${data.selectedPeriod.summary.lossCount} / BE ${data.selectedPeriod.summary.breakevenCount}`} />
             <StatCard label="総合 勝率" value={formatPercent(data.total.summary.winRate)} sublabel={`取引数 ${data.total.summary.tradeCount}`} />
             <StatCard label="総合 総損益" value={formatMoney(data.total.summary.totalPnl)} sublabel={`平均 ${formatMoney(data.total.summary.averagePnl)}`} />
+            <StatCard label="総合 Profit Factor" value={data.total.summary.profitFactor?.toFixed(2) ?? (data.total.summary.grossProfit > 0 && data.total.summary.grossLoss === 0 ? "∞" : "-")} sublabel="1.00超で総利益が総損失を上回る" />
             <StatCard label="総合 WIN" value={String(data.total.summary.winCount)} sublabel={`LOSS ${data.total.summary.lossCount} / BE ${data.total.summary.breakevenCount}`} />
+          </div>
+          <div className={`mt-5 border px-4 py-4 text-sm ${data.dataIntegrity.inconsistentCount > 0 || data.dataIntegrity.staleOpenCount > 0 ? "border-amber-300/30 bg-amber-950/20 text-amber-100" : "border-emerald-300/20 bg-emerald-950/15 text-emerald-100"}`}>
+            <div className="font-semibold">学習データ品質</div>
+            <div className="mt-1 leading-6">
+              検査済み {data.dataIntegrity.checkedCount}件 / 未検査 {data.dataIntegrity.unknownCount}件 / 学習対象 {data.dataIntegrity.learningEligibleCount}件 / 除外 {data.dataIntegrity.inconsistentCount}件 / 36時間超の未決済扱い {data.dataIntegrity.staleOpenCount}件
+            </div>
+            {data.dataIntegrity.issues.length > 0 ? (
+              <div className="mt-3 space-y-1 text-xs">
+                {data.dataIntegrity.issues.map((issue) => (
+                  <div key={`${issue.reason}-${issue.id}`}>
+                    {issue.symbol} / ticket {issue.orderTicket ?? "-"} / {issue.reason}
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </div>
           <div className="mt-6 grid gap-5 lg:grid-cols-2">
             <article className="rounded-3xl border border-white/8 bg-white/5 p-4">

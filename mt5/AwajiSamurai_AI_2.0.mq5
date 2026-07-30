@@ -15,6 +15,7 @@
 //|          RSI_MR_BONUS / CALIBRATION)。skip_reasonに streak_guard  |
 //|          タグが追加される。AI_EA_Versionを1.6.0に更新。          |
 //| - v1.7.0: 固定ロット・market-only化、H1を監査専用へ変更         |
+//| - v1.8.0: 複数建玉のposition ID追跡と純損益集計を修正           |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -60,7 +61,7 @@ input string EALogBearerToken        = "";
 #define AI_Bearer_Token AIBearerToken
 #define EA_Log_Bearer_Token EALogBearerToken
 #define AI_EA_Instance "main"
-#define AI_EA_Version "1.7.0"
+#define AI_EA_Version "1.8.0"
 #define AI_Timeout_ms 10000
 #define UseIchimoku true
 #define Ichimoku_Tenkan 9
@@ -83,92 +84,158 @@ datetime g_trackedFillLastTry=0;
 // 複数ポジション追跡（MaxPositions>1 対応）
 struct TrackedTrade{
    ulong    position_ticket;
+   ulong    position_id;
    ulong    order_ticket;
+   ulong    entry_deal_ticket;
+   long     signal_id;
    datetime open_time;
    double   entry_price;
+   int      dir;
    bool     fill_sent;
    datetime fill_last_try;
 };
 TrackedTrade g_tracked[];
 
-// ===== Tracking rehydrate (after restart) =====
-// EAの再起動/再アタッチで g_tracked が初期化されると、
-// 既存ポジションの WIN/LOSS 更新ができず ai_signals が FILLED で滞留することがある。
-// そこで、現在のポジションを履歴(deals)から order_ticket に紐付け直して tracked に復元する。
+string ToIsoUtc(const datetime serverTime)
+{
+   datetime utcTime=serverTime-(TimeCurrent()-TimeGMT());
+   string value=TimeToString(utcTime,TIME_DATE|TIME_SECONDS);
+   StringReplace(value,".","-");
+   StringReplace(value," ","T");
+   return value+"Z";
+}
+
+ulong FindOpenPositionTicketByIdentifier(const ulong positionId)
+{
+   if(positionId==0) return 0;
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket=PositionGetTicket(i);
+      if(ticket==0) continue;
+      if((ulong)PositionGetInteger(POSITION_IDENTIFIER)!=positionId) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
+      return ticket;
+   }
+   return 0;
+}
+
+bool ResolveExecutedTrade(const ulong orderTicket,const ulong resultDeal,
+   ulong &positionTicket,ulong &positionId,ulong &entryDealTicket,
+   datetime &openTime,double &entryPrice,int &positionDir)
+{
+   positionTicket=0;
+   positionId=0;
+   entryDealTicket=0;
+   openTime=TimeCurrent();
+   entryPrice=0;
+   positionDir=0;
+
+   ulong dealTicket=resultDeal;
+   if(dealTicket>0 && HistoryDealSelect(dealTicket))
+   {
+      positionId=(ulong)HistoryDealGetInteger(dealTicket,DEAL_POSITION_ID);
+      entryDealTicket=dealTicket;
+      openTime=(datetime)HistoryDealGetInteger(dealTicket,DEAL_TIME);
+      entryPrice=HistoryDealGetDouble(dealTicket,DEAL_PRICE);
+      long dealType=HistoryDealGetInteger(dealTicket,DEAL_TYPE);
+      if(dealType==DEAL_TYPE_BUY) positionDir=1;
+      else if(dealType==DEAL_TYPE_SELL) positionDir=-1;
+   }
+
+   if(positionId==0 && HistorySelect(TimeCurrent()-300,TimeCurrent()+60))
+   {
+      for(int i=HistoryDealsTotal()-1;i>=0;i--)
+      {
+         ulong candidate=HistoryDealGetTicket(i);
+         if(candidate==0) continue;
+         if((ulong)HistoryDealGetInteger(candidate,DEAL_ORDER)!=orderTicket) continue;
+         if(HistoryDealGetInteger(candidate,DEAL_ENTRY)!=DEAL_ENTRY_IN) continue;
+         if(HistoryDealGetString(candidate,DEAL_SYMBOL)!=_Symbol) continue;
+         if((long)HistoryDealGetInteger(candidate,DEAL_MAGIC)!=Magic) continue;
+         positionId=(ulong)HistoryDealGetInteger(candidate,DEAL_POSITION_ID);
+         entryDealTicket=candidate;
+         openTime=(datetime)HistoryDealGetInteger(candidate,DEAL_TIME);
+         entryPrice=HistoryDealGetDouble(candidate,DEAL_PRICE);
+         long dealType=HistoryDealGetInteger(candidate,DEAL_TYPE);
+         if(dealType==DEAL_TYPE_BUY) positionDir=1;
+         else if(dealType==DEAL_TYPE_SELL) positionDir=-1;
+         break;
+      }
+   }
+
+   positionTicket=FindOpenPositionTicketByIdentifier(positionId);
+   return positionId>0 && positionTicket>0 && entryDealTicket>0;
+}
+
+// EA再起動後も、変化しないPOSITION_IDENTIFIERから注文を復元する。
 void RehydrateTrackingFromExistingPositions()
 {
-   datetime now=TimeCurrent();
-   // 過去の履歴範囲は広すぎると重いので、十分な安全マージンで 30日
-   datetime from=now-(30*86400);
-   bool hs=HistorySelect(from,now);
-   int dealsTotal=(hs?HistoryDealsTotal():0);
-
    int added=0;
    for(int i=PositionsTotal()-1;i>=0;i--)
    {
       ulong posTicket=PositionGetTicket(i);
-      if(posTicket<=0) continue;
+      if(posTicket==0) continue;
       if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC)!=Magic) continue;
-      if(IsPositionTracked(posTicket)) continue;
+
+      ulong positionId=(ulong)PositionGetInteger(POSITION_IDENTIFIER);
+      if(positionId==0 || IsPositionTracked(positionId)) continue;
 
       datetime openTime=(datetime)PositionGetInteger(POSITION_TIME);
       double entryPrice=PositionGetDouble(POSITION_PRICE_OPEN);
+      long posType=PositionGetInteger(POSITION_TYPE);
+      int positionDir=(posType==POSITION_TYPE_BUY?1:(posType==POSITION_TYPE_SELL?-1:0));
       ulong ordTicket=0;
+      ulong entryDealTicket=0;
 
-      // Find entry deal for this position to get original order ticket
-      if(hs && dealsTotal>0)
+      if(HistorySelectByPosition(positionId))
       {
-         for(int d=dealsTotal-1; d>=0; d--)
+         for(int d=0;d<HistoryDealsTotal();d++)
          {
             ulong dealTicket=HistoryDealGetTicket(d);
-            if(dealTicket<=0) continue;
-            if((ulong)HistoryDealGetInteger(dealTicket,DEAL_POSITION_ID)!=posTicket) continue;
+            if(dealTicket==0) continue;
+            if(HistoryDealGetInteger(dealTicket,DEAL_ENTRY)!=DEAL_ENTRY_IN) continue;
             if(HistoryDealGetString(dealTicket,DEAL_SYMBOL)!=_Symbol) continue;
             if((long)HistoryDealGetInteger(dealTicket,DEAL_MAGIC)!=Magic) continue;
-            if(HistoryDealGetInteger(dealTicket,DEAL_ENTRY)!=DEAL_ENTRY_IN) continue;
-
             ordTicket=(ulong)HistoryDealGetInteger(dealTicket,DEAL_ORDER);
-            // Prefer deal time/price as they are definitive
+            entryDealTicket=dealTicket;
             openTime=(datetime)HistoryDealGetInteger(dealTicket,DEAL_TIME);
-            double dp=HistoryDealGetDouble(dealTicket,DEAL_PRICE);
-            if(MathIsValidNumber(dp) && dp>0) entryPrice=dp;
+            double dealPrice=HistoryDealGetDouble(dealTicket,DEAL_PRICE);
+            if(MathIsValidNumber(dealPrice) && dealPrice>0) entryPrice=dealPrice;
             break;
          }
       }
 
-      if(ordTicket>0)
+      if(ordTicket>0 && AddTrackedTrade(posTicket,positionId,ordTicket,entryDealTicket,0,openTime,entryPrice,positionDir,false))
       {
-         if(AddTrackedTrade(posTicket,ordTicket,openTime,entryPrice))
+         added++;
+         if(g_trackedPositionTicket==0)
          {
-            added++;
-            // legacy single-slot: set only if empty (MaxPositions<=1 前提での互換)
-            if(g_trackedPositionTicket==0)
-            {
-               g_trackedPositionTicket=posTicket;
-               g_trackedOrderTicket=ordTicket;
-               g_trackedPositionOpenTime=openTime;
-               g_trackedPositionEntryPrice=entryPrice;
-               g_trackedFillSent=false;
-               g_trackedFillLastTry=0;
-            }
+            g_trackedPositionTicket=posTicket;
+            g_trackedOrderTicket=ordTicket;
+            g_trackedPositionOpenTime=openTime;
+            g_trackedPositionEntryPrice=entryPrice;
+            g_trackedFillSent=false;
+            g_trackedFillLastTry=0;
          }
       }
    }
 
-   if(added>0)
-   {
-      SafePrint(StringFormat("[TRACK] Rehydrated %d position(s) from existing positions",added));
-   }
+   if(added>0) SafePrint(StringFormat("[TRACK] Rehydrated %d position(s) by position identifier",added));
 }
 
 void ClearTrackedSlot(const int idx)
 {
    if(idx<0 || idx>=ArraySize(g_tracked)) return;
    g_tracked[idx].position_ticket=0;
+   g_tracked[idx].position_id=0;
    g_tracked[idx].order_ticket=0;
+   g_tracked[idx].entry_deal_ticket=0;
+   g_tracked[idx].signal_id=0;
    g_tracked[idx].open_time=0;
    g_tracked[idx].entry_price=0;
+   g_tracked[idx].dir=0;
    g_tracked[idx].fill_sent=false;
    g_tracked[idx].fill_last_try=0;
 }
@@ -177,30 +244,32 @@ int FindFreeTrackedSlot()
 {
    for(int i=0;i<ArraySize(g_tracked);i++)
    {
-      if(g_tracked[i].position_ticket==0 && g_tracked[i].order_ticket==0) return i;
+      if(g_tracked[i].position_id==0 && g_tracked[i].order_ticket==0) return i;
    }
    return -1;
 }
 
-int FindTrackedByPositionTicket(const ulong posTicket)
+int FindTrackedByPositionId(const ulong positionId)
 {
-   if(posTicket==0) return -1;
+   if(positionId==0) return -1;
    for(int i=0;i<ArraySize(g_tracked);i++)
    {
-      if(g_tracked[i].position_ticket==posTicket) return i;
+      if(g_tracked[i].position_id==positionId) return i;
    }
    return -1;
 }
 
-bool IsPositionTracked(const ulong posTicket)
+bool IsPositionTracked(const ulong positionId)
 {
-   return FindTrackedByPositionTicket(posTicket)>=0;
+   return FindTrackedByPositionId(positionId)>=0;
 }
 
-bool AddTrackedTrade(const ulong posTicket,const ulong ordTicket,const datetime openTime,const double entryPrice)
+bool AddTrackedTrade(const ulong posTicket,const ulong positionId,const ulong ordTicket,
+   const ulong entryDealTicket,const long signalId,const datetime openTime,
+   const double entryPrice,const int positionDir,const bool fillSent)
 {
-   if(posTicket==0) return false;
-   if(IsPositionTracked(posTicket)) return true;
+   if(posTicket==0 || positionId==0 || ordTicket==0) return false;
+   if(IsPositionTracked(positionId)) return true;
    int idx=FindFreeTrackedSlot();
    if(idx<0)
    {
@@ -208,10 +277,14 @@ bool AddTrackedTrade(const ulong posTicket,const ulong ordTicket,const datetime 
       return false;
    }
    g_tracked[idx].position_ticket=posTicket;
+   g_tracked[idx].position_id=positionId;
    g_tracked[idx].order_ticket=ordTicket;
+   g_tracked[idx].entry_deal_ticket=entryDealTicket;
+   g_tracked[idx].signal_id=signalId;
    g_tracked[idx].open_time=openTime;
    g_tracked[idx].entry_price=entryPrice;
-   g_tracked[idx].fill_sent=false;
+   g_tracked[idx].dir=positionDir;
+   g_tracked[idx].fill_sent=fillSent;
    g_tracked[idx].fill_last_try=0;
    return true;
 }
@@ -1797,7 +1870,7 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
 }
 
 // ===== AI Signals記録（ML学習用） =====
-long RecordSignal(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,const CandleFeatures &candle,ulong ticket=0,double entry_price=0,bool mark_filled=false,bool is_virtual=false,double planned_entry=0,double planned_sl=0,double planned_tp=0,int planned_order_type=-1,int expiry_minutes=0,double executed_lot=0.0,int original_dir=0,const string shadow_reason="")
+long RecordSignal(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,const CandleFeatures &candle,ulong ticket=0,double entry_price=0,bool mark_filled=false,bool is_virtual=false,double planned_entry=0,double planned_sl=0,double planned_tp=0,int planned_order_type=-1,int expiry_minutes=0,double executed_lot=0.0,int original_dir=0,const string shadow_reason="",ulong position_id=0,ulong position_ticket=0,ulong entry_deal_ticket=0)
 {
    // レジーム判定用の追加特徴量（QueryAIと同様にEA側で計算して保存する）
    ENUM_TIMEFRAMES tf=(tf_label=="M15")?TF_Entry:TF_Recheck;
@@ -1999,6 +2072,10 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
       payload+=",\"order_ticket\":\""+ULongToString(ticket)+"\"";
       if(entry_price>0) payload+=",\"entry_price\":"+DoubleToString(entry_price,_Digits);
    }
+   if(position_id>0) payload+=",\"mt5_position_id\":\""+ULongToString(position_id)+"\"";
+   if(position_ticket>0) payload+=",\"mt5_position_ticket\":\""+ULongToString(position_ticket)+"\"";
+   if(entry_deal_ticket>0) payload+=",\"entry_deal_ticket\":\""+ULongToString(entry_deal_ticket)+"\"";
+   if(!is_virtual) payload+=",\"tracking_version\":\"position_id_v2\"";
    // Only mark FILLED when we have a real broker ticket.
    // Otherwise we would create FILLED rows without order_ticket/entry_price, and they cannot be updated later.
    if(mark_filled && ticket>0){ payload+=",\"actual_result\":\"FILLED\""; }
@@ -2088,33 +2165,46 @@ void CheckVirtualWatches()
    }
 }
 
-void UpdateSignalResultWithOpenTime(ulong ticket,double exit_price,double profit_loss,const string result,bool sl_hit,bool tp_hit,datetime open_time)
+bool UpdateSignalResultWithOpenTime(const long signal_id,const ulong order_ticket,
+   const ulong position_id,const ulong position_ticket,const ulong entry_deal_ticket,
+   const ulong exit_deal_ticket,const double exit_price,const double profit_loss,
+   const double commission,const double swap_value,const double fee,const string result,
+   const bool sl_hit,const bool tp_hit,const bool result_consistent,
+   const string quality_reason,const datetime open_time,const datetime close_time)
 {
-   datetime now=TimeCurrent();
    int duration=0;
-   if(open_time>0) duration=(int)((now-open_time)/60);
+   if(open_time>0 && close_time>=open_time) duration=(int)((close_time-open_time)/60);
    
-   string payload="{"+
-   "\"order_ticket\":\""+ULongToString(ticket)+"\","+
+   string payload="{";
+   if(signal_id>0) payload+="\"signal_id\":"+IntegerToString((int)signal_id)+",";
+   payload+=
+   "\"order_ticket\":\""+ULongToString(order_ticket)+"\","+
+   "\"mt5_position_id\":\""+ULongToString(position_id)+"\","+
+   "\"mt5_position_ticket\":\""+ULongToString(position_ticket)+"\","+
+   "\"entry_deal_ticket\":\""+ULongToString(entry_deal_ticket)+"\","+
+   "\"exit_deal_ticket\":\""+ULongToString(exit_deal_ticket)+"\","+
    "\"exit_price\":"+DoubleToString(exit_price,_Digits)+","+
    "\"profit_loss\":"+DoubleToString(profit_loss,2)+","+
+   "\"realized_commission\":"+DoubleToString(commission,2)+","+
+   "\"realized_swap\":"+DoubleToString(swap_value,2)+","+
+   "\"realized_fee\":"+DoubleToString(fee,2)+","+
    "\"actual_result\":\""+result+"\","+
-   "\"closed_at\":\""+TimeToString(now,TIME_DATE|TIME_SECONDS)+"\","+
+   "\"closed_at\":\""+ToIsoUtc(close_time)+"\","+
    "\"hold_duration_minutes\":"+IntegerToString(duration)+","+
    "\"sl_hit\":"+(sl_hit?"true":"false")+","+
-   "\"tp_hit\":"+(tp_hit?"true":"false")+"}";
+   "\"tp_hit\":"+(tp_hit?"true":"false")+","+
+   "\"result_consistent\":"+(result_consistent?"true":"false")+","+
+   "\"result_quality_reason\":"+(quality_reason!=""?"\""+JsonEscape(quality_reason)+"\"":"null")+","+
+   "\"tracking_version\":\"position_id_v2\"}";
    
    string resp;
    if(!HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000)){
       SafePrint("[AI_SIGNALS] Failed to update result");
+      return false;
    }else{
-      SafePrint(StringFormat("[AI_SIGNALS] Updated: ticket=%s result=%s P/L=%.2f",ULongToString(ticket),result,profit_loss));
+      SafePrint(StringFormat("[AI_SIGNALS] Updated: order=%s position=%s result=%s net=%.2f consistent=%d",ULongToString(order_ticket),ULongToString(position_id),result,profit_loss,(result_consistent?1:0)));
    }
-}
-
-void UpdateSignalResult(ulong ticket,double exit_price,double profit_loss,const string result,bool sl_hit,bool tp_hit)
-{
-   UpdateSignalResultWithOpenTime(ticket,exit_price,profit_loss,result,sl_hit,tp_hit,g_trackedPositionOpenTime);
+   return true;
 }
 
 // ===== 注文関連 =====
@@ -2300,7 +2390,8 @@ void OnM15NewBar()
       double slDist=t_exec.atr*ai.risk_atr_mult, tpDist=slDist*ai.reward_rr;
       double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID), ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
       double planned_entry=0, planned_sl=0, planned_tp=0; int planned_type=-1;
-      bool ok=false; double entry=0.0; ulong posTicket=0; ulong ordTicket=0;
+      bool ok=false; double entry=0.0; ulong posTicket=0; ulong positionId=0;
+      ulong ordTicket=0; ulong entryDealTicket=0; datetime openTime=0; int executedDir=0;
       AIOut ai_exec=ai;
 
       ai_exec.entry_method="market";
@@ -2314,42 +2405,47 @@ void OnM15NewBar()
          ok=trade.Buy(finalLots,_Symbol,0,planned_sl,planned_tp);
          if(ok){
             ordTicket=trade.ResultOrder();
-            if(PositionSelect(_Symbol)){
-               posTicket=(ulong)PositionGetInteger(POSITION_TICKET);
-               entry=PositionGetDouble(POSITION_PRICE_OPEN);
-            }
+            ulong resultDeal=trade.ResultDeal();
+            ResolveExecutedTrade(ordTicket,resultDeal,posTicket,positionId,entryDealTicket,openTime,entry,executedDir);
          }
       }else{
          ok=trade.Sell(finalLots,_Symbol,0,planned_sl,planned_tp);
          if(ok){
             ordTicket=trade.ResultOrder();
-            if(PositionSelect(_Symbol)){
-               posTicket=(ulong)PositionGetInteger(POSITION_TICKET);
-               entry=PositionGetDouble(POSITION_PRICE_OPEN);
-            }
+            ulong resultDeal=trade.ResultDeal();
+            ResolveExecutedTrade(ordTicket,resultDeal,posTicket,positionId,entryDealTicket,openTime,entry,executedDir);
          }
       }
 
-      if(ok && posTicket>0 && ordTicket>0){
-         datetime openTime=0;
-         if(PositionSelectByTicket(posTicket)) openTime=(datetime)PositionGetInteger(POSITION_TIME);
-         AddTrackedTrade(posTicket,ordTicket,openTime,entry);
+      if(ok && posTicket>0 && positionId>0 && ordTicket>0 && entryDealTicket>0){
+         if(executedDir==0) executedDir=t_exec.dir;
+         long signalId=RecordSignal("M15",executedDir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,finalLots,decision_dir,"",positionId,posTicket,entryDealTicket);
+         bool tracked=AddTrackedTrade(posTicket,positionId,ordTicket,entryDealTicket,signalId,openTime,entry,executedDir,signalId>0);
 
          // legacy single-slot (last executed)
          g_trackedPositionTicket=posTicket;
          g_trackedOrderTicket=ordTicket;
          g_trackedPositionOpenTime=openTime;
          g_trackedPositionEntryPrice=entry;
-         g_trackedFillSent=false;
+         g_trackedFillSent=(signalId>0);
          g_trackedFillLastTry=0;
 
-         // ai_signals.order_ticket is the order ticket key
-         RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,finalLots,decision_dir);
-         LogAIDecision("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,"EXECUTED_MARKET",threshold_met,posCount,ordTicket,tech_dir,finalLots);
-         SafePrint(StringFormat("[M15] market executed dir=%d prob=%.0f%% lot=%.2f",t_exec.dir,ai.win_prob*100,finalLots));
+         LogAIDecision("M15",executedDir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,"EXECUTED_MARKET",threshold_met,posCount,ordTicket,tech_dir,finalLots);
+         SafePrint(StringFormat("[M15] market executed dir=%d prob=%.0f%% lot=%.2f posId=%s tracked=%d",executedDir,ai.win_prob*100,finalLots,ULongToString(positionId),(tracked?1:0)));
       }else{
-         SafePrint("[M15] market execution failed");
-         MaybeRecordVirtualSkip("SKIPPED_ORDER_FAILED",t_plan,rsi,ai,expiry_min);
+         if(ok && ordTicket>0)
+         {
+            entry=trade.ResultPrice();
+            long signalId=RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,finalLots,decision_dir);
+            SafePrint(StringFormat("[TRACK] Executed order=%s but identity resolution is pending signal=%d",ULongToString(ordTicket),(int)signalId));
+            RehydrateTrackingFromExistingPositions();
+            LogAIDecision("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,"EXECUTED_TRACKING_PENDING",threshold_met,posCount,ordTicket,tech_dir,finalLots);
+         }
+         else
+         {
+            SafePrint("[M15] market execution failed");
+            MaybeRecordVirtualSkip("SKIPPED_ORDER_FAILED",t_plan,rsi,ai,expiry_min);
+         }
       }
    }else{
       TechSignal t_plan=t; t_plan.dir=(ai.suggested_dir!=0?ai.suggested_dir:tech_dir);
@@ -2371,18 +2467,18 @@ void OnM15NewBar()
 // ===== ポジション監視（ML学習用） =====
 void CheckPositionStatus()
 {
-   // Ensure entry_price is recorded for tracked positions (market orders can report entry_price=0 right after OrderSend)
    datetime now=TimeCurrent();
    for(int ti=0; ti<ArraySize(g_tracked); ti++)
    {
-      if(g_tracked[ti].order_ticket==0 || g_tracked[ti].position_ticket==0) continue;
+      if(g_tracked[ti].order_ticket==0 || g_tracked[ti].position_id==0) continue;
       if(g_tracked[ti].fill_sent) continue;
-      // try at most once per 60 seconds per trade
       if(g_tracked[ti].fill_last_try!=0 && (now - g_tracked[ti].fill_last_try) < 60) continue;
       g_tracked[ti].fill_last_try=now;
 
-      if(PositionSelectByTicket(g_tracked[ti].position_ticket))
+      ulong currentTicket=FindOpenPositionTicketByIdentifier(g_tracked[ti].position_id);
+      if(currentTicket>0 && PositionSelectByTicket(currentTicket))
       {
+         g_tracked[ti].position_ticket=currentTicket;
          double ep=PositionGetDouble(POSITION_PRICE_OPEN);
          if(MathIsValidNumber(ep) && ep>0)
          {
@@ -2394,13 +2490,17 @@ void CheckPositionStatus()
             string payload="{\"order_ticket\":\""+ULongToString(g_tracked[ti].order_ticket)+"\""+
                            ",\"entry_price\":"+DoubleToString(ep,_Digits)+
                            ",\"actual_result\":\"FILLED\""+
+                           ",\"mt5_position_id\":\""+ULongToString(g_tracked[ti].position_id)+"\""+
+                           ",\"mt5_position_ticket\":\""+ULongToString(currentTicket)+"\""+
+                           ",\"entry_deal_ticket\":\""+ULongToString(g_tracked[ti].entry_deal_ticket)+"\""+
+                           ",\"tracking_version\":\"position_id_v2\""+
                            ",\"symbol\":\""+JsonEscape(_Symbol)+"\""+
                            ",\"timeframe\":\"M15\""+
                            ",\"dir\":"+IntegerToString(posDir)+
                            ",\"reason\":\"rehydrated_existing_position\""+
                            ",\"instance\":\""+JsonEscape(AI_EA_Instance)+"\""+
                            ",\"model_version\":\""+JsonEscape(AI_EA_Version)+"\""+
-                           (g_tracked[ti].open_time>0 ? ",\"created_at\":\""+TimeToString(g_tracked[ti].open_time,TIME_DATE|TIME_SECONDS)+"\"" : "")+
+                           (g_tracked[ti].open_time>0 ? ",\"created_at\":\""+ToIsoUtc(g_tracked[ti].open_time)+"\"" : "")+
                            "}";
             string resp;
             if(HttpPostJson(AI_Signals_Update_URL,AI_Bearer_Token,payload,resp,3000))
@@ -2412,59 +2512,101 @@ void CheckPositionStatus()
       }
    }
 
-   // 追跡中のポジションがクローズされたかチェック
    for(int ti=0; ti<ArraySize(g_tracked); ti++)
    {
-      if(g_tracked[ti].position_ticket==0) continue;
-      if(PositionSelectByTicket(g_tracked[ti].position_ticket)) continue;
-
-      // ポジションがクローズされた - 履歴から結果を取得
-      if(HistorySelectByPosition(g_tracked[ti].position_ticket))
+      if(g_tracked[ti].position_id==0) continue;
+      ulong currentTicket=FindOpenPositionTicketByIdentifier(g_tracked[ti].position_id);
+      if(currentTicket>0)
       {
-         int total=HistoryDealsTotal();
-         for(int i=total-1;i>=0;i--)
+         g_tracked[ti].position_ticket=currentTicket;
+         continue;
+      }
+
+      if(HistorySelectByPosition(g_tracked[ti].position_id))
+      {
+         double grossProfit=0;
+         double commission=0;
+         double swapValue=0;
+         double fee=0;
+         double exitPriceVolume=0;
+         double exitVolume=0;
+         ulong lastExitDeal=0;
+         datetime closeTime=0;
+         bool slHit=false;
+         bool tpHit=false;
+
+         for(int i=0;i<HistoryDealsTotal();i++)
          {
             ulong dealTicket=HistoryDealGetTicket(i);
-            if(dealTicket>0 && (ulong)HistoryDealGetInteger(dealTicket,DEAL_POSITION_ID)==g_tracked[ti].position_ticket)
+            if(dealTicket==0) continue;
+            grossProfit+=HistoryDealGetDouble(dealTicket,DEAL_PROFIT);
+            commission+=HistoryDealGetDouble(dealTicket,DEAL_COMMISSION);
+            swapValue+=HistoryDealGetDouble(dealTicket,DEAL_SWAP);
+            fee+=HistoryDealGetDouble(dealTicket,DEAL_FEE);
+
+            long dealEntry=HistoryDealGetInteger(dealTicket,DEAL_ENTRY);
+            if(dealEntry!=DEAL_ENTRY_OUT && dealEntry!=DEAL_ENTRY_OUT_BY) continue;
+            double volume=HistoryDealGetDouble(dealTicket,DEAL_VOLUME);
+            double dealPrice=HistoryDealGetDouble(dealTicket,DEAL_PRICE);
+            exitPriceVolume+=dealPrice*volume;
+            exitVolume+=volume;
+            datetime dealTime=(datetime)HistoryDealGetInteger(dealTicket,DEAL_TIME);
+            if(dealTime>=closeTime)
             {
-               if(HistoryDealGetInteger(dealTicket,DEAL_ENTRY)==DEAL_ENTRY_OUT)
-               {
-                  double exit_price=HistoryDealGetDouble(dealTicket,DEAL_PRICE);
-                  double profit=HistoryDealGetDouble(dealTicket,DEAL_PROFIT);
-                  long deal_reason=HistoryDealGetInteger(dealTicket,DEAL_REASON);
-
-                  bool sl_hit=(deal_reason==DEAL_REASON_SL);
-                  bool tp_hit=(deal_reason==DEAL_REASON_TP);
-
-                  string result="BREAK_EVEN";
-                  if(profit>0.01) result="WIN";
-                  else if(profit<-0.01) result="LOSS";
-
-                  ulong keyTicket=(g_tracked[ti].order_ticket>0?g_tracked[ti].order_ticket:g_tracked[ti].position_ticket);
-                  UpdateSignalResultWithOpenTime(keyTicket,exit_price,profit,result,sl_hit,tp_hit,g_tracked[ti].open_time);
-
-                  // ★ TP/SL時のみクールダウンを設定
-                  if(sl_hit || tp_hit){
-                     g_cooldownUntil = TimeCurrent() + (CooldownAfterCloseMin*60);
-                     SafePrint(StringFormat("[COOLDOWN] Start %d min after %s (pos=%s)",
-                        CooldownAfterCloseMin, (tp_hit?"TP":"SL"), ULongToString(g_tracked[ti].position_ticket)));
-                  }
-
-                  // legacy single-slot reset if it matches
-                  if(g_trackedPositionTicket==g_tracked[ti].position_ticket){
-                     g_trackedPositionTicket=0;
-                     g_trackedOrderTicket=0;
-                     g_trackedPositionOpenTime=0;
-                     g_trackedPositionEntryPrice=0;
-                     g_trackedFillSent=false;
-                     g_trackedFillLastTry=0;
-                  }
-
-                  ClearTrackedSlot(ti);
-                  break;
-               }
+               closeTime=dealTime;
+               lastExitDeal=dealTicket;
             }
+            long dealReason=HistoryDealGetInteger(dealTicket,DEAL_REASON);
+            if(dealReason==DEAL_REASON_SL) slHit=true;
+            if(dealReason==DEAL_REASON_TP) tpHit=true;
          }
+
+         if(lastExitDeal==0 || exitVolume<=0) continue;
+
+         double exitPrice=exitPriceVolume/exitVolume;
+         double netProfit=grossProfit+commission+swapValue+fee;
+         string result="BREAK_EVEN";
+         if(netProfit>0.01) result="WIN";
+         else if(netProfit<-0.01) result="LOSS";
+
+         bool consistent=true;
+         string qualityReason="";
+         double directionalMove=(exitPrice-g_tracked[ti].entry_price)*g_tracked[ti].dir;
+         if(netProfit>0.01 && directionalMove < -_Point)
+         {
+            consistent=false;
+            qualityReason="positive_pnl_against_recorded_direction";
+         }
+         if(g_tracked[ti].dir==0 || g_tracked[ti].entry_price<=0)
+         {
+            consistent=false;
+            qualityReason="missing_entry_identity";
+         }
+
+         bool updated=UpdateSignalResultWithOpenTime(
+            g_tracked[ti].signal_id,g_tracked[ti].order_ticket,g_tracked[ti].position_id,
+            g_tracked[ti].position_ticket,g_tracked[ti].entry_deal_ticket,lastExitDeal,
+            exitPrice,netProfit,commission,swapValue,fee,result,slHit,tpHit,
+            consistent,qualityReason,g_tracked[ti].open_time,closeTime);
+         if(!updated) continue;
+
+         if(slHit || tpHit)
+         {
+            g_cooldownUntil=TimeCurrent()+(CooldownAfterCloseMin*60);
+            SafePrint(StringFormat("[COOLDOWN] Start %d min after %s (positionId=%s)",
+               CooldownAfterCloseMin,(tpHit?"TP":"SL"),ULongToString(g_tracked[ti].position_id)));
+         }
+
+         if(g_trackedPositionTicket==g_tracked[ti].position_ticket)
+         {
+            g_trackedPositionTicket=0;
+            g_trackedOrderTicket=0;
+            g_trackedPositionOpenTime=0;
+            g_trackedPositionEntryPrice=0;
+            g_trackedFillSent=false;
+            g_trackedFillLastTry=0;
+         }
+         ClearTrackedSlot(ti);
       }
    }
 
@@ -2476,6 +2618,12 @@ void CheckPositionStatus()
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
 
+   if(MaxPositions<1 || MaxPositions>100 || Lots<=0)
+   {
+      Alert("ERROR: BaseLotSize must be positive and MaxOpenTrades must be 1-100");
+      return(INIT_PARAMETERS_INCORRECT);
+   }
+
    if(AI_Bearer_Token=="" && EA_Log_Bearer_Token==""){
       Alert("ERROR: Bearer token is not set!");
       Print("[INIT] ERROR: AI_Bearer_Token and EA_Log_Bearer_Token are empty");
@@ -2485,7 +2633,8 @@ int OnInit(){
    int cap=(VirtualMaxWatches<10?10:VirtualMaxWatches);
    ArrayResize(g_virtual,cap);
 
-   int tcap=(TrackedMaxTrades<1?1:TrackedMaxTrades);
+   int requestedTrackCap=(MaxPositions>TrackedMaxTrades?MaxPositions:TrackedMaxTrades);
+   int tcap=(requestedTrackCap<1?1:(requestedTrackCap>100?100:requestedTrackCap));
    ArrayResize(g_tracked,tcap);
    for(int i=0;i<ArraySize(g_tracked);i++) ClearTrackedSlot(i);
 
