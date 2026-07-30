@@ -465,7 +465,9 @@ function makeRecommendationFromStats(stats: SymbolStats, marketNote?: string): P
   const virtualBayesian = stats.virtual_win_rate_bayesian ?? stats.virtual_win_rate ?? 0.40;
   const virtualEpisodes = stats.virtual_episode_trades ?? stats.virtual_trades ?? 0;
   const marketFitScore = stats.market_fit_score ?? 50;
-  const profitFactorLabel = stats.real_profit_factor === null ? "PF 未確定" : `PF ${stats.real_profit_factor.toFixed(2)}`;
+  const profitFactorLabel = typeof stats.real_profit_factor === "number" && Number.isFinite(stats.real_profit_factor)
+    ? `PF ${stats.real_profit_factor.toFixed(2)}`
+    : "PF 未確定";
   const baseReason = `実取引 ${stats.real_trades}件（補正勝率 ${(realBayesian * 100).toFixed(1)}%、${profitFactorLabel}）、仮想 ${virtualEpisodes}エピソード（補正勝率 ${(virtualBayesian * 100).toFixed(1)}%）、市場適合 ${marketFitScore.toFixed(1)}`;
   return {
     symbol: stats.symbol,
