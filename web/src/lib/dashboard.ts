@@ -404,6 +404,26 @@ function buildFunctionUrl(functionName: string, params: Record<string, string>) 
   return `${SUPABASE_URL}/functions/v1/${functionName}?${search.toString()}`;
 }
 
+const TRADE_RESULT_INTEGRITY_FIELDS = "mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version";
+
+async function fetchAiSignalsWithOptionalIntegrity(
+  params: Record<string, string>,
+  legacySelect: string,
+): Promise<AISignalRecord[]> {
+  try {
+    return await fetchJson<AISignalRecord[]>(buildRestUrl("ai_signals", {
+      ...params,
+      select: legacySelect.replace("order_ticket", `order_ticket,${TRADE_RESULT_INTEGRITY_FIELDS}`),
+    }));
+  } catch {
+    // Keep the dashboard available while a newly deployed UI is waiting for its DB migration.
+    return fetchJson<AISignalRecord[]>(buildRestUrl("ai_signals", {
+      ...params,
+      select: legacySelect,
+    }));
+  }
+}
+
 async function postJson<T>(url: string, body: unknown): Promise<T> {
   const response = await fetch(url, {
     method: "POST",
@@ -881,15 +901,13 @@ async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
 }
 
 async function fetchShadowTrades(): Promise<AISignalRecord[]> {
-  const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,probability_adjustments,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session,shadow_reason,mfe_r,mae_r",
+  return fetchAiSignalsWithOptionalIntegrity({
     is_virtual: "eq.true",
     reverse_execution: "eq.false",
     created_at: `gte.${toIsoDaysAgo(30)}`,
     order: "created_at.desc",
     limit: "2000",
-  });
-  return fetchJson<AISignalRecord[]>(url);
+  }, "id,created_at,symbol,timeframe,dir,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,probability_adjustments,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session,shadow_reason,mfe_r,mae_r");
 }
 
 async function fetchH1AuditTrades(): Promise<AISignalRecord[]> {
@@ -904,8 +922,7 @@ async function fetchH1AuditTrades(): Promise<AISignalRecord[]> {
 }
 
 async function fetchRecentTrades(): Promise<AISignalRecord[]> {
-  const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
+  return fetchAiSignalsWithOptionalIntegrity({
     is_virtual: "eq.false",
     or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
     reverse_execution: "eq.false",
@@ -913,26 +930,22 @@ async function fetchRecentTrades(): Promise<AISignalRecord[]> {
     actual_result: "in.(WIN,LOSS,BREAK_EVEN)",
     order: "closed_at.desc",
     limit: "12",
-  });
-  return fetchJson<AISignalRecord[]>(url);
+  }, "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session");
 }
 
 async function fetchOpenTrades(): Promise<AISignalRecord[]> {
-  const url = buildRestUrl("ai_signals", {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
+  return fetchAiSignalsWithOptionalIntegrity({
     is_virtual: "eq.false",
     or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
     actual_result: "eq.FILLED",
     closed_at: "is.null",
     order: "created_at.desc",
     limit: "8",
-  });
-  return fetchJson<AISignalRecord[]>(url);
+  }, "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session");
 }
 
 async function fetchClosedTrades(period: string): Promise<AISignalRecord[]> {
   const params: Record<string, string> = {
-    select: "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
     is_virtual: "eq.false",
     or: "(is_manual_trade.is.null,is_manual_trade.eq.false)",
     reverse_execution: "eq.false",
@@ -944,8 +957,10 @@ async function fetchClosedTrades(period: string): Promise<AISignalRecord[]> {
   if (period !== "all") {
     params.closed_at = `gte.${toIsoDaysAgo(Number(period))}`;
   }
-  const url = buildRestUrl("ai_signals", params);
-  return fetchJson<AISignalRecord[]>(url);
+  return fetchAiSignalsWithOptionalIntegrity(
+    params,
+    "id,created_at,symbol,timeframe,dir,win_prob,entry_price,exit_price,profit_loss,closed_at,actual_result,order_ticket,reason,decision_summary,entry_method,is_virtual,reverse_execution,is_manual_trade,trade_plan_id,plan_alignment,event_risk,market_session",
+  );
 }
 
 export async function getDashboardData(period = "30"): Promise<DashboardData> {
