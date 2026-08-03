@@ -1025,6 +1025,11 @@ export default async function Home({ searchParams }: PageProps) {
                 <span key={`open-${trade.id}`} className="rounded-full border border-amber-300/18 bg-amber-300/8 px-3 py-1 text-xs text-amber-100">保有中 {trade.symbol}{trade.dir != null ? ` ${trade.directionLabel}` : ""}</span>
               )) : <span className="rounded-full border border-white/10 bg-white/6 px-3 py-1 text-xs text-slate-300">現在保有なし</span>}
             </div>
+            {data.staleOpenTrades.length > 0 ? (
+              <div className="mb-4 border border-amber-300/25 bg-amber-950/20 px-3 py-2 text-xs text-amber-100">
+                決済状態の要確認: {data.staleOpenTrades.map((trade) => `${trade.symbol}${trade.order_ticket ? ` (${trade.order_ticket})` : ""}`).join(" / ")}
+              </div>
+            ) : null}
             <TradeCards trades={data.recentTrades} />
             <div className="hidden overflow-hidden rounded-3xl border border-white/8 md:block">
               <table className="min-w-full divide-y divide-white/8 text-sm">

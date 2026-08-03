@@ -354,6 +354,7 @@ type DashboardData = {
   recentEaLogs: EALogRecord[];
   recentTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
   openTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
+  staleOpenTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
   shadowAnalysis: ShadowAnalysis;
   opportunityAnalysis: OpportunityAnalysis;
   h1Audit: H1AuditSummary;
@@ -500,6 +501,10 @@ function summarizeTrades(trades: AISignalRecord[]): DashboardSummary {
     profitFactor: grossLoss > 0 ? round2(grossProfit / grossLoss) : null,
     qualityExcludedCount,
   };
+}
+
+function isStaleOpenTrade(trade: AISignalRecord) {
+  return Date.parse(trade.created_at) < Date.now() - 36 * 60 * 60 * 1000;
 }
 
 function summarizeDataIntegrity(closedTrades: AISignalRecord[], openTrades: AISignalRecord[]): DataIntegritySummary {
@@ -1030,7 +1035,9 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
   const pairSelector = pairSelectorResult.data;
   const recentEaLogs = recentEaLogsResult.data;
   const recentTrades = recentTradesResult.data;
-  const openTrades = openTradesResult.data;
+  const unresolvedTrades = openTradesResult.data;
+  const openTrades = unresolvedTrades.filter((trade) => !isStaleOpenTrade(trade));
+  const staleOpenTrades = unresolvedTrades.filter(isStaleOpenTrade);
   const selectedTrades = selectedTradesResult.data;
   const totalTrades = totalTradesResult.data;
   const shadowTrades = shadowTradesResult.data;
@@ -1053,10 +1060,11 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
     recentEaLogs,
     recentTrades: decorateTrades(recentTrades),
     openTrades: decorateTrades(openTrades),
+    staleOpenTrades: decorateTrades(staleOpenTrades),
     shadowAnalysis: summarizeShadowTrades(shadowTrades),
     opportunityAnalysis: summarizeOpportunityAnalysis(shadowTrades),
     h1Audit: summarizeH1Audit(h1AuditTrades),
-    dataIntegrity: summarizeDataIntegrity(totalTrades, openTrades),
+    dataIntegrity: summarizeDataIntegrity(totalTrades, unresolvedTrades),
     selectedPeriod: {
       key: period,
       label: periodLabel(period),
