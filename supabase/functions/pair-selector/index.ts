@@ -182,6 +182,7 @@ interface DailyTradePlan {
   summary: string;
   market_themes: string[];
   symbols: TradePlanSymbol[];
+  conditional_symbols: TradePlanSymbol[];
   selection_meta: SelectionMeta;
   global_rules: {
     avoid_high_impact_minutes_before: number;
@@ -564,7 +565,7 @@ function eventWindowsForSymbol(symbol: string, marketContext: MarketContext | nu
 }
 
 function planGatesForSymbol(symbol: string, riskLevel: MarketContext["risk_level"] | undefined): { min_win_prob: number; max_cost_r: number } {
-  const baseMin = riskLevel === "high" ? 0.52 : riskLevel === "medium" ? 0.50 : 0.48;
+  const baseMin = riskLevel === "high" ? 0.58 : riskLevel === "medium" ? 0.55 : 0.52;
   const baseCost = 0.20;
   if (symbol === "BTCUSD") return { min_win_prob: baseMin + 0.01, max_cost_r: baseCost };
   if (symbol === "XAUUSD" || symbol === "XAGUSD") return { min_win_prob: baseMin + 0.02, max_cost_r: 0.18 };
@@ -598,7 +599,7 @@ function makePlanSymbol(
     strategy,
     session_windows: rec.session_windows?.length ? rec.session_windows : defaultSessionWindows(rec.symbol, marketContext?.risk_level),
     avoid_event_windows: rec.avoid_event_windows?.length ? rec.avoid_event_windows : eventWindowsForSymbol(rec.symbol, marketContext),
-    min_win_prob: typeof rec.min_win_prob === "number" ? clamp(rec.min_win_prob, 0.45, 0.65) : gates.min_win_prob,
+    min_win_prob: typeof rec.min_win_prob === "number" ? clamp(rec.min_win_prob, 0.50, 0.75) : gates.min_win_prob,
     max_cost_r: typeof rec.max_cost_r === "number"
       ? Math.min(clamp(rec.max_cost_r, 0.05, 0.20), gates.max_cost_r)
       : gates.max_cost_r,
@@ -611,7 +612,7 @@ function makePlanSymbol(
 
 function attachPlanToRecommendations(recs: PairRecommendation[], plan: DailyTradePlan | undefined): PairRecommendation[] {
   if (!plan) return recs;
-  const bySymbol = new Map(plan.symbols.map((item) => [item.symbol, item]));
+  const bySymbol = new Map([...plan.symbols, ...(plan.conditional_symbols ?? [])].map((item) => [item.symbol, item]));
   return recs.map((rec) => {
     const item = bySymbol.get(rec.symbol);
     if (!item) return rec;
@@ -646,15 +647,19 @@ function buildFallbackTradePlan(
   marketContext: MarketContext | null,
   summary: string,
   selectionMeta = defaultSelectionMeta(selected.length),
+  conditional: PairRecommendation[] = [],
 ): DailyTradePlan {
   const now = new Date();
   const statsBySymbol = new Map(stats.map((item) => [item.symbol, item]));
   const symbols = selected.slice(0, Math.max(1, selected.length)).map((rec) =>
     makePlanSymbol(rec, statsBySymbol.get(rec.symbol), marketContext)
   );
+  const conditionalSymbols = conditional.map((rec) =>
+    makePlanSymbol(rec, statsBySymbol.get(rec.symbol), marketContext)
+  );
 
   return {
-    plan_version: "daily-plan-v1",
+    plan_version: "daily-plan-v2-pair-gates",
     plan_date: now.toISOString().slice(0, 10),
     generated_at: now.toISOString(),
     expires_at: new Date(now.getTime() + 30 * 60 * 60 * 1000).toISOString(),
@@ -663,6 +668,7 @@ function buildFallbackTradePlan(
     summary: summary || marketContext?.summary || "現在の市場環境とシステム実績から作成した日次トレード計画です。",
     market_themes: (marketContext?.themes ?? []).slice(0, 5),
     symbols,
+    conditional_symbols: conditionalSymbols,
     selection_meta: selectionMeta,
     global_rules: {
       avoid_high_impact_minutes_before: 60,
@@ -673,7 +679,7 @@ function buildFallbackTradePlan(
   };
 }
 
-function normalizeTradePlan(
+export function normalizeTradePlan(
   value: unknown,
   selected: PairRecommendation[],
   stats: SymbolStats[],
@@ -681,19 +687,30 @@ function normalizeTradePlan(
   marketContext: MarketContext | null,
   summary: string,
   selectionMeta = defaultSelectionMeta(selected.length),
+  conditional: PairRecommendation[] = [],
 ): DailyTradePlan {
-  const fallback = buildFallbackTradePlan(selected, stats, timeframe, marketContext, summary, selectionMeta);
+  const fallback = buildFallbackTradePlan(selected, stats, timeframe, marketContext, summary, selectionMeta, conditional);
   if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
   const raw = value as any;
   const symbolsRaw = Array.isArray(raw.symbols) ? raw.symbols : [];
+  const conditionalRaw = Array.isArray(raw.conditional_symbols) ? raw.conditional_symbols : [];
+  const allAiPlanSymbols = [...symbolsRaw, ...conditionalRaw];
   const statsBySymbol = new Map(stats.map((item) => [item.symbol, item]));
   const validSelected = new Set(selected.map((rec) => rec.symbol));
-  const aiSymbols: TradePlanSymbol[] = symbolsRaw
+  const aiSymbols: TradePlanSymbol[] = allAiPlanSymbols
     .filter((item: any) => typeof item?.symbol === "string" && validSelected.has(item.symbol))
     .map((item: any) => makePlanSymbol(item as PairRecommendation, statsBySymbol.get(item.symbol), marketContext));
   const aiBySymbol = new Map<string, TradePlanSymbol>(aiSymbols.map((item) => [item.symbol, item]));
   const symbols = selected.map((rec) =>
     aiBySymbol.get(rec.symbol) ?? makePlanSymbol(rec, statsBySymbol.get(rec.symbol), marketContext)
+  );
+  const validConditional = new Set(conditional.map((rec) => rec.symbol));
+  const aiConditionalSymbols: TradePlanSymbol[] = allAiPlanSymbols
+    .filter((item: any) => typeof item?.symbol === "string" && validConditional.has(item.symbol))
+    .map((item: any) => makePlanSymbol(item as PairRecommendation, statsBySymbol.get(item.symbol), marketContext));
+  const aiConditionalBySymbol = new Map<string, TradePlanSymbol>(aiConditionalSymbols.map((item) => [item.symbol, item]));
+  const conditionalSymbols = conditional.map((rec) =>
+    aiConditionalBySymbol.get(rec.symbol) ?? makePlanSymbol(rec, statsBySymbol.get(rec.symbol), marketContext)
   );
 
   return {
@@ -702,6 +719,7 @@ function normalizeTradePlan(
     market_themes: Array.isArray(raw.market_themes) ? raw.market_themes.filter((x: unknown) => typeof x === "string").slice(0, 5) : fallback.market_themes,
     risk_level: raw.risk_level === "low" || raw.risk_level === "medium" || raw.risk_level === "high" ? raw.risk_level : fallback.risk_level,
     symbols: symbols.length > 0 ? symbols : fallback.symbols,
+    conditional_symbols: conditionalSymbols,
     selection_meta: selectionMeta,
     global_rules: {
       ...fallback.global_rules,
@@ -824,9 +842,12 @@ function buildSelectionView(
   const recommended_pairs = ranked_pairs
     .filter((x) => x.category === "recommended")
     .map(({ category: _category, ...rest }) => rest);
-  const neutral_pairs = ranked_pairs
-    .filter((x) => x.category === "neutral")
-    .map(({ category: _category, ...rest }) => rest);
+  const neutral_pairs = attachPlanToRecommendations(
+    ranked_pairs
+      .filter((x) => x.category === "neutral")
+      .map(({ category: _category, ...rest }) => rest),
+    aiSelection.trade_plan,
+  );
   const avoided_pairs = ranked_pairs
     .filter((x) => x.category === "avoid")
     .sort((a, b) => a.score - b.score)
@@ -840,6 +861,22 @@ function buildSelectionView(
     avoided_pairs,
     ranked_pairs,
   };
+}
+
+function buildConditionalRecommendations(
+  stats: SymbolStats[],
+  selected: PairRecommendation[],
+  avoided: PairRecommendation[],
+  marketContext: MarketContext | null,
+): PairRecommendation[] {
+  const selectedSymbols = new Set(selected.map((item) => item.symbol.toUpperCase()));
+  const avoidedSymbols = new Set(avoided.map((item) => item.symbol.toUpperCase()));
+  return stats
+    .filter((item) => item.market_eligible !== false)
+    .filter((item) => !selectedSymbols.has(item.symbol.toUpperCase()) && !avoidedSymbols.has(item.symbol.toUpperCase()))
+    .filter((item) => item.compatibility_score >= 45)
+    .sort((a, b) => b.compatibility_score - a.compatibility_score)
+    .map((item) => makeRecommendationFromStats(item, noteForSymbol(marketContext, item.symbol)));
 }
 
 function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string, marketContext: MarketContext | null): AiSelectionResult {
@@ -859,7 +896,16 @@ function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string
   }
 
   const summary = marketContext?.summary || "現在の市場反応と直近実績を併用した簡易選定です。";
-  const trade_plan = buildFallbackTradePlan(selected_pairs.slice(0, topN), stats, timeframe, marketContext, summary);
+  const conditionalPairs = buildConditionalRecommendations(stats, selected_pairs, avoided_pairs, marketContext);
+  const trade_plan = buildFallbackTradePlan(
+    selected_pairs.slice(0, topN),
+    stats,
+    timeframe,
+    marketContext,
+    summary,
+    defaultSelectionMeta(selected_pairs.slice(0, topN).length),
+    conditionalPairs,
+  );
 
   return {
     summary,
@@ -1848,13 +1894,14 @@ async function askOpenAi(stats: SymbolStats[], topN: number, cadence: string, ti
 - このシステムは ${timeframe} を使う
 - top ${topN} 件を選ぶ
 - 理由は「現在の市場環境」と「このシステムの直近実績」の両方に触れる
-- 選んだ銘柄ごとに、今日だけ許可する方向・戦略・取引時間帯・避けるイベント・実行ゲートを決める
+- 推奨ペアと条件付き許可ペアの全銘柄について、今日だけ許可する方向・戦略・取引時間帯・避けるイベント・実行ゲートを個別に決める
 - 勝率の最大化ではなく、RR=1.5と取引コストを踏まえた期待値を最大化する
-- 勝率50%前後でもコスト控除後の期待値が正なら候補として残す
-- min_win_probは通常0.48～0.55。根拠なく0.60以上へ引き上げない
+- min_win_probは全銘柄共通値にせず、その日の相場、銘柄特性、実績、コストから0.50～0.75の範囲で個別に決める
+- 条件が良いからゲートを上げるのではなく、予測の不確実性・損失傾向・コストが高いほど必要勝率を上げる
 - max_cost_rは直近の独立機会でプラスだった0.20R以下を基本にする
 - allowed_direction は buy/sell/both/none のいずれか。迷うなら both ではなく根拠のある方向へ絞る
 - strategy は trend_follow/pullback/mean_revert/breakout/standby のいずれか
+- session_windowsは銘柄ごとに当日の有効時間をUTCのHH:MMで指定する。東京時間帯も相場適合があれば選択肢から外さない
 - 高重要イベントに影響される銘柄は、その前後を avoid_event_windows に入れる
 
 現在の市場環境:
@@ -1867,7 +1914,7 @@ JSONのみで回答:
 {
   "summary": "日本語で、市場環境とシステム適合性を2-3文で要約",
   "selected_pairs": [
-    {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"...","allowed_direction":"buy|sell|both|none","strategy":"trend_follow|pullback|mean_revert|breakout|standby","min_win_prob":0.50,"max_cost_r":0.20}
+    {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"...","allowed_direction":"buy|sell|both|none","strategy":"trend_follow|pullback|mean_revert|breakout|standby","min_win_prob":0.58,"max_cost_r":0.20}
   ],
   "avoided_pairs": [
     {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"..."}
@@ -1881,8 +1928,23 @@ JSONのみで回答:
         "symbol": "X",
         "allowed_direction": "buy|sell|both|none",
         "strategy": "trend_follow|pullback|mean_revert|breakout|standby",
-        "min_win_prob": 0.50,
+        "session_windows": [{"label":"Tokyo|London|New York|custom","start_utc":"00:00","end_utc":"09:00"}],
+        "min_win_prob": 0.58,
         "max_cost_r": 0.20,
+        "confidence": "high|medium|low",
+        "score": 0-100,
+        "reason": "日本語で具体的に",
+        "setup_focus": ["H1 trend confirmation", "spread cost below gate"]
+      }
+    ],
+    "conditional_symbols": [
+      {
+        "symbol": "推奨外かつ回避外のX",
+        "allowed_direction": "buy|sell|both|none",
+        "strategy": "trend_follow|pullback|mean_revert|breakout|standby",
+        "session_windows": [{"label":"Tokyo|London|New York|custom","start_utc":"00:00","end_utc":"09:00"}],
+        "min_win_prob": 0.61,
+        "max_cost_r": 0.18,
         "confidence": "high|medium|low",
         "score": 0-100,
         "reason": "日本語で具体的に",
@@ -1915,7 +1977,18 @@ JSONのみで回答:
     const fallbackSelected = selected_pairs.length > 0
       ? selected_pairs
       : fallbackSelection(stats, topN, timeframe, marketContext).selected_pairs;
-    const trade_plan = normalizeTradePlan(parsed?.trade_plan, fallbackSelected.slice(0, topN), stats, timeframe, marketContext, summary);
+    const conditionalPairs = buildConditionalRecommendations(stats, fallbackSelected, avoided_pairs, marketContext);
+    const selectedForPlan = fallbackSelected.slice(0, topN);
+    const trade_plan = normalizeTradePlan(
+      parsed?.trade_plan,
+      selectedForPlan,
+      stats,
+      timeframe,
+      marketContext,
+      summary,
+      defaultSelectionMeta(selectedForPlan.length),
+      conditionalPairs,
+    );
 
     return {
       summary,
@@ -1944,6 +2017,7 @@ async function generateReport(body: any) {
   const finalized = finalizeSelection(aiSelection, stats, topN, enrichedContext);
   aiSelection.selected_pairs = finalized.selected;
   aiSelection.avoided_pairs = finalized.avoided;
+  const conditionalPairs = buildConditionalRecommendations(stats, finalized.selected, finalized.avoided, enrichedContext);
   const tradePlan = normalizeTradePlan(
     aiSelection.trade_plan,
     finalized.selected,
@@ -1952,6 +2026,7 @@ async function generateReport(body: any) {
     enrichedContext,
     aiSelection.summary || enrichedContext?.summary || "",
     finalized.meta,
+    conditionalPairs,
   );
   aiSelection.trade_plan = tradePlan;
   aiSelection.selected_pairs = attachPlanToRecommendations(aiSelection.selected_pairs, tradePlan);
@@ -2068,13 +2143,22 @@ if (import.meta.main) Deno.serve(async (req: Request) => {
           avoided_pairs: Array.isArray(report?.avoided_pairs) ? report.avoided_pairs : [],
         };
         const liveContext = applySystemFitToContext(liveContextRaw, stats);
+        const conditionalPairs = buildConditionalRecommendations(
+          stats,
+          aiSelection.selected_pairs,
+          aiSelection.avoided_pairs,
+          liveContext,
+        );
+        const selectedForPlan = aiSelection.selected_pairs.slice(0, Number(report?.top_n ?? DEFAULT_TOP_N));
         const reportPlan = normalizeTradePlan(
           report?.trade_plan,
-          aiSelection.selected_pairs.slice(0, Number(report?.top_n ?? DEFAULT_TOP_N)),
+          selectedForPlan,
           stats,
           String(report?.timeframe ?? DEFAULT_TIMEFRAME),
           liveContext,
           aiSelection.summary,
+          defaultSelectionMeta(selectedForPlan.length),
+          conditionalPairs,
         );
         aiSelection.trade_plan = reportPlan;
         aiSelection.selected_pairs = attachPlanToRecommendations(aiSelection.selected_pairs, reportPlan);

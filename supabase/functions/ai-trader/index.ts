@@ -6,6 +6,7 @@ import {
   finalizeDecisionSummaryText,
   isMinuteWithinWindow,
   qualifiesForOpportunityOverride,
+  resolveAbsoluteManualProbabilityGate,
   resolveDetailedFinalProbability,
   resolveManualProbabilityGate,
   resolveOpportunityGate,
@@ -604,7 +605,7 @@ type DailyPlanSymbol = {
   setup_focus?: string[];
 };
 
-type GateAdjustment = -0.10 | -0.05 | 0 | 0.05 | 0.10;
+type GateAdjustment = number;
 type PlanGateMode = "more_active" | "active" | "ai" | "cautious" | "very_cautious";
 type ManualSessionOverride = {
   mode: "custom" | "all_day";
@@ -728,6 +729,22 @@ export interface TradeRequest {
 }
 
 export interface TradeResponse {
+  // Probability targets are explicit from v3 onward. win_prob remains an alias
+  // of tp_before_sl_prob_final for backwards-compatible EA execution.
+  direction_prob?: number;
+  direction_prob_raw?: number;
+  tp_before_sl_prob?: number;
+  tp_before_sl_prob_raw?: number;
+  tp_before_sl_prob_calibrated?: number;
+  tp_before_sl_prob_final?: number;
+  probability_target_version?: string;
+  direction_horizon_minutes?: number;
+  planned_entry_price?: number;
+  planned_sl?: number;
+  planned_tp?: number;
+  planned_reward_rr?: number;
+  planned_risk_atr_mult?: number;
+  planned_cost_r?: number;
   win_prob: number;
   win_prob_raw?: number;
   win_prob_calibrated?: number;
@@ -747,6 +764,10 @@ export interface TradeResponse {
   // dir=0（両方向評価）のとき、EAが簡単に表示/保存できるように top-level で返す
   buy_win_prob?: number;
   sell_win_prob?: number;
+  buy_direction_prob?: number;
+  sell_direction_prob?: number;
+  buy_tp_before_sl_prob?: number;
+  sell_tp_before_sl_prob?: number;
   buy_action?: number;
   sell_action?: number;
   offset_factor: number;
@@ -754,7 +775,7 @@ export interface TradeResponse {
   confidence?: string;
   reasoning?: string;
   // Dynamic gating / EV
-  recommended_min_win_prob?: number; // 0.60 - 0.75 (never higher to avoid reducing opportunities)
+  recommended_min_win_prob?: number; // 0.50 - 0.75; the daily pair plan owns the execution gate
   expected_value_r?: number; // EV in R-multiples (loss=-1R, win=+1.5R)
   reward_rr?: number;
   risk_atr_mult?: number;
@@ -781,8 +802,8 @@ export interface TradeResponse {
   // Optional debug payload for dual-direction evaluation
   direction_eval?: {
     selected_dir: number;
-    buy?: { win_prob: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
-    sell?: { win_prob: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
+    buy?: { win_prob: number; direction_prob?: number; tp_before_sl_prob?: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
+    sell?: { win_prob: number; direction_prob?: number; tp_before_sl_prob?: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
   };
 
   // Daily trade plan diagnostics
@@ -867,6 +888,7 @@ function buildDecisionSummary(opts: {
   willExecute: boolean;
   dir: number;
   winProb: number;
+  directionProb?: number;
   effectiveGate: number;
   expectedValueR: number;
   minEvR: number;
@@ -882,6 +904,8 @@ function buildDecisionSummary(opts: {
   const parts = [
     `${status} ${dirLabel}`,
     `p=${round3(opts.winProb)}`,
+    `target=tp_before_sl`,
+    ...(typeof opts.directionProb === "number" ? [`dirP=${round3(opts.directionProb)}`] : []),
     `gate=${round3(opts.effectiveGate)}`,
     `ev=${round3(opts.expectedValueR)}R`,
     `minEv=${round3(opts.minEvR)}R`,
@@ -941,40 +965,20 @@ function activeEventWindow(item: DailyPlanSymbol | null | undefined): NonNullabl
   return null;
 }
 
-function normalizeGateAdjustment(value: unknown): GateAdjustment {
-  const numeric = typeof value === "number" ? value : Number(value);
-  if (Math.abs(numeric - 0.10) < 0.0001) return 0.10;
-  if (Math.abs(numeric - 0.05) < 0.0001) return 0.05;
-  if (Math.abs(numeric + 0.10) < 0.0001) return -0.10;
-  if (Math.abs(numeric + 0.05) < 0.0001) return -0.05;
-  return 0;
-}
-
-function resolvePlanGateAdjustment(plan: DailyPlanContext, symbol: string): {
+function resolvePlanGateAdjustment(_plan: DailyPlanContext, _symbol: string): {
   adjustment: GateAdjustment;
   mode: PlanGateMode;
   manual: boolean;
 } {
-  const overrides = plan.plan_overrides ?? {};
-  const bySymbol = overrides.symbol_gate_adjustments;
-  const symbolKey = symbol.toUpperCase();
-  const symbolValues = bySymbol && typeof bySymbol === "object"
-    ? bySymbol as Record<string, unknown>
-    : {};
-  const hasSymbolValue = Object.prototype.hasOwnProperty.call(symbolValues, symbolKey);
-  const symbolValue = hasSymbolValue ? symbolValues[symbolKey] : undefined;
-  const hasGlobalValue = Object.prototype.hasOwnProperty.call(overrides, "gate_adjustment");
-  const adjustment = normalizeGateAdjustment(symbolValue ?? overrides.gate_adjustment);
-  const mode = adjustment === 0.10
-    ? "very_cautious"
-    : adjustment === 0.05
-    ? "cautious"
-    : adjustment === -0.10
-    ? "more_active"
-    : adjustment === -0.05
-    ? "active"
-    : "ai";
-  return { adjustment, mode, manual: adjustment !== 0 && (hasSymbolValue || hasGlobalValue) };
+  // Legacy +/-5pt overrides are intentionally ignored. The dashboard now stores
+  // an explicit per-symbol final gate in symbol_min_win_probs.
+  return { adjustment: 0, mode: "ai", manual: false };
+}
+
+function resolvePlanManualMinWinProb(plan: DailyPlanContext, symbol: string): number | null {
+  const raw = plan.plan_overrides?.symbol_min_win_probs;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return resolveAbsoluteManualProbabilityGate((raw as Record<string, unknown>)[symbol.toUpperCase()]);
 }
 
 function resolveManualExecutionGate(
@@ -983,14 +987,25 @@ function resolveManualExecutionGate(
   fallbackBaseGate?: number,
 ): { gate: number; adjustment: GateAdjustment; mode: PlanGateMode } | null {
   if (!plan) return null;
+  const manualMinWinProb = resolvePlanManualMinWinProb(plan, symbol);
   const override = resolvePlanGateAdjustment(plan, symbol);
+  const floor = getMinWinProbFloor();
+  const baseGate = Math.max(
+    floor,
+    typeof fallbackBaseGate === "number" ? fallbackBaseGate : floor,
+    typeof plan.item?.min_win_prob === "number" ? plan.item.min_win_prob : floor,
+  );
+  if (manualMinWinProb !== null) {
+    const adjustment = round3(manualMinWinProb - baseGate);
+    return {
+      gate: manualMinWinProb,
+      adjustment,
+      mode: adjustment > 0 ? "cautious" : adjustment < 0 ? "active" : "ai",
+    };
+  }
   if (!override.manual) return null;
-  const baseGate = typeof plan.item?.min_win_prob === "number"
-    ? plan.item.min_win_prob
-    : fallbackBaseGate;
-  if (typeof baseGate !== "number") return null;
   return {
-    gate: resolveManualProbabilityGate(baseGate, override.adjustment),
+    gate: resolveManualProbabilityGate(baseGate, override.adjustment, floor),
     adjustment: override.adjustment,
     mode: override.mode,
   };
@@ -1063,7 +1078,8 @@ async function fetchDailyPlanContext(req: TradeRequest): Promise<DailyPlanContex
   const avoidedPairs = Array.isArray(report?.avoided_pairs) ? report.avoided_pairs : [];
   const universe = Array.isArray(report?.universe) ? report.universe : [];
   const planSymbols = Array.isArray(plan?.symbols) ? plan.symbols : [];
-  const item = [...planSymbols, ...selectedPairs].find((row: any) => {
+  const conditionalSymbols = Array.isArray(plan?.conditional_symbols) ? plan.conditional_symbols : [];
+  const item = [...planSymbols, ...conditionalSymbols, ...selectedPairs].find((row: any) => {
     return typeof row?.symbol === "string" && row.symbol.toUpperCase() === req.symbol.toUpperCase();
   }) ?? null;
   const extractSymbols = (values: unknown[]) => values.flatMap((value: unknown) => {
@@ -1109,7 +1125,7 @@ function buildDailyPlanPrompt(plan: DailyPlanContext | null, req: TradeRequest):
   if (!plan) {
     return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n最新の日次計画は取得できませんでした。EAの上位足/セッション/構造情報を通常の判断補助として使ってください。\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}`;
   }
-  return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• report_id=${plan.report_id ?? "N/A"} status=${plan.plan_status} risk=${plan.risk_level ?? "unknown"}\n• symbol_membership=${plan.membership}\n• avoid_reason=${plan.avoid_reason ?? "N/A"}\n• summary=${plan.summary ?? "N/A"}\n• themes=${(plan.market_themes ?? []).join(" / ") || "N/A"}\n• symbol_plan=${JSON.stringify(plan.item ?? null)}\n• manual_overrides=${JSON.stringify(plan.plan_overrides ?? {})}\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}\n\nselected は日次計画の方向・時間帯・個別ゲートを適用します。eligible_unselected は通常の勝率・期待値・コスト・チャート・イベント条件を満たせば取引可能です。avoided と unlisted は取引禁止です。日次計画に反する方向・時間帯・イベント直前直後・上位足逆行・節目直前・異常コストのエントリーは、勝率を保守的に見積もってください。ダッシュボードの手動設定はAI推奨より優先してください。`;
+  return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• report_id=${plan.report_id ?? "N/A"} status=${plan.plan_status} risk=${plan.risk_level ?? "unknown"}\n• symbol_membership=${plan.membership}\n• avoid_reason=${plan.avoid_reason ?? "N/A"}\n• summary=${plan.summary ?? "N/A"}\n• themes=${(plan.market_themes ?? []).join(" / ") || "N/A"}\n• symbol_plan=${JSON.stringify(plan.item ?? null)}\n• manual_overrides=${JSON.stringify(plan.plan_overrides ?? {})}\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}\n\nselected と eligible_unselected は、それぞれの日次計画にある方向・時間帯・個別ゲートを適用します。eligible_unselected はそのうえで通常の期待値・コスト・チャート・イベント条件を満たせば取引可能です。avoided と unlisted は取引禁止です。日次計画に反する方向・時間帯・イベント直前直後・上位足逆行・節目直前・異常コストのエントリーは、勝率を保守的に見積もってください。ダッシュボードの手動設定はAI推奨より優先してください。`;
 }
 
 function contextNumber(source: Record<string, number | string | null> | undefined, key: string): number | null {
@@ -1237,11 +1253,25 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
       : "symbol_unlisted"
   );
   const gateOverride = resolvePlanGateAdjustment(plan, tradeReq.symbol);
+  const manualMinWinProb = resolvePlanManualMinWinProb(plan, tradeReq.symbol);
   const sessionOverride = resolvePlanSessionOverride(plan, tradeReq.symbol);
-  const planBaseGate = typeof item?.min_win_prob === "number" ? clampWinProb(item.min_win_prob) : null;
-  const planEffectiveGate = planBaseGate === null
-    ? null
-    : resolveManualProbabilityGate(planBaseGate, gateOverride.adjustment);
+  const minimumGateFloor = getMinWinProbFloor();
+  const planBaseGate = Math.max(
+    minimumGateFloor,
+    typeof item?.min_win_prob === "number" ? clampWinProb(item.min_win_prob) : minimumGateFloor,
+  );
+  const planEffectiveGate = manualMinWinProb ?? resolveManualProbabilityGate(
+    planBaseGate,
+    gateOverride.adjustment,
+    minimumGateFloor,
+  );
+  const planGateAdjustment = round3(planEffectiveGate - planBaseGate);
+  const planGateManual = manualMinWinProb !== null || gateOverride.manual;
+  const planGateMode: PlanGateMode = planGateAdjustment > 0
+    ? "cautious"
+    : planGateAdjustment < 0
+    ? "active"
+    : "ai";
 
   if (plan.plan_status === "paused") hardReasons.push("daily_plan_paused");
   if (plan.membership === "avoided") hardReasons.push("daily_plan_symbol_avoided");
@@ -1259,6 +1289,14 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
     hardReasons.push("daily_plan_event_window");
   }
 
+  if (actionDir !== 0 && sessionOverride?.mode === "custom") {
+    const manualWindows = sessionOverride.windows ?? [];
+    if (manualWindows.length > 0 && !manualWindows.some((window) => isNowInJstSessionWindow(window))) {
+      hardReasons.push("daily_plan_manual_session_closed");
+      alignment = "manual_session_mismatch";
+    }
+  }
+
   if (item && actionDir !== 0) {
     const allowed = item.allowed_direction ?? "both";
     const actual = directionToPlanLabel(actionDir);
@@ -1267,13 +1305,7 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
       alignment = "direction_mismatch";
     }
 
-    if (sessionOverride?.mode === "custom") {
-      const manualWindows = sessionOverride.windows ?? [];
-      if (manualWindows.length > 0 && !manualWindows.some((window) => isNowInJstSessionWindow(window))) {
-        hardReasons.push("daily_plan_manual_session_closed");
-        alignment = "manual_session_mismatch";
-      }
-    } else if (sessionOverride?.mode !== "all_day") {
+    if (!sessionOverride) {
       const sessions = item.session_windows ?? [];
       if (sessions.length > 0 && !sessions.some((window) => isNowInSessionWindow(window, tradeReq.utc_hour))) {
         softReasons.push("daily_plan_session_closed");
@@ -1281,8 +1313,8 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
       }
     }
 
-    if (planEffectiveGate !== null && response.win_prob < planEffectiveGate) {
-      if (gateOverride.manual) {
+    if (response.win_prob < planEffectiveGate) {
+      if (planGateManual) {
         hardReasons.push("daily_plan_manual_gate");
       } else {
         softReasons.push("daily_plan_winprob_below_plan");
@@ -1300,6 +1332,9 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
       softReasons.push("daily_plan_htf_conflict");
       alignment = "htf_conflict";
     }
+  } else if (actionDir !== 0 && response.win_prob < planEffectiveGate) {
+    hardReasons.push(planGateManual ? "daily_plan_manual_gate" : "daily_plan_winprob_below_plan");
+    alignment = "plan_gate_miss";
   }
 
   const planTag =
@@ -1308,7 +1343,7 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
     `${item?.allowed_direction ? ` dir=${item.allowed_direction}` : ""}` +
     `${item?.strategy ? ` strategy=${item.strategy}` : ""}` +
     `${sessionOverride ? ` session=${sessionOverride.mode}_jst` : " session=ai"}` +
-    `${planEffectiveGate !== null ? ` gate=${round3(planBaseGate!)}+${round3(gateOverride.adjustment)}=>${round3(planEffectiveGate)}` : ""})`;
+    ` gate=${round3(planBaseGate)}+${round3(planGateAdjustment)}=>${round3(planEffectiveGate)})`;
 
   const withDiagnostics = {
     ...response,
@@ -1316,15 +1351,13 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
     plan_alignment: alignment,
     event_risk: eventRisk,
     plan_base_min_win_prob: planBaseGate,
-    plan_gate_adjustment: gateOverride.adjustment,
+    plan_gate_adjustment: planGateAdjustment,
     plan_effective_min_win_prob: planEffectiveGate,
-    plan_gate_mode: gateOverride.mode,
+    plan_gate_mode: planGateMode,
     daily_plan: plan,
     reasoning: appendReasonText(response.reasoning, planTag),
     method_reason: appendReasonText(response.method_reason, planTag),
-    decision_summary: planEffectiveGate === null
-      ? response.decision_summary
-      : appendReasonText(response.decision_summary, `planGate=${round3(planBaseGate!)}+${round3(gateOverride.adjustment)}=>${round3(planEffectiveGate)}`),
+    decision_summary: appendReasonText(response.decision_summary, `planGate=${round3(planBaseGate)}+${round3(planGateAdjustment)}=>${round3(planEffectiveGate)}`),
   } as TradeResponse;
 
   if (actionDir === 0 || (hardReasons.length === 0 && softReasons.length === 0)) return withDiagnostics;
@@ -1702,6 +1735,8 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
   const calibrationOk = !calibrationRequired || debug.applied;
 
   const dir = (base.action === 1 || base.action === -1) ? base.action : 0;
+  const probabilityDir = dir === -1 ? -1 : 1;
+  const probabilityContract = buildProbabilityContract(req, probabilityDir, rt);
   const rsiGuard = applyExtremeRsiPenalty({ req, dir, winProb: calibrated, costR: rt.costR });
   const afterRsi = rsiGuard.winProb;
 
@@ -1784,6 +1819,7 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     willExecute: action !== 0,
     dir,
     winProb: winProbFinal,
+    directionProb: raw,
     effectiveGate: effective_gate,
     expectedValueR: expected_value_r,
     minEvR,
@@ -1796,6 +1832,20 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
 
   return {
     ...base,
+    direction_prob: round3(raw),
+    direction_prob_raw: round3(raw),
+    tp_before_sl_prob: round3(winProbFinal),
+    tp_before_sl_prob_raw: round3(raw),
+    tp_before_sl_prob_calibrated: round3(calibrated),
+    tp_before_sl_prob_final: round3(winProbFinal),
+    probability_target_version: "fallback_shared_estimate_v2",
+    direction_horizon_minutes: probabilityContract.directionHorizonMinutes,
+    planned_entry_price: probabilityContract.entry,
+    planned_sl: probabilityContract.sl,
+    planned_tp: probabilityContract.tp,
+    planned_reward_rr: probabilityContract.rewardRR,
+    planned_risk_atr_mult: probabilityContract.riskAtrMult,
+    planned_cost_r: probabilityContract.costR,
     win_prob: round3(winProbFinal),
     action,
     decision_summary,
@@ -1836,10 +1886,7 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
 
 function sanitizeRecommendedMinWinProb(v: unknown): number | null {
   if (typeof v !== "number" || !isFinite(v)) return null;
-  // Policy:
-  // - never raise above 0.75 (avoid reducing trade opportunities)
-  // - allow values below 0.60 because win_prob may be calibrated downward
-  const clamped = Math.max(0.40, Math.min(0.75, v));
+  const clamped = Math.max(0.50, Math.min(0.75, v));
   return Math.round(clamped * 1000) / 1000;
 }
 
@@ -1850,9 +1897,9 @@ function getMinEvR(): number {
 }
 
 function getMinWinProbFloor(): number {
-  const v = Number(Deno.env.get("AI_TRADER_OPPORTUNITY_MIN_WIN_PROB") ?? 0.48);
-  if (!Number.isFinite(v)) return 0.48;
-  return Math.max(0.40, Math.min(0.75, Math.round(v * 1000) / 1000));
+  const v = Number(Deno.env.get("AI_TRADER_OPPORTUNITY_MIN_WIN_PROB") ?? 0.50);
+  if (!Number.isFinite(v)) return 0.50;
+  return Math.max(0.50, Math.min(0.75, Math.round(v * 1000) / 1000));
 }
 
 function getMaxCostR(): number {
@@ -2114,6 +2161,36 @@ async function getRuntimeTradeParams(req: TradeRequest): Promise<{
   };
 }
 
+function getDirectionHorizonMinutes(): number {
+  const parsed = Number(Deno.env.get("AI_TRADER_DIRECTION_HORIZON_MINUTES") ?? 60);
+  if (!Number.isFinite(parsed)) return 60;
+  return Math.max(15, Math.min(240, Math.round(parsed)));
+}
+
+function buildProbabilityContract(
+  req: TradeRequest,
+  dir: number,
+  rt: Awaited<ReturnType<typeof getRuntimeTradeParams>>,
+) {
+  const roundPrice = (value: number) => Math.round(value * 100_000_000) / 100_000_000;
+  const entry = dir > 0
+    ? (Number.isFinite(req.ask) && req.ask > 0 ? req.ask : req.price)
+    : (Number.isFinite(req.bid) && req.bid > 0 ? req.bid : req.price);
+  const riskDistance = Math.max(0, req.atr * rt.riskAtrMult);
+  const rewardDistance = riskDistance * rt.rewardRR;
+  const sl = dir > 0 ? entry - riskDistance : entry + riskDistance;
+  const tp = dir > 0 ? entry + rewardDistance : entry - rewardDistance;
+  return {
+    directionHorizonMinutes: getDirectionHorizonMinutes(),
+    entry: roundPrice(entry),
+    sl: roundPrice(sl),
+    tp: roundPrice(tp),
+    rewardRR: round3(rt.rewardRR),
+    riskAtrMult: round3(rt.riskAtrMult),
+    costR: round3(rt.costR),
+  };
+}
+
 function computeEvGateMinWinProb(opts: { rewardRR: number; costR: number; minEvR: number }): number {
   const rr = Number.isFinite(opts.rewardRR) && opts.rewardRR > 0 ? opts.rewardRR : 1.5;
   const costR = Number.isFinite(opts.costR) && opts.costR > 0 ? opts.costR : 0;
@@ -2309,6 +2386,22 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
     : "N/A";
   const dailyPlanContext = await fetchDailyPlanContext(req);
   const dailyPlanPrompt = buildDailyPlanPrompt(dailyPlanContext, req);
+  const rt = await getRuntimeTradeParams(req);
+  const probabilityContract = buildProbabilityContract(req, dir, rt);
+  const probabilityContractPrompt = `
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+注文条件と確率の定義
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• 予定エントリー: ${probabilityContract.entry}
+• 予定SL: ${probabilityContract.sl}（ATR × ${probabilityContract.riskAtrMult}）
+• 予定TP: ${probabilityContract.tp}（RR=${probabilityContract.rewardRR}）
+• 推定取引コスト: ${probabilityContract.costR}R
+• direction_prob: ${probabilityContract.directionHorizonMinutes}分後の価格が、予定エントリーより取引方向側にある確率
+• tp_before_sl_prob: 上記の予定TPへ、予定SLより先に到達する確率
+• win_prob: 後方互換用。tp_before_sl_probと同じ値を返す
+
+direction_probとtp_before_sl_probは別々に評価してください。方向が合ってもTP到達前に反転する場合があるため、同じ値を機械的に返してはいけません。`;
   
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 🔄 ハイブリッド学習システム（3段階）
@@ -2640,7 +2733,7 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
     systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。1000件以上の実績データに基づくML学習結果を最重視して勝率を予測してください。
 ${priorityGuideline}
 ${mlContextForPrompt}${successCasesForPrompt}${failureCasesForPrompt}${recommendationsForPrompt}
-${dailyPlanPrompt}
+${dailyPlanPrompt}${probabilityContractPrompt}
   補助情報: RSI=${rsi.toFixed(2)}, ATR=${atr.toFixed(5)}${atrNorm !== undefined ? `, ATR_norm=${atrNorm.toFixed(8)}` : ""}${adx !== undefined ? `, ADX=${adx.toFixed(2)}` : ""}${diPlus !== undefined ? `, +DI=${diPlus.toFixed(2)}` : ""}${diMinus !== undefined ? `, -DI=${diMinus.toFixed(2)}` : ""}${bbWidth !== undefined ? `, BB_width=${bbWidth.toFixed(6)}` : ""}
 ${ichimokuContext}
 EA判断: ${reason}`;
@@ -2661,7 +2754,7 @@ EA判断: ${reason}`;
     systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。高品質なML学習結果とテクニカル指標を総合的に判断し、勝率を予測してください。
 ${priorityGuideline}
 ${mlContextForPrompt}${successCasesForPrompt}${failureCasesForPrompt}
-${dailyPlanPrompt}
+${dailyPlanPrompt}${probabilityContractPrompt}
   テクニカル指標: RSI=${rsi.toFixed(2)}, ATR=${atr.toFixed(5)}${atrNorm !== undefined ? `, ATR_norm=${atrNorm.toFixed(8)}` : ""}${adx !== undefined ? `, ADX=${adx.toFixed(2)}` : ""}${diPlus !== undefined ? `, +DI=${diPlus.toFixed(2)}` : ""}${diMinus !== undefined ? `, -DI=${diMinus.toFixed(2)}` : ""}${bbWidth !== undefined ? `, BB_width=${bbWidth.toFixed(6)}` : ""}
 ${ichimokuContext}
 EA判断: ${reason}`;
@@ -2681,7 +2774,7 @@ EA判断: ${reason}`;
     
     systemPrompt = `あなたはプロの金融トレーダー兼AIアナリストです。すべてのテクニカル指標とEA側の総合判断を総合的に分析し、取引の成功確率（勝率）を0.0～1.0の範囲で予測してください。
   ${priorityGuideline}${mlContextForPrompt}
-${dailyPlanPrompt}
+${dailyPlanPrompt}${probabilityContractPrompt}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 市場情報
@@ -2799,7 +2892,8 @@ ${candleBarsSummary}
 - RSI極値だけで高勝率にしない。反転足・構造転換・伸び切りの確認が必要
 - 日次計画と上位足は文脈として使う。重大イベントと方向不一致以外は、それだけで見送りにしない
 - 不確実なら0.50付近へ寄せる。根拠なしに0.60を超えない
-- 出力は「自信度」ではなく、次の1トレードが利益になる校正済み確率として評価する`;
+- direction_probは指定時間後の方向一致、tp_before_sl_probは指定バリアの先着事象として別々に評価する
+- 実行判断用の勝率はtp_before_sl_probであり、単なる方向一致を勝ちとして数えない`;
   }
   
   // 共通の回答形式指示
@@ -2810,8 +2904,10 @@ ${candleBarsSummary}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 以下のJSON形式で回答してください:
 {
-  "win_prob": 0.XX,  // 0.00～1.00の範囲で動的に設定
-  "recommended_min_win_prob": 0.50, // 参考値。0.45～0.60
+  "direction_prob": 0.XX, // 指定時間後に価格が取引方向側にある確率
+  "tp_before_sl_prob": 0.XX, // 予定TPが予定SLより先に到達する確率
+  "win_prob": 0.XX,  // tp_before_sl_probと必ず同じ値（後方互換）
+  "recommended_min_win_prob": 0.55, // 参考値。0.50～0.75
   "skip_reason": "", // 見送りなら理由（例: "range", "conflict", "news"）
   "confidence": "high" | "medium" | "low",
   "reasoning": "判断理由（40文字以内、主要な根拠を明記）"
@@ -2828,8 +2924,8 @@ ${candleBarsSummary}
 
   try {
     const modelSystemPrompt = ENABLE_ML_CONTEXT_FOR_OPENAI
-      ? "実績データ、価格構造、コストを統合し、次の1トレードの校正済み勝率をJSONで返す。過信と過度な見送りを避け、期待値を重視する。"
-      : "価格構造、複数時間足、テクニカル指標を統合し、次の1トレードの校正済み勝率をJSONで返す。過信と過度な見送りを避け、期待値を重視する。";
+      ? "実績データ、価格構造、正確なTP/SL条件を統合し、方向確率とTP先着確率を分けてJSONで返す。過信と過度な見送りを避け、期待値を重視する。"
+      : "価格構造、複数時間足、正確なTP/SL条件を統合し、方向確率とTP先着確率を分けてJSONで返す。過信と過度な見送りを避け、期待値を重視する。";
     const prediction = await requestOpenAiTradePrediction(modelSystemPrompt, prompt);
     if (!prediction) {
       console.warn("[AI] Falling back to rule-based calculation");
@@ -2848,14 +2944,16 @@ ${candleBarsSummary}
     }
     
   const aiResult = JSON.parse(jsonMatch[0]);
-    let win_prob = parseFloat(aiResult.win_prob);
+    let direction_prob = parseFloat(aiResult.direction_prob);
+    let win_prob = parseFloat(aiResult.tp_before_sl_prob ?? aiResult.win_prob);
     
     // 安全性チェック
-    if (isNaN(win_prob) || win_prob < 0 || win_prob > 1) {
-      console.error("[AI] Invalid win_prob:", win_prob, "from AI response:", JSON.stringify(aiResult));
+    if (isNaN(direction_prob) || direction_prob < 0 || direction_prob > 1 || isNaN(win_prob) || win_prob < 0 || win_prob > 1) {
+      console.error("[AI] Invalid probability targets:", { direction_prob, tp_before_sl_prob: win_prob }, "from AI response:", JSON.stringify(aiResult));
       console.warn("[AI] Falling back to rule-based calculation");
       return await calculateSignalFallbackWithCalibration(req);
     }
+    direction_prob = clampWinProb(direction_prob);
     
     // ⭐ 学習データ収集フェーズではML調整をスキップ
     if (APPLY_ML_WIN_PROB_ADJUSTMENT && mlWinRateBoost !== 0) {
@@ -2881,7 +2979,6 @@ ${candleBarsSummary}
     const calibrationOk = !calibrationRequired || cal.debug.applied;
     
     const confidence = aiResult.confidence || "unknown";
-    const rt = await getRuntimeTradeParams(req);
     const clientMinWinProbProvided = typeof req.min_win_prob === "number";
     const client_min_win_prob = sanitizeRecommendedMinWinProb(
       clientMinWinProbProvided ? req.min_win_prob : (rt.minWinProbFromConfig ?? undefined),
@@ -2943,7 +3040,8 @@ ${candleBarsSummary}
     
     // 詳細ログ出力
     console.log(
-      `[AI] OpenAI prediction: ${(win_prob * 100).toFixed(1)}% (${confidence}) - ${reasoning} | ` +
+      `[AI] OpenAI prediction: tpP=${(win_prob * 100).toFixed(1)}% ` +
+      `dirP=${(direction_prob * 100).toFixed(1)}% (${confidence}) - ${reasoning} | ` +
       `ichimoku=${ichimoku_score?.toFixed(2) || "N/A"} quality=${signalQuality} | entry_method=${entry_method} | lot=fixed`
     );
     
@@ -2990,6 +3088,7 @@ ${candleBarsSummary}
       willExecute,
       dir,
       winProb: win_prob,
+      directionProb: direction_prob,
       effectiveGate: effective_gate,
       expectedValueR: expected_value_r,
       minEvR,
@@ -3001,6 +3100,20 @@ ${candleBarsSummary}
     });
 
     return {
+      direction_prob: round3(direction_prob),
+      direction_prob_raw: round3(direction_prob),
+      tp_before_sl_prob: round3(win_prob),
+      tp_before_sl_prob_raw: round3(raw_win_prob),
+      tp_before_sl_prob_calibrated: round3(cal.winProb),
+      tp_before_sl_prob_final: round3(win_prob),
+      probability_target_version: "direction_tp_v2",
+      direction_horizon_minutes: probabilityContract.directionHorizonMinutes,
+      planned_entry_price: probabilityContract.entry,
+      planned_sl: probabilityContract.sl,
+      planned_tp: probabilityContract.tp,
+      planned_reward_rr: probabilityContract.rewardRR,
+      planned_risk_atr_mult: probabilityContract.riskAtrMult,
+      planned_cost_r: probabilityContract.costR,
       win_prob: round3(win_prob),
       action: willExecute ? dir : 0,
       decision_summary,
@@ -3125,6 +3238,10 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
       suggested_dir: picked.selectedDir,
       buy_win_prob: buyRes.win_prob,
       sell_win_prob: sellRes.win_prob,
+      buy_direction_prob: buyRes.direction_prob,
+      sell_direction_prob: sellRes.direction_prob,
+      buy_tp_before_sl_prob: buyRes.tp_before_sl_prob ?? buyRes.win_prob,
+      sell_tp_before_sl_prob: sellRes.tp_before_sl_prob ?? sellRes.win_prob,
       buy_action: buyRes.action,
       sell_action: sellRes.action,
       reasoning: mergedReasoning,
@@ -3132,6 +3249,8 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
         selected_dir: picked.selectedDir,
         buy: {
           win_prob: buyRes.win_prob,
+          direction_prob: buyRes.direction_prob,
+          tp_before_sl_prob: buyRes.tp_before_sl_prob ?? buyRes.win_prob,
           action: buyRes.action,
           expected_value_r: buyRes.expected_value_r,
           entry_method: buyRes.entry_method,
@@ -3139,6 +3258,8 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
         },
         sell: {
           win_prob: sellRes.win_prob,
+          direction_prob: sellRes.direction_prob,
+          tp_before_sl_prob: sellRes.tp_before_sl_prob ?? sellRes.win_prob,
           action: sellRes.action,
           expected_value_r: sellRes.expected_value_r,
           entry_method: sellRes.entry_method,
@@ -3188,7 +3309,7 @@ serve(async (req: Request) => {
       JSON.stringify({ 
         ok: true, 
         service: "ai-trader with OpenAI + Comprehensive Technical Analysis", 
-        version: "2.14.0-detailed-win-probability",
+        version: "3.0.0-direction-tp-probabilities",
         mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
         ml_learning_enabled: mlLearningEnabled,
@@ -3217,6 +3338,8 @@ serve(async (req: Request) => {
           "operator_jst_session_override",
           "final_decision_summary",
           "detailed_final_probability",
+          "separate_direction_probability",
+          "tp_before_sl_probability",
           "higher_timeframe_context",
           "chart_structure_guard",
           "volatility_cost_context",
@@ -3294,6 +3417,14 @@ serve(async (req: Request) => {
       const suggested_dir = requestedDir === 1 || requestedDir === -1 ? requestedDir : undefined;
 
       const response: TradeResponse = {
+        direction_prob: 0.5,
+        direction_prob_raw: 0.5,
+        tp_before_sl_prob: 0.5,
+        tp_before_sl_prob_raw: 0.5,
+        tp_before_sl_prob_calibrated: 0.5,
+        tp_before_sl_prob_final: 0.5,
+        probability_target_version: "invalid_input_v2",
+        direction_horizon_minutes: getDirectionHorizonMinutes(),
         win_prob: 0.5,
         action: 0,
         suggested_dir,

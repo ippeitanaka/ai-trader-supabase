@@ -3,6 +3,7 @@ import {
   collapseShadowEpisodes,
   finalizeSelection,
   isMarketEligible,
+  normalizeTradePlan,
 } from "./index.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -20,6 +21,7 @@ function trade(createdAt: string) {
     win_prob: 0.6,
     ml_pattern_used: false,
     entry_method: "market",
+    result_consistent: true,
   };
 }
 
@@ -33,6 +35,7 @@ function stat(symbol: string, score: number, eligible = true) {
     real_win_rate: null,
     real_total_profit_loss: 0,
     real_avg_profit_loss: null,
+    real_profit_factor: null,
     avg_win_prob: null,
     recent_7d_trades: 0,
     recent_7d_win_rate: null,
@@ -97,4 +100,21 @@ Deno.test("selection backfills missing AI picks from all-symbol market scores", 
   assert(result.meta.backfilled_count === 2, "expected two backfilled symbols");
   assert(result.meta.complete, "selection should be complete");
   assert(result.meta.excluded_market_closed.includes("XAUUSD"), "closed market should be reported");
+});
+
+Deno.test("daily plan preserves AI gates and sessions for conditional pairs", () => {
+  const selected = [{ symbol: "BTCUSD", score: 62, confidence: "low" as const, reason: "AI pick" }];
+  const conditional = [{ symbol: "EURUSD", score: 60, confidence: "low" as const, reason: "Conditional" }];
+  const plan = normalizeTradePlan({
+    symbols: [{ symbol: "BTCUSD", min_win_prob: 0.57 }],
+    conditional_symbols: [{
+      symbol: "EURUSD",
+      min_win_prob: 0.63,
+      session_windows: [{ label: "Tokyo", start_utc: "00:00", end_utc: "06:00" }],
+    }],
+  }, selected, [stat("BTCUSD", 62), stat("EURUSD", 60)], "M15", null, "test", undefined, conditional);
+
+  assert(plan.symbols[0].min_win_prob === 0.57, "selected AI gate should be preserved");
+  assert(plan.conditional_symbols[0].min_win_prob === 0.63, "conditional AI gate should be preserved");
+  assert(plan.conditional_symbols[0].session_windows[0].label === "Tokyo", "conditional AI session should be preserved");
 });

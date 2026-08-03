@@ -20,6 +20,20 @@ interface EALogEntry {
   buy_win_prob?: number;         // dir=0両方向評価のBUY勝率（0-1）
   sell_win_prob?: number;        // dir=0両方向評価のSELL勝率（0-1）
   trade_decision?: string;       // 実際の取引状況
+  direction_prob?: number;
+  direction_prob_raw?: number;
+  tp_before_sl_prob?: number;
+  tp_before_sl_prob_raw?: number;
+  tp_before_sl_prob_calibrated?: number;
+  tp_before_sl_prob_final?: number;
+  probability_target_version?: string;
+  direction_horizon_minutes?: number;
+  planned_entry_price?: number;
+  planned_sl?: number;
+  planned_tp?: number;
+  planned_reward_rr?: number;
+  planned_risk_atr_mult?: number;
+  planned_cost_r?: number;
   win_prob?: number;             // AIの算出した勝率
   win_prob_raw?: number;
   win_prob_calibrated?: number;
@@ -78,6 +92,20 @@ interface EALogInput {
   suggested_dir?: number;
   buy_win_prob?: number;
   sell_win_prob?: number;
+  direction_prob?: number;
+  direction_prob_raw?: number;
+  tp_before_sl_prob?: number;
+  tp_before_sl_prob_raw?: number;
+  tp_before_sl_prob_calibrated?: number;
+  tp_before_sl_prob_final?: number;
+  probability_target_version?: string;
+  direction_horizon_minutes?: number;
+  planned_entry_price?: number;
+  planned_sl?: number;
+  planned_tp?: number;
+  planned_reward_rr?: number;
+  planned_risk_atr_mult?: number;
+  planned_cost_r?: number;
   win_prob?: number;
   win_prob_raw?: number;
   win_prob_calibrated?: number;
@@ -392,6 +420,20 @@ serve(async (req: Request) => {
       buy_win_prob: body.buy_win_prob !== undefined ? Number(body.buy_win_prob) : undefined,
       sell_win_prob: body.sell_win_prob !== undefined ? Number(body.sell_win_prob) : undefined,
       trade_decision: body.trade_decision || undefined,
+      direction_prob: body.direction_prob !== undefined ? Number(body.direction_prob) : undefined,
+      direction_prob_raw: body.direction_prob_raw !== undefined ? Number(body.direction_prob_raw) : undefined,
+      tp_before_sl_prob: body.tp_before_sl_prob !== undefined ? Number(body.tp_before_sl_prob) : undefined,
+      tp_before_sl_prob_raw: body.tp_before_sl_prob_raw !== undefined ? Number(body.tp_before_sl_prob_raw) : undefined,
+      tp_before_sl_prob_calibrated: body.tp_before_sl_prob_calibrated !== undefined ? Number(body.tp_before_sl_prob_calibrated) : undefined,
+      tp_before_sl_prob_final: body.tp_before_sl_prob_final !== undefined ? Number(body.tp_before_sl_prob_final) : undefined,
+      probability_target_version: body.probability_target_version || undefined,
+      direction_horizon_minutes: body.direction_horizon_minutes !== undefined ? Number(body.direction_horizon_minutes) : undefined,
+      planned_entry_price: body.planned_entry_price !== undefined ? Number(body.planned_entry_price) : undefined,
+      planned_sl: body.planned_sl !== undefined ? Number(body.planned_sl) : undefined,
+      planned_tp: body.planned_tp !== undefined ? Number(body.planned_tp) : undefined,
+      planned_reward_rr: body.planned_reward_rr !== undefined ? Number(body.planned_reward_rr) : undefined,
+      planned_risk_atr_mult: body.planned_risk_atr_mult !== undefined ? Number(body.planned_risk_atr_mult) : undefined,
+      planned_cost_r: body.planned_cost_r !== undefined ? Number(body.planned_cost_r) : undefined,
       win_prob: body.win_prob !== undefined ? Number(body.win_prob) : undefined,
       win_prob_raw: body.win_prob_raw !== undefined ? Number(body.win_prob_raw) : undefined,
       win_prob_calibrated: body.win_prob_calibrated !== undefined ? Number(body.win_prob_calibrated) : undefined,
