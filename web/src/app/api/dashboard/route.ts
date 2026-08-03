@@ -52,6 +52,20 @@ export async function POST(request: Request) {
           }
         }
       }
+      const rawSymbolMinWinProbUpdates = body?.symbol_min_win_prob_updates;
+      const symbolMinWinProbUpdates: Record<string, number | null> = {};
+      if (rawSymbolMinWinProbUpdates && typeof rawSymbolMinWinProbUpdates === "object" && !Array.isArray(rawSymbolMinWinProbUpdates)) {
+        for (const [symbol, value] of Object.entries(rawSymbolMinWinProbUpdates)) {
+          const normalizedSymbol = symbol.trim().toUpperCase();
+          const numeric = Number(value);
+          if (!normalizedSymbol) continue;
+          if (value === null) {
+            symbolMinWinProbUpdates[normalizedSymbol] = null;
+          } else if (Number.isFinite(numeric) && numeric >= 0.50 && numeric <= 0.90) {
+            symbolMinWinProbUpdates[normalizedSymbol] = Math.round(numeric * 100) / 100;
+          }
+        }
+      }
       const rawSessionOverrides = body?.symbol_session_overrides;
       const symbolSessionOverrides: Record<string, {
         mode: "custom" | "all_day";
@@ -115,6 +129,9 @@ export async function POST(request: Request) {
           : {}),
         ...(rawSymbolMinWinProbs && typeof rawSymbolMinWinProbs === "object"
           ? { symbol_min_win_probs: symbolMinWinProbs }
+          : {}),
+        ...(rawSymbolMinWinProbUpdates && typeof rawSymbolMinWinProbUpdates === "object"
+          ? { symbol_min_win_prob_updates: symbolMinWinProbUpdates }
           : {}),
         ...(rawSessionOverrides && typeof rawSessionOverrides === "object"
           ? { symbol_session_overrides: symbolSessionOverrides }

@@ -74,6 +74,7 @@ type PlanOverrides = {
   gate_mode?: "more_active" | "active" | "ai" | "cautious" | "very_cautious";
   symbol_gate_adjustments?: Record<string, -0.10 | -0.05 | 0 | 0.05 | 0.10>;
   symbol_min_win_probs?: Record<string, number>;
+  symbol_min_win_prob_updates?: Record<string, number | null>;
   symbol_session_overrides?: Record<string, {
     mode: "custom" | "all_day";
     timezone: "Asia/Tokyo";
@@ -891,6 +892,17 @@ export async function updateTradePlanOverrides(reportId: number, overrides: Plan
   });
   const currentRows = await fetchJson<Array<{ plan_overrides?: PlanOverrides; plan_status?: string }>>(currentUrl);
   const current = currentRows[0]?.plan_overrides ?? {};
+  const { symbol_min_win_prob_updates: symbolMinWinProbUpdates, ...providedOverrides } = overrides;
+  const symbolMinWinProbs = {
+    ...(current.symbol_min_win_probs ?? {}),
+    ...(providedOverrides.symbol_min_win_probs ?? {}),
+  };
+  if (symbolMinWinProbUpdates) {
+    for (const [symbol, value] of Object.entries(symbolMinWinProbUpdates)) {
+      if (value === null) delete symbolMinWinProbs[symbol];
+      else symbolMinWinProbs[symbol] = value;
+    }
+  }
   const updatedAt = new Date().toISOString();
   const history = [
     ...(Array.isArray(current.history) ? current.history : []),
@@ -898,7 +910,8 @@ export async function updateTradePlanOverrides(reportId: number, overrides: Plan
   ].slice(-50);
   const merged: PlanOverrides = {
     ...current,
-    ...overrides,
+    ...providedOverrides,
+    ...(providedOverrides.symbol_min_win_probs || symbolMinWinProbUpdates ? { symbol_min_win_probs: symbolMinWinProbs } : {}),
     history,
     updated_at: updatedAt,
   };

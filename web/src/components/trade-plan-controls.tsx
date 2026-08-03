@@ -98,23 +98,34 @@ export function SymbolGateControl({ reportId, symbol, aiMinWinProb, symbolMinWin
   const aiPercent = Math.round(Math.max(0.50, Math.min(0.75, aiMinWinProb)) * 100);
   const overrideValue = symbolMinWinProbs?.[symbolKey];
   const hasOverride = typeof overrideValue === "number";
-  const [percent, setPercent] = useState(Math.round((overrideValue ?? aiMinWinProb) * 100));
+  const effectivePercent = Math.round((overrideValue ?? aiMinWinProb) * 100);
+  const [draftPercent, setDraftPercent] = useState(String(effectivePercent));
+
+  function normalizedDraftPercent() {
+    const numeric = Number(draftPercent);
+    if (!Number.isInteger(numeric) || numeric < 50 || numeric > 90) return null;
+    return numeric;
+  }
 
   async function updateSymbolGate(useAi: boolean) {
     if (!reportId) return;
-    const next = { ...(symbolMinWinProbs ?? {}) };
-    if (useAi) delete next[symbolKey];
-    else next[symbolKey] = Math.max(50, Math.min(90, Math.round(percent))) / 100;
+    const nextPercent = normalizedDraftPercent();
+    if (!useAi && nextPercent === null) {
+      setError("勝率ゲートは50%から90%の整数で設定してください。");
+      return;
+    }
+    const gateValue = useAi ? null : nextPercent! / 100;
+    const displayedPercent = useAi ? aiPercent : nextPercent!;
     setIsPending(true);
     setMessage(null);
     setError(null);
     try {
       await postPlanOverride({
         report_id: reportId,
-        symbol_min_win_probs: next,
-        note: useAi ? `${symbolKey} gate reset to AI` : `${symbolKey} gate set to ${next[symbolKey]}`,
+        symbol_min_win_prob_updates: { [symbolKey]: gateValue },
+        note: useAi ? `${symbolKey} gate reset to AI` : `${symbolKey} gate set to ${gateValue}`,
       });
-      if (useAi) setPercent(aiPercent);
+      setDraftPercent(String(displayedPercent));
       setMessage(useAi ? "AI推奨へ戻しました。" : "最終勝率ゲートを更新しました。");
       startTransition(() => router.refresh());
     } catch (updateError) {
@@ -128,7 +139,7 @@ export function SymbolGateControl({ reportId, symbol, aiMinWinProb, symbolMinWin
     <div className="mt-3 rounded-lg border border-white/10 bg-slate-950/25 p-3">
       <div className="flex items-center justify-between gap-3 text-xs">
         <span className="text-slate-400">勝率ゲート</span>
-        <span className="text-cyan-100">AI推奨 {aiPercent}% / 最終 {Math.round(percent)}%{hasOverride ? "（手動）" : ""}</span>
+        <span className="text-cyan-100">AI推奨 {aiPercent}% / 最終 {effectivePercent}%{hasOverride ? "（手動）" : ""}</span>
       </div>
       <div className="mt-2 grid grid-cols-[minmax(0,1fr)_auto] gap-2">
         <label className="sr-only" htmlFor={`gate-${symbolKey}`}>最終勝率ゲート</label>
@@ -138,30 +149,35 @@ export function SymbolGateControl({ reportId, symbol, aiMinWinProb, symbolMinWin
           min="50"
           max="90"
           step="1"
-          value={percent}
+          inputMode="numeric"
+          value={draftPercent}
           disabled={!reportId || isPending}
-          onChange={(event) => setPercent(Math.max(50, Math.min(90, Number(event.target.value))))}
-          className="w-full rounded-lg border border-white/12 bg-slate-950/65 px-3 py-2 text-sm text-white outline-none focus:border-cyan-300/60 disabled:opacity-45"
+          onChange={(event) => setDraftPercent(event.target.value)}
+          onBlur={() => {
+            const nextPercent = normalizedDraftPercent();
+            if (nextPercent !== null) setDraftPercent(String(nextPercent));
+          }}
+          className="min-h-11 w-full rounded-lg border border-white/12 bg-slate-950/65 px-3 py-2 text-sm text-white outline-none focus:border-cyan-300/60 disabled:opacity-45"
         />
         <button
           type="button"
           disabled={!reportId || isPending}
           onClick={() => updateSymbolGate(false)}
-          className="rounded-lg border border-cyan-300/25 bg-cyan-300/10 px-3 py-2 text-xs font-semibold text-cyan-50 transition hover:bg-cyan-300/18 disabled:opacity-45"
+          className="min-h-11 touch-manipulation rounded-lg border border-cyan-300/25 bg-cyan-300/10 px-3 py-2 text-xs font-semibold text-cyan-50 transition hover:bg-cyan-300/18 disabled:opacity-45"
         >
-          反映
+          {isPending ? "更新中" : "反映"}
         </button>
       </div>
       <button
         type="button"
         disabled={!reportId || isPending || !hasOverride}
         onClick={() => updateSymbolGate(true)}
-        className="mt-2 text-xs text-slate-400 underline decoration-white/20 underline-offset-4 transition hover:text-white disabled:no-underline disabled:opacity-40"
+        className="mt-2 min-h-11 touch-manipulation text-xs text-slate-400 underline decoration-white/20 underline-offset-4 transition hover:text-white disabled:no-underline disabled:opacity-40"
       >
         AI推奨へ戻す
       </button>
-      {message ? <p className="mt-1 text-xs text-emerald-200">{message}</p> : null}
-      {error ? <p className="mt-1 text-xs text-rose-200">{error}</p> : null}
+      {message ? <p className="mt-1 text-xs text-emerald-200" role="status">{message}</p> : null}
+      {error ? <p className="mt-1 text-xs text-rose-200" role="alert">{error}</p> : null}
     </div>
   );
 }
