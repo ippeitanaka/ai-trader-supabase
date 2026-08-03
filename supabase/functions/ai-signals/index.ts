@@ -271,6 +271,17 @@ interface AISignalEntry {
   timeframe: string;
   dir: number;
   win_prob: number;
+  direction_prob?: number | null;
+  direction_prob_raw?: number | null;
+  tp_before_sl_prob?: number | null;
+  tp_before_sl_prob_raw?: number | null;
+  tp_before_sl_prob_calibrated?: number | null;
+  tp_before_sl_prob_final?: number | null;
+  probability_target_version?: string | null;
+  direction_horizon_minutes?: number | null;
+  planned_reward_rr?: number | null;
+  planned_risk_atr_mult?: number | null;
+  planned_cost_r?: number | null;
   win_prob_raw?: number | null;
   win_prob_calibrated?: number | null;
   win_prob_final?: number | null;
@@ -685,6 +696,17 @@ serve(async (req: Request) => {
         timeframe: body.timeframe,
         dir: body.dir,
         win_prob: body.win_prob,
+        direction_prob: isFiniteNumber(body.direction_prob) ? clamp(body.direction_prob, 0, 1) : null,
+        direction_prob_raw: isFiniteNumber(body.direction_prob_raw ?? body.direction_prob) ? clamp(body.direction_prob_raw ?? body.direction_prob, 0, 1) : null,
+        tp_before_sl_prob: isFiniteNumber(body.tp_before_sl_prob ?? body.win_prob) ? clamp(body.tp_before_sl_prob ?? body.win_prob, 0, 1) : body.win_prob,
+        tp_before_sl_prob_raw: isFiniteNumber(body.tp_before_sl_prob_raw ?? body.win_prob_raw) ? clamp(body.tp_before_sl_prob_raw ?? body.win_prob_raw, 0, 1) : null,
+        tp_before_sl_prob_calibrated: isFiniteNumber(body.tp_before_sl_prob_calibrated ?? body.win_prob_calibrated) ? clamp(body.tp_before_sl_prob_calibrated ?? body.win_prob_calibrated, 0, 1) : null,
+        tp_before_sl_prob_final: isFiniteNumber(body.tp_before_sl_prob_final ?? body.win_prob_final ?? body.win_prob) ? clamp(body.tp_before_sl_prob_final ?? body.win_prob_final ?? body.win_prob, 0, 1) : body.win_prob,
+        probability_target_version: safeText(body.probability_target_version),
+        direction_horizon_minutes: Number.isFinite(body.direction_horizon_minutes) ? Math.max(1, Math.min(1440, Math.floor(body.direction_horizon_minutes))) : null,
+        planned_reward_rr: isFiniteNumber(body.planned_reward_rr) ? Math.max(0, body.planned_reward_rr) : null,
+        planned_risk_atr_mult: isFiniteNumber(body.planned_risk_atr_mult) ? Math.max(0, body.planned_risk_atr_mult) : null,
+        planned_cost_r: isFiniteNumber(body.planned_cost_r) ? Math.max(0, body.planned_cost_r) : null,
         win_prob_raw: isFiniteNumber(body.win_prob_raw) ? clamp(body.win_prob_raw, 0, 1) : null,
         win_prob_calibrated: isFiniteNumber(body.win_prob_calibrated) ? clamp(body.win_prob_calibrated, 0, 1) : null,
         win_prob_final: isFiniteNumber(body.win_prob_final) ? clamp(body.win_prob_final, 0, 1) : body.win_prob,
@@ -873,6 +895,17 @@ serve(async (req: Request) => {
           delete legacyEntry.reverse_execution;
           delete legacyEntry.original_dir;
           delete legacyEntry.win_prob_raw;
+          delete legacyEntry.direction_prob;
+          delete legacyEntry.direction_prob_raw;
+          delete legacyEntry.tp_before_sl_prob;
+          delete legacyEntry.tp_before_sl_prob_raw;
+          delete legacyEntry.tp_before_sl_prob_calibrated;
+          delete legacyEntry.tp_before_sl_prob_final;
+          delete legacyEntry.probability_target_version;
+          delete legacyEntry.direction_horizon_minutes;
+          delete legacyEntry.planned_reward_rr;
+          delete legacyEntry.planned_risk_atr_mult;
+          delete legacyEntry.planned_cost_r;
           delete legacyEntry.win_prob_calibrated;
           delete legacyEntry.win_prob_final;
           delete legacyEntry.calibration_applied;

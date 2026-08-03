@@ -26,7 +26,7 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: "report_id is required" }, { status: 400 });
       }
       const status = body?.status === "paused" ? "paused" : body?.status === "active" ? "active" : undefined;
-      const allowedAdjustments = new Set([-0.1, -0.05, 0, 0.05, 0.1]);
+      const allowedAdjustments = new Set([0, 0.05, 0.1]);
       const gateAdjustment = allowedAdjustments.has(Number(body?.gate_adjustment))
         ? Number(body.gate_adjustment) as -0.10 | -0.05 | 0 | 0.05 | 0.10
         : undefined;
@@ -38,6 +38,17 @@ export async function POST(request: Request) {
           const numeric = Number(value);
           if (normalizedSymbol && allowedAdjustments.has(numeric)) {
             symbolGateAdjustments[normalizedSymbol] = numeric as -0.10 | -0.05 | 0 | 0.05 | 0.10;
+          }
+        }
+      }
+      const rawSymbolMinWinProbs = body?.symbol_min_win_probs;
+      const symbolMinWinProbs: Record<string, number> = {};
+      if (rawSymbolMinWinProbs && typeof rawSymbolMinWinProbs === "object" && !Array.isArray(rawSymbolMinWinProbs)) {
+        for (const [symbol, value] of Object.entries(rawSymbolMinWinProbs)) {
+          const normalizedSymbol = symbol.trim().toUpperCase();
+          const numeric = Number(value);
+          if (normalizedSymbol && Number.isFinite(numeric) && numeric >= 0.50 && numeric <= 0.90) {
+            symbolMinWinProbs[normalizedSymbol] = Math.round(numeric * 100) / 100;
           }
         }
       }
@@ -101,6 +112,9 @@ export async function POST(request: Request) {
           : {}),
         ...(rawSymbolAdjustments && typeof rawSymbolAdjustments === "object"
           ? { symbol_gate_adjustments: symbolGateAdjustments }
+          : {}),
+        ...(rawSymbolMinWinProbs && typeof rawSymbolMinWinProbs === "object"
+          ? { symbol_min_win_probs: symbolMinWinProbs }
           : {}),
         ...(rawSessionOverrides && typeof rawSessionOverrides === "object"
           ? { symbol_session_overrides: symbolSessionOverrides }

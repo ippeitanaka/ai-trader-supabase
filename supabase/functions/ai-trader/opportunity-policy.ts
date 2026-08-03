@@ -42,6 +42,16 @@ export function resolveManualProbabilityGate(
   return Math.round(resolved * 1000) / 1000;
 }
 
+export function resolveAbsoluteManualProbabilityGate(
+  value: unknown,
+  minGate = 0.50,
+  maxGate = 0.90,
+): number | null {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return null;
+  return Math.round(Math.max(minGate, Math.min(maxGate, numeric)) * 100) / 100;
+}
+
 export function isMinuteWithinWindow(current: number, start: number, end: number): boolean {
   if (start <= end) return current >= start && current <= end;
   return current >= start || current <= end;

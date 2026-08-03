@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| AwajiSamurai_AI_2.0.mq5  (ver 1.7.0)                            |
+//| AwajiSamurai_AI_2.0.mq5  (ver 1.9.0)                            |
 //| - Supabase: ai-signals(AI側) / ea-log                            |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
@@ -16,6 +16,7 @@
 //|          タグが追加される。AI_EA_Versionを1.6.0に更新。          |
 //| - v1.7.0: 固定ロット・market-only化、H1を監査専用へ変更         |
 //| - v1.8.0: 複数建玉のposition ID追跡と純損益集計を修正           |
+//| - v1.9.0: 方向確率とTP先着確率を分離し、注文条件を記録          |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -36,7 +37,7 @@ input string EALogBearerToken        = "";
 #define TF_Entry PERIOD_M15
 #define TF_Recheck PERIOD_H1
 #define MinWinProb 0.50
-#define ServerMinWinProb 0.55
+#define ServerMinWinProb 0.50
 #define RiskATRmult 2.0
 #define RewardRR 1.5
 #define PendingExpiryMin 90
@@ -61,7 +62,7 @@ input string EALogBearerToken        = "";
 #define AI_Bearer_Token AIBearerToken
 #define EA_Log_Bearer_Token EALogBearerToken
 #define AI_EA_Instance "main"
-#define AI_EA_Version "1.8.0"
+#define AI_EA_Version "1.9.0"
 #define AI_Timeout_ms 10000
 #define UseIchimoku true
 #define Ichimoku_Tenkan 9
@@ -1353,6 +1354,20 @@ string BuildCostContextJson(const ENUM_TIMEFRAMES tf,const double atr,const doub
 // ===== AI連携 =====
 struct AIOut{
    double win_prob;int action;double offset_factor;int expiry_min;string reasoning;string confidence;
+   double direction_prob;
+   double direction_prob_raw;
+   double tp_before_sl_prob;
+   double tp_before_sl_prob_raw;
+   double tp_before_sl_prob_calibrated;
+   double tp_before_sl_prob_final;
+   string probability_target_version;
+   int    direction_horizon_minutes;
+   double planned_entry_price;
+   double planned_sl;
+   double planned_tp;
+   double planned_reward_rr;
+   double planned_risk_atr_mult;
+   double planned_cost_r;
    double win_prob_raw;
    double win_prob_calibrated;
    double win_prob_final;
@@ -1461,6 +1476,15 @@ bool ValidateAIResponse(const AIOut &ai,string &why)
       why="invalid win_prob";
       return false;
    }
+   if(!MathIsValidNumber(ai.direction_prob) || ai.direction_prob<0.0 || ai.direction_prob>1.0 ||
+      !MathIsValidNumber(ai.direction_prob_raw) || ai.direction_prob_raw<0.0 || ai.direction_prob_raw>1.0 ||
+      !MathIsValidNumber(ai.tp_before_sl_prob) || ai.tp_before_sl_prob<0.0 || ai.tp_before_sl_prob>1.0 ||
+      !MathIsValidNumber(ai.tp_before_sl_prob_raw) || ai.tp_before_sl_prob_raw<0.0 || ai.tp_before_sl_prob_raw>1.0 ||
+      !MathIsValidNumber(ai.tp_before_sl_prob_calibrated) || ai.tp_before_sl_prob_calibrated<0.0 || ai.tp_before_sl_prob_calibrated>1.0 ||
+      !MathIsValidNumber(ai.tp_before_sl_prob_final) || ai.tp_before_sl_prob_final<0.0 || ai.tp_before_sl_prob_final>1.0){
+      why="invalid explicit probability targets";
+      return false;
+   }
    if(!MathIsValidNumber(ai.win_prob_raw) || ai.win_prob_raw<0.0 || ai.win_prob_raw>1.0 ||
       !MathIsValidNumber(ai.win_prob_calibrated) || ai.win_prob_calibrated<0.0 || ai.win_prob_calibrated>1.0 ||
       !MathIsValidNumber(ai.win_prob_final) || ai.win_prob_final<0.0 || ai.win_prob_final>1.0){
@@ -1498,6 +1522,20 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
 {
    // default init (ExtractJson* が失敗しても未初期化値を使わない)
    out_ai.win_prob=0.0;
+   out_ai.direction_prob=0.0;
+   out_ai.direction_prob_raw=0.0;
+   out_ai.tp_before_sl_prob=0.0;
+   out_ai.tp_before_sl_prob_raw=0.0;
+   out_ai.tp_before_sl_prob_calibrated=0.0;
+   out_ai.tp_before_sl_prob_final=0.0;
+   out_ai.probability_target_version="legacy_win_prob";
+   out_ai.direction_horizon_minutes=60;
+   out_ai.planned_entry_price=0.0;
+   out_ai.planned_sl=0.0;
+   out_ai.planned_tp=0.0;
+   out_ai.planned_reward_rr=RewardRR;
+   out_ai.planned_risk_atr_mult=RiskATRmult;
+   out_ai.planned_cost_r=0.0;
    out_ai.win_prob_raw=0.0;
    out_ai.win_prob_calibrated=0.0;
    out_ai.win_prob_final=0.0;
@@ -1748,6 +1786,21 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    }
 
    ExtractJsonNumber(resp,"win_prob",out_ai.win_prob);
+   if(!ExtractJsonNumber(resp,"direction_prob",out_ai.direction_prob)) out_ai.direction_prob=out_ai.win_prob;
+   if(!ExtractJsonNumber(resp,"direction_prob_raw",out_ai.direction_prob_raw)) out_ai.direction_prob_raw=out_ai.direction_prob;
+   if(!ExtractJsonNumber(resp,"tp_before_sl_prob",out_ai.tp_before_sl_prob)) out_ai.tp_before_sl_prob=out_ai.win_prob;
+   if(!ExtractJsonNumber(resp,"tp_before_sl_prob_raw",out_ai.tp_before_sl_prob_raw)) out_ai.tp_before_sl_prob_raw=out_ai.win_prob;
+   if(!ExtractJsonNumber(resp,"tp_before_sl_prob_calibrated",out_ai.tp_before_sl_prob_calibrated)) out_ai.tp_before_sl_prob_calibrated=out_ai.win_prob;
+   if(!ExtractJsonNumber(resp,"tp_before_sl_prob_final",out_ai.tp_before_sl_prob_final)) out_ai.tp_before_sl_prob_final=out_ai.win_prob;
+   else out_ai.win_prob=out_ai.tp_before_sl_prob_final;
+   ExtractJsonString(resp,"probability_target_version",out_ai.probability_target_version);
+   ExtractJsonInt(resp,"direction_horizon_minutes",out_ai.direction_horizon_minutes);
+   ExtractJsonNumber(resp,"planned_entry_price",out_ai.planned_entry_price);
+   ExtractJsonNumber(resp,"planned_sl",out_ai.planned_sl);
+   ExtractJsonNumber(resp,"planned_tp",out_ai.planned_tp);
+   ExtractJsonNumber(resp,"planned_reward_rr",out_ai.planned_reward_rr);
+   ExtractJsonNumber(resp,"planned_risk_atr_mult",out_ai.planned_risk_atr_mult);
+   ExtractJsonNumber(resp,"planned_cost_r",out_ai.planned_cost_r);
    if(!ExtractJsonNumber(resp,"win_prob_raw",out_ai.win_prob_raw)) out_ai.win_prob_raw=out_ai.win_prob;
    if(!ExtractJsonNumber(resp,"win_prob_calibrated",out_ai.win_prob_calibrated)) out_ai.win_prob_calibrated=out_ai.win_prob;
    if(!ExtractJsonNumber(resp,"win_prob_final",out_ai.win_prob_final)) out_ai.win_prob_final=out_ai.win_prob;
@@ -1823,6 +1876,20 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
    (ai.suggested_dir!=0?"\"suggested_dir\":"+IntegerToString(ai.suggested_dir)+",":"")+
    (ai.buy_win_prob>=0?"\"buy_win_prob\":"+DoubleToString(ai.buy_win_prob,3)+",":"")+
    (ai.sell_win_prob>=0?"\"sell_win_prob\":"+DoubleToString(ai.sell_win_prob,3)+",":"")+
+   "\"direction_prob\":"+DoubleToString(ai.direction_prob,3)+","+
+   "\"direction_prob_raw\":"+DoubleToString(ai.direction_prob_raw,3)+","+
+   "\"tp_before_sl_prob\":"+DoubleToString(ai.tp_before_sl_prob,3)+","+
+   "\"tp_before_sl_prob_raw\":"+DoubleToString(ai.tp_before_sl_prob_raw,3)+","+
+   "\"tp_before_sl_prob_calibrated\":"+DoubleToString(ai.tp_before_sl_prob_calibrated,3)+","+
+   "\"tp_before_sl_prob_final\":"+DoubleToString(ai.tp_before_sl_prob_final,3)+","+
+   "\"probability_target_version\":\""+JsonEscape(ai.probability_target_version)+"\","+
+   "\"direction_horizon_minutes\":"+IntegerToString(ai.direction_horizon_minutes)+","+
+   "\"planned_entry_price\":"+DoubleToString(ai.planned_entry_price,_Digits)+","+
+   "\"planned_sl\":"+DoubleToString(ai.planned_sl,_Digits)+","+
+   "\"planned_tp\":"+DoubleToString(ai.planned_tp,_Digits)+","+
+   "\"planned_reward_rr\":"+DoubleToString(ai.planned_reward_rr,3)+","+
+   "\"planned_risk_atr_mult\":"+DoubleToString(ai.planned_risk_atr_mult,3)+","+
+   "\"planned_cost_r\":"+DoubleToString(ai.planned_cost_r,3)+","+
    "\"win_prob\":"+DoubleToString(ai.win_prob,3)+","+
    "\"win_prob_raw\":"+DoubleToString(ai.win_prob_raw,3)+","+
    "\"win_prob_calibrated\":"+DoubleToString(ai.win_prob_calibrated,3)+","+
@@ -1978,6 +2045,17 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"symbol\":\""+JsonEscape(_Symbol)+"\","+
    "\"timeframe\":\""+JsonEscape(tf_label)+"\","+
    "\"dir\":"+IntegerToString(dir)+","+
+   "\"direction_prob\":"+DoubleToString(ai.direction_prob,3)+","+
+   "\"direction_prob_raw\":"+DoubleToString(ai.direction_prob_raw,3)+","+
+   "\"tp_before_sl_prob\":"+DoubleToString(ai.tp_before_sl_prob,3)+","+
+   "\"tp_before_sl_prob_raw\":"+DoubleToString(ai.tp_before_sl_prob_raw,3)+","+
+   "\"tp_before_sl_prob_calibrated\":"+DoubleToString(ai.tp_before_sl_prob_calibrated,3)+","+
+   "\"tp_before_sl_prob_final\":"+DoubleToString(ai.tp_before_sl_prob_final,3)+","+
+   "\"probability_target_version\":\""+JsonEscape(ai.probability_target_version)+"\","+
+   "\"direction_horizon_minutes\":"+IntegerToString(ai.direction_horizon_minutes)+","+
+   "\"planned_reward_rr\":"+DoubleToString(ai.planned_reward_rr,3)+","+
+   "\"planned_risk_atr_mult\":"+DoubleToString(ai.planned_risk_atr_mult,3)+","+
+   "\"planned_cost_r\":"+DoubleToString(ai.planned_cost_r,3)+","+
    "\"win_prob\":"+DoubleToString(ai.win_prob,3)+","+
    "\"win_prob_raw\":"+DoubleToString(ai.win_prob_raw,3)+","+
    "\"win_prob_calibrated\":"+DoubleToString(ai.win_prob_calibrated,3)+","+

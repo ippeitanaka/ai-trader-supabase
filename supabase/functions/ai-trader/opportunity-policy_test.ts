@@ -4,6 +4,7 @@ import {
   finalizeDecisionSummaryText,
   isMinuteWithinWindow,
   qualifiesForOpportunityOverride,
+  resolveAbsoluteManualProbabilityGate,
   resolveDetailedFinalProbability,
   resolveManualProbabilityGate,
   resolveOpportunityGate,
@@ -13,23 +14,23 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
-Deno.test("positive-EV setup is not blocked by a stale client probability gate", () => {
+Deno.test("execution gate respects the configured probability floor", () => {
   const gate = resolveOpportunityGate({
     clientMinWinProb: 0.55,
     evGateMinWinProb: 0.511,
-    floor: 0.48,
+    floor: 0.50,
   });
   assert(gate === 0.511, `expected EV-derived gate, received ${gate}`);
-  assert(0.57 >= gate, "57% setup should remain executable");
+  assert(0.57 >= gate, "57% setup should remain executable when the daily gate permits it");
 });
 
 Deno.test("opportunity gate keeps an absolute probability floor", () => {
   const gate = resolveOpportunityGate({
     clientMinWinProb: 0.45,
     evGateMinWinProb: 0.44,
-    floor: 0.48,
+    floor: 0.50,
   });
-  assert(gate === 0.48, `expected 0.48 floor, received ${gate}`);
+  assert(gate === 0.50, `expected 0.50 floor, received ${gate}`);
 });
 
 Deno.test("detailed final probability preserves calibrated variation around 50 percent", () => {
@@ -37,10 +38,16 @@ Deno.test("detailed final probability preserves calibrated variation around 50 p
   assert(resolveDetailedFinalProbability(0.482) === 0.482, "48.2% must remain distinguishable from 50%");
 });
 
-Deno.test("manual probability adjustment can lower or raise the final plan gate", () => {
-  assert(resolveManualProbabilityGate(0.58, -0.05) === 0.53, "manual -5pt should produce a 53% gate");
-  assert(resolveManualProbabilityGate(0.52, 0.10) === 0.62, "manual +10pt should produce a 62% gate");
-  assert(resolveManualProbabilityGate(0.52, -0.10) === 0.50, "manual gate should keep the 50% lower bound");
+Deno.test("manual probability adjustment supports one-point changes", () => {
+  assert(resolveManualProbabilityGate(0.58, -0.01) === 0.57, "manual -1pt should produce a 57% gate");
+  assert(resolveManualProbabilityGate(0.58, 0.01) === 0.59, "manual +1pt should produce a 59% gate");
+  assert(resolveManualProbabilityGate(0.50, -0.01) === 0.50, "manual gate should keep the 50% lower bound");
+});
+
+Deno.test("absolute manual gate is rounded to one-percent increments", () => {
+  assert(resolveAbsoluteManualProbabilityGate(0.584) === 0.58, "58.4% should round to 58%");
+  assert(resolveAbsoluteManualProbabilityGate(0.586) === 0.59, "58.6% should round to 59%");
+  assert(resolveAbsoluteManualProbabilityGate(0.49) === 0.50, "manual gate should not go below 50%");
 });
 
 Deno.test("manual JST window supports ranges that cross midnight", () => {

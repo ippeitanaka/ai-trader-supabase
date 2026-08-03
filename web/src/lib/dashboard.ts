@@ -51,6 +51,7 @@ type DailyTradePlan = {
   summary?: string;
   market_themes?: string[];
   symbols?: TradePlanSymbol[];
+  conditional_symbols?: TradePlanSymbol[];
   selection_meta?: {
     requested_count: number;
     selected_count: number;
@@ -72,6 +73,7 @@ type PlanOverrides = {
   gate_adjustment?: -0.10 | -0.05 | 0 | 0.05 | 0.10;
   gate_mode?: "more_active" | "active" | "ai" | "cautious" | "very_cautious";
   symbol_gate_adjustments?: Record<string, -0.10 | -0.05 | 0 | 0.05 | 0.10>;
+  symbol_min_win_probs?: Record<string, number>;
   symbol_session_overrides?: Record<string, {
     mode: "custom" | "all_day";
     timezone: "Asia/Tokyo";
@@ -149,6 +151,20 @@ type EALogRecord = {
   tf: string | null;
   action: string | null;
   trade_decision: string | null;
+  direction_prob?: number | null;
+  direction_prob_raw?: number | null;
+  tp_before_sl_prob?: number | null;
+  tp_before_sl_prob_raw?: number | null;
+  tp_before_sl_prob_calibrated?: number | null;
+  tp_before_sl_prob_final?: number | null;
+  probability_target_version?: string | null;
+  direction_horizon_minutes?: number | null;
+  planned_entry_price?: number | null;
+  planned_sl?: number | null;
+  planned_tp?: number | null;
+  planned_reward_rr?: number | null;
+  planned_risk_atr_mult?: number | null;
+  planned_cost_r?: number | null;
   win_prob: number | null;
   win_prob_raw?: number | null;
   win_prob_calibrated?: number | null;
@@ -183,6 +199,17 @@ type AISignalRecord = {
   symbol: string;
   timeframe: string | null;
   dir: number | null;
+  direction_prob?: number | null;
+  direction_prob_raw?: number | null;
+  tp_before_sl_prob?: number | null;
+  tp_before_sl_prob_raw?: number | null;
+  tp_before_sl_prob_calibrated?: number | null;
+  tp_before_sl_prob_final?: number | null;
+  probability_target_version?: string | null;
+  direction_horizon_minutes?: number | null;
+  planned_reward_rr?: number | null;
+  planned_risk_atr_mult?: number | null;
+  planned_cost_r?: number | null;
   win_prob: number | null;
   win_prob_raw?: number | null;
   win_prob_calibrated?: number | null;
@@ -405,6 +432,7 @@ function buildFunctionUrl(functionName: string, params: Record<string, string>) 
 }
 
 const TRADE_RESULT_INTEGRITY_FIELDS = "mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version";
+const TRADE_PROBABILITY_FIELDS = "direction_prob,direction_prob_raw,tp_before_sl_prob,tp_before_sl_prob_raw,tp_before_sl_prob_calibrated,tp_before_sl_prob_final,probability_target_version,direction_horizon_minutes,planned_reward_rr,planned_risk_atr_mult,planned_cost_r";
 
 async function fetchAiSignalsWithOptionalIntegrity(
   params: Record<string, string>,
@@ -413,7 +441,7 @@ async function fetchAiSignalsWithOptionalIntegrity(
   try {
     return await fetchJson<AISignalRecord[]>(buildRestUrl("ai_signals", {
       ...params,
-      select: legacySelect.replace("order_ticket", `order_ticket,${TRADE_RESULT_INTEGRITY_FIELDS}`),
+      select: legacySelect.replace("order_ticket", `order_ticket,${TRADE_RESULT_INTEGRITY_FIELDS},${TRADE_PROBABILITY_FIELDS}`),
     }));
   } catch {
     // Keep the dashboard available while a newly deployed UI is waiting for its DB migration.
@@ -517,14 +545,16 @@ function summarizeShadowTrades(trades: AISignalRecord[]): ShadowAnalysis {
   const wins = resolved.filter((trade) => trade.actual_result === "WIN");
   const losses = resolved.filter((trade) => trade.actual_result === "LOSS");
   const rawBrier = resolved.map((trade) => {
-    if (trade.win_prob_raw == null) return null;
+    const probability = trade.tp_before_sl_prob_raw ?? trade.win_prob_raw;
+    if (probability == null) return null;
     const outcome = trade.actual_result === "WIN" ? 1 : 0;
-    return (trade.win_prob_raw - outcome) ** 2;
+    return (probability - outcome) ** 2;
   });
   const calibratedBrier = resolved.map((trade) => {
-    if (trade.win_prob_calibrated == null) return null;
+    const probability = trade.tp_before_sl_prob_calibrated ?? trade.win_prob_calibrated;
+    if (probability == null) return null;
     const outcome = trade.actual_result === "WIN" ? 1 : 0;
-    return (trade.win_prob_calibrated - outcome) ** 2;
+    return (probability - outcome) ** 2;
   });
   const expectedCalibrationError = (selector: (trade: AISignalRecord) => number | null | undefined) => {
     if (resolved.length === 0) return null;
@@ -555,14 +585,14 @@ function summarizeShadowTrades(trades: AISignalRecord[]): ShadowAnalysis {
     missedWinCount: wins.length,
     shadowWinRate: resolved.length > 0 ? round2((wins.length / resolved.length) * 100) : null,
     netR: round2(resolved.reduce((sum, trade) => sum + (trade.profit_loss ?? 0), 0)) ?? 0,
-    averageRawProb: averageProbabilityPercent(trades.map((trade) => trade.win_prob_raw)),
-    averageCalibratedProb: averageProbabilityPercent(trades.map((trade) => trade.win_prob_calibrated)),
-    averageFinalProb: averageProbabilityPercent(trades.map((trade) => trade.win_prob_final ?? trade.win_prob)),
+    averageRawProb: averageProbabilityPercent(trades.map((trade) => trade.tp_before_sl_prob_raw ?? trade.win_prob_raw)),
+    averageCalibratedProb: averageProbabilityPercent(trades.map((trade) => trade.tp_before_sl_prob_calibrated ?? trade.win_prob_calibrated)),
+    averageFinalProb: averageProbabilityPercent(trades.map((trade) => trade.tp_before_sl_prob_final ?? trade.win_prob_final ?? trade.win_prob)),
     averageCalibrationShift: averageProbabilityPercent(trades.map((trade) => trade.calibration_shift)),
     rawBrierScore: round2(average(rawBrier)),
     calibratedBrierScore: round2(average(calibratedBrier)),
-    rawEce: round2(expectedCalibrationError((trade) => trade.win_prob_raw)),
-    calibratedEce: round2(expectedCalibrationError((trade) => trade.win_prob_calibrated)),
+    rawEce: round2(expectedCalibrationError((trade) => trade.tp_before_sl_prob_raw ?? trade.win_prob_raw)),
+    calibratedEce: round2(expectedCalibrationError((trade) => trade.tp_before_sl_prob_calibrated ?? trade.win_prob_calibrated)),
     recent: trades.slice(0, 8),
   };
 }
@@ -574,7 +604,7 @@ function parseOpportunityDecision(trade: AISignalRecord) {
     const parsed = value == null ? Number.NaN : Number(value);
     return Number.isFinite(parsed) ? parsed : null;
   };
-  const calibratedProbability = trade.win_prob_calibrated ?? trade.win_prob_raw ?? read(/\bp=(-?\d+(?:\.\d+)?)/);
+  const calibratedProbability = trade.tp_before_sl_prob_calibrated ?? trade.win_prob_calibrated ?? trade.tp_before_sl_prob_raw ?? trade.win_prob_raw ?? read(/\bp=(-?\d+(?:\.\d+)?)/);
   const adjustments = trade.probability_adjustments ?? {};
   const adjustmentTotal = ["extreme_rsi", "rsi_mean_reversion", "recent_performance", "loss_streak"]
     .map((key) => adjustments[key])
@@ -892,12 +922,19 @@ export async function updateTradePlanOverrides(reportId: number, overrides: Plan
 }
 
 async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
-  const url = buildRestUrl("ea-log", {
-    select: "id,created_at,at,sym,tf,action,trade_decision,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,decision_summary,skip_reason,entry_method,trade_plan_id,plan_alignment,event_risk,market_session,ai_reasoning,order_ticket",
+  const legacySelect = "id,created_at,at,sym,tf,action,trade_decision,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,decision_summary,skip_reason,entry_method,trade_plan_id,plan_alignment,event_risk,market_session,ai_reasoning,order_ticket";
+  const params = {
     order: "at.desc",
     limit: "5",
-  });
-  return fetchJson<EALogRecord[]>(url);
+  };
+  try {
+    return await fetchJson<EALogRecord[]>(buildRestUrl("ea-log", {
+      ...params,
+      select: legacySelect.replace("win_prob", `${TRADE_PROBABILITY_FIELDS},planned_entry_price,planned_sl,planned_tp,win_prob`),
+    }));
+  } catch {
+    return fetchJson<EALogRecord[]>(buildRestUrl("ea-log", { ...params, select: legacySelect }));
+  }
 }
 
 async function fetchShadowTrades(): Promise<AISignalRecord[]> {
