@@ -1,5 +1,6 @@
 import { getDashboardData } from "@/lib/dashboard";
 import { AiRefreshButton } from "@/components/ai-refresh-button";
+import { DashboardAutoRefresh } from "@/components/dashboard-auto-refresh";
 import { SymbolGateControl, SymbolSessionControl, TradePlanControls } from "@/components/trade-plan-controls";
 
 export const dynamic = "force-dynamic";
@@ -468,6 +469,7 @@ export default async function Home({ searchParams }: PageProps) {
 
   return (
     <main className="dashboard-shell min-h-screen px-5 py-8 text-slate-100 sm:px-8 lg:px-10">
+      <DashboardAutoRefresh />
       <div className="mx-auto max-w-7xl">
         {data.dataErrors.length > 0 ? (
           <section className="mb-6 rounded-[28px] border border-amber-300/20 bg-amber-500/10 p-5 backdrop-blur">
