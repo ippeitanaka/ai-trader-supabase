@@ -942,7 +942,7 @@ export async function updateTradePlanOverrides(reportId: number, overrides: Plan
 async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
   const legacySelect = "id,created_at,at,sym,tf,action,trade_decision,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,decision_summary,skip_reason,entry_method,trade_plan_id,plan_alignment,event_risk,market_session,ai_reasoning,order_ticket";
   const params = {
-    order: "at.desc",
+    order: "created_at.desc,id.desc",
     limit: "5",
   };
   try {

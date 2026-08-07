@@ -19,11 +19,14 @@ export function DashboardAutoRefresh() {
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") refresh();
     };
+    const handlePageShow = () => refresh();
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("pageshow", handlePageShow);
     return () => {
       window.clearInterval(intervalId);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("pageshow", handlePageShow);
     };
   }, [router]);
 
