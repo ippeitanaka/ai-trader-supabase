@@ -3,7 +3,7 @@
 import { startTransition, useEffect } from "react";
 import { useRouter } from "next/navigation";
 
-const REFRESH_INTERVAL_MS = 15 * 60 * 1000;
+const REFRESH_INTERVAL_MS = 30 * 1000;
 
 export function DashboardAutoRefresh() {
   const router = useRouter();
