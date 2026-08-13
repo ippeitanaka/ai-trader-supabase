@@ -31,6 +31,7 @@ const COUNTRY_LABELS: Record<string, string> = {
 
 const SKIP_REASON_LABELS: Record<string, string> = {
   winprob_below_gate: "TP先着確率が実行基準を下回ったため",
+  direction_edge_too_small: "BUYとSELLの優位差が小さく、方向を絞れなかったため",
   ev_below_min: "期待値が最低基準を下回ったため",
   cost_too_high: "コストが許容上限を超えたため",
   calibration_not_applied: "補正モデルを適用できなかったため",
@@ -987,7 +988,7 @@ export default async function Home({ searchParams }: PageProps) {
 
         <section className="mt-8 grid gap-5 lg:grid-cols-[0.95fr_1.05fr]">
           <article className="surface-panel rounded-[28px] p-6 backdrop-blur">
-            <SectionTitle title="直近5件のEAログ" description="方向確率とTP先着確率を分けて確認" />
+            <SectionTitle title="直近5件のEAログ" description="BUY・SELL比較、方向確率、TP先着確率を確認" />
             <div className="space-y-4">
               {data.recentEaLogs.map((log) => (
                 <div key={log.id} className="rounded-3xl border border-white/8 bg-white/5 p-4">
@@ -1005,6 +1006,7 @@ export default async function Home({ searchParams }: PageProps) {
                   </div>
                   <p className="mt-3 text-sm leading-7 text-slate-100">{buildEaNarrative(log)}</p>
                   {(log.tp_before_sl_prob_raw ?? log.win_prob_raw) != null ? <p className="mt-2 text-xs text-cyan-100/80">TP先着: Raw {formatPercent((log.tp_before_sl_prob_raw ?? log.win_prob_raw)! * 100)} → 補正後 {formatPercent((log.tp_before_sl_prob_calibrated ?? log.win_prob_calibrated ?? log.tp_before_sl_prob_raw ?? log.win_prob_raw)! * 100)} → 最終 {formatPercent((log.tp_before_sl_prob_final ?? log.win_prob_final ?? log.win_prob) != null ? (log.tp_before_sl_prob_final ?? log.win_prob_final ?? log.win_prob)! * 100 : null)} / {log.calibration_method ?? "補正なし"} {log.calibration_scope ? `(${log.calibration_scope}, n=${log.calibration_sample_size ?? "-"})` : ""}</p> : null}
+                  {log.buy_win_prob != null && log.sell_win_prob != null ? <p className="mt-2 text-xs text-emerald-100/85">AI方向比較: BUY {formatPercent(log.buy_win_prob * 100)} / SELL {formatPercent(log.sell_win_prob * 100)} / 優位差 {(Math.abs(log.buy_win_prob - log.sell_win_prob) * 100).toFixed(1)}pt / 採用 {log.suggested_dir === 1 ? "BUY" : log.suggested_dir === -1 ? "SELL" : "見送り"}</p> : null}
                   {log.direction_prob != null ? <p className="mt-2 text-xs text-slate-300">方向確率: {formatPercent(log.direction_prob * 100)} / {log.direction_horizon_minutes ?? 60}分後 / 実行ゲートには不使用</p> : null}
                   {log.planned_tp != null && log.planned_sl != null ? <p className="mt-2 text-xs text-slate-300">注文前提: Entry {log.planned_entry_price ?? "-"} / TP {log.planned_tp} / SL {log.planned_sl} / RR {log.planned_reward_rr?.toFixed(2) ?? "-"} / cost {log.planned_cost_r?.toFixed(3) ?? "-"}R</p> : null}
                   {log.plan_effective_min_win_prob != null ? <p className="mt-2 text-xs text-slate-300">実行ゲート: AI {formatPercent((log.plan_base_min_win_prob ?? 0) * 100)} + {((log.plan_gate_adjustment ?? 0) * 100).toFixed(0)}pt = {formatPercent(log.plan_effective_min_win_prob * 100)}</p> : null}
