@@ -12,6 +12,12 @@ import {
   resolveOpportunityGate,
   type DailyPlanMembership,
 } from "./opportunity-policy.ts";
+import {
+  blendWithDirectionalEvidence,
+  buildDirectionalEvidence,
+  chooseDirection,
+  type DirectionalEvidence,
+} from "./direction-policy.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -514,7 +520,86 @@ type ExecutionModelHealth = {
   separation: number | null;
 };
 
+type DirectionalEvidenceResult = DirectionalEvidence & {
+  scope: "symbol_tf_dir" | "symbol_tf_dir_session";
+};
+
 const executionModelHealthCache = new Map<string, { expiresAt: number; health: ExecutionModelHealth }>();
+const directionalEvidenceCache = new Map<string, { expiresAt: number; evidence: DirectionalEvidenceResult | null }>();
+
+function getDirectionalEvidenceLookbackDays(): number {
+  const value = Number(Deno.env.get("AI_TRADER_DIRECTION_EVIDENCE_LOOKBACK_DAYS") ?? 120);
+  if (!Number.isFinite(value) || value < 14) return 120;
+  return Math.min(365, Math.floor(value));
+}
+
+function getMinimumDirectionEdge(): number {
+  const value = Number(Deno.env.get("AI_TRADER_MIN_DIRECTION_EDGE") ?? 0.025);
+  if (!Number.isFinite(value)) return 0.025;
+  return Math.max(0, Math.min(0.15, value));
+}
+
+async function getDirectionalEvidence(req: TradeRequest): Promise<DirectionalEvidenceResult | null> {
+  const direction = req.ea_suggestion.dir;
+  if (direction !== 1 && direction !== -1) return null;
+
+  const session = typeof req.market_session === "string" ? req.market_session.trim().toLowerCase() : "";
+  const cacheKey = `${req.symbol}|${req.timeframe}|${direction}|${session || "all"}`;
+  const cached = directionalEvidenceCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.evidence;
+
+  const since = new Date(
+    Date.now() - getDirectionalEvidenceLookbackDays() * 24 * 60 * 60 * 1000,
+  ).toISOString();
+  const { data, error } = await supabase
+    .from("ai_signals")
+    .select("created_at,symbol,dir,actual_result,is_virtual,probability_target_version,market_session")
+    .gte("created_at", since)
+    .eq("symbol", req.symbol)
+    .eq("timeframe", req.timeframe)
+    .eq("dir", direction)
+    .eq("reverse_execution", false)
+    .or("is_manual_trade.is.null,is_manual_trade.eq.false")
+    .or("result_consistent.is.null,result_consistent.eq.true")
+    .in("actual_result", ["WIN", "LOSS"])
+    .order("created_at", { ascending: false })
+    .limit(800);
+
+  if (error) {
+    console.warn(`[direction-evidence] fetch error ${cacheKey}: ${error.message}`);
+    directionalEvidenceCache.set(cacheKey, { expiresAt: Date.now() + 60 * 1000, evidence: null });
+    return null;
+  }
+
+  const rows = collapseTimedEpisodes((data ?? []) as Array<{
+    created_at: string;
+    symbol: string;
+    dir: number | null;
+    actual_result: string;
+    is_virtual: boolean | null;
+    probability_target_version: string | null;
+    market_session: string | null;
+  }>);
+  const allEvidence = buildDirectionalEvidence(rows);
+  const sessionRows = session
+    ? rows.filter((row) => (row.market_session ?? "").trim().toLowerCase() === session)
+    : [];
+  const sessionEvidence = buildDirectionalEvidence(sessionRows);
+  const useSession = Boolean(sessionEvidence && sessionEvidence.effective_samples >= 8);
+  const selected = useSession ? sessionEvidence : allEvidence;
+  const evidence = selected
+    ? {
+        ...selected,
+        scope: useSession ? "symbol_tf_dir_session" as const : "symbol_tf_dir" as const,
+      }
+    : null;
+
+  directionalEvidenceCache.set(cacheKey, {
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    evidence,
+  });
+  return evidence;
+}
 
 async function getExecutionModelHealth(timeframe: string): Promise<ExecutionModelHealth> {
   const cached = executionModelHealthCache.get(timeframe);
@@ -757,6 +842,7 @@ export interface TradeResponse {
   calibration_bin_sample_size?: number | null;
   calibration_shift?: number;
   probability_adjustments?: Record<string, number | string | boolean | null>;
+  direction_evidence?: DirectionalEvidenceResult | null;
   action: number;
   decision_summary?: string;
   // action=0 の場合でも「AIがより良いと見た方向」を返す（検証/学習用）
@@ -802,8 +888,13 @@ export interface TradeResponse {
   // Optional debug payload for dual-direction evaluation
   direction_eval?: {
     selected_dir: number;
-    buy?: { win_prob: number; direction_prob?: number; tp_before_sl_prob?: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
-    sell?: { win_prob: number; direction_prob?: number; tp_before_sl_prob?: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string };
+    edge?: number;
+    minimum_edge?: number;
+    ambiguous?: boolean;
+    buy_score?: number;
+    sell_score?: number;
+    buy?: { win_prob: number; direction_prob?: number; tp_before_sl_prob?: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string; evidence?: DirectionalEvidenceResult | null };
+    sell?: { win_prob: number; direction_prob?: number; tp_before_sl_prob?: number; action: number; expected_value_r?: number; entry_method?: string; skip_reason?: string; evidence?: DirectionalEvidenceResult | null };
   };
 
   // Daily trade plan diagnostics
@@ -1138,6 +1229,14 @@ function contextNumber(source: Record<string, number | string | null> | undefine
   return null;
 }
 
+function hasValidatedOpportunityEvidence(response: TradeResponse): boolean {
+  const evidence = response.direction_evidence;
+  if (!evidence) return false;
+  return evidence.real_samples >= 8 &&
+    evidence.effective_samples >= 12 &&
+    evidence.conservative_win_rate >= 0.52;
+}
+
 function applyChartQualityGuard(tradeReq: TradeRequest, response: TradeResponse): TradeResponse {
   const actionDir = typeof response.action === "number" ? response.action : 0;
   if (actionDir === 0) return response;
@@ -1203,11 +1302,13 @@ function applyChartQualityGuard(tradeReq: TradeRequest, response: TradeResponse)
     ? response.expected_value_r
     : computeExpectedValueR(response.win_prob, response.reward_rr ?? 1.5, response.cost_r ?? 0);
   const costR = typeof response.cost_r === "number" ? response.cost_r : 0;
-  const canOverride = hardReasons.length === 0 && qualifiesForOpportunityOverride({
-    winProb: response.win_prob,
-    expectedValueR,
-    costR,
-  });
+  const canOverride = hardReasons.length === 0 &&
+    hasValidatedOpportunityEvidence(response) &&
+    qualifiesForOpportunityOverride({
+      winProb: response.win_prob,
+      expectedValueR,
+      costR,
+    });
   if (canOverride) {
     const overrideNote = `CHART_OPPORTUNITY_OVERRIDE: ${softReasons.join("; ")}`;
     return {
@@ -1371,13 +1472,15 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
     : softReasons.includes("daily_plan_session_closed")
     ? 0.12
     : 0.05;
-  const canOverride = hardReasons.length === 0 && qualifiesForOpportunityOverride({
-    winProb: response.win_prob,
-    expectedValueR,
-    costR,
-    minExpectedValueR: minOverrideEv,
-    maxCostR: 0.20,
-  });
+  const canOverride = hardReasons.length === 0 &&
+    hasValidatedOpportunityEvidence(response) &&
+    qualifiesForOpportunityOverride({
+      winProb: response.win_prob,
+      expectedValueR,
+      costR,
+      minExpectedValueR: minOverrideEv,
+      maxCostR: 0.20,
+    });
   if (canOverride) {
     const overrideNote = `DAILY_PLAN_OPPORTUNITY_OVERRIDE: ${softReasons.join("; ")}`;
     return {
@@ -1687,22 +1790,33 @@ function calculateSignalFallback(req: TradeRequest): TradeResponse {
     }
   }
 
+  const requestedDir = req.ea_suggestion.dir === 1 || req.ea_suggestion.dir === -1
+    ? req.ea_suggestion.dir as 1 | -1
+    : null;
+  const directionalScore = requestedDir ? analysis.total_score * requestedDir : Math.abs(analysis.total_score);
+  const direction = requestedDir
+    ? directionalScore > 0.3 ? requestedDir : 0
+    : analysis.direction;
+  const winProb = requestedDir
+    ? 0.5 + 0.45 * Math.tanh(directionalScore * 2)
+    : analysis.win_prob;
+
   console.log(
-    `[Fallback] QuadFusion: win_prob=${(analysis.win_prob * 100).toFixed(1)}% ` +
-    `direction=${analysis.direction} confidence=${analysis.confidence}`
+    `[Fallback] QuadFusion: win_prob=${(winProb * 100).toFixed(1)}% ` +
+    `direction=${direction} requested=${requestedDir ?? 0} confidence=${analysis.confidence}`
   );
   
   return {
-    win_prob: Math.round(analysis.win_prob * 1000) / 1000,
-    action: analysis.direction,
-    suggested_dir: analysis.direction,
+    win_prob: Math.round(winProb * 1000) / 1000,
+    action: direction,
+    suggested_dir: requestedDir ?? analysis.direction,
     offset_factor: Math.round(offset_factor * 1000) / 1000,
     expiry_minutes,
     confidence: analysis.confidence,
     reasoning: analysis.reasoning,
     recommended_min_win_prob: 0.75,
-    expected_value_r: computeExpectedValueR(analysis.win_prob),
-    skip_reason: analysis.direction === 0 ? "no-trade" : "",
+    expected_value_r: computeExpectedValueR(winProb),
+    skip_reason: direction === 0 ? "no-trade" : "",
     entry_method: "market",
     entry_params: null,
     method_selected_by: "Fallback",
@@ -1731,13 +1845,16 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
 
   const raw = typeof base.win_prob === "number" ? base.win_prob : 0.5;
   const { winProb: calibrated, debug } = await calibrateWinProb(req, raw);
+  const directionEvidence = await getDirectionalEvidence(req);
+  const historyBlend = blendWithDirectionalEvidence(calibrated, directionEvidence);
+  const evidenceAdjusted = historyBlend.probability;
 
   const calibrationOk = !calibrationRequired || debug.applied;
 
   const dir = (base.action === 1 || base.action === -1) ? base.action : 0;
   const probabilityDir = dir === -1 ? -1 : 1;
   const probabilityContract = buildProbabilityContract(req, probabilityDir, rt);
-  const rsiGuard = applyExtremeRsiPenalty({ req, dir, winProb: calibrated, costR: rt.costR });
+  const rsiGuard = applyExtremeRsiPenalty({ req, dir, winProb: evidenceAdjusted, costR: rt.costR });
   const afterRsi = rsiGuard.winProb;
 
   // RSI Mean-Reversion Bonus: SHORT@RSI>=70 / LONG@RSI<=30 has ~63% win rate historically.
@@ -1804,6 +1921,12 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
   const calTag = debug.applied
     ? `CAL(${debug.method}/${debug.scope} n=${debug.n}): raw=${round3(raw)}→${round3(calibrated)}`
     : "";
+  const evidenceTag = directionEvidence
+    ? `DIR_EVIDENCE(${directionEvidence.scope} real=${directionEvidence.real_samples} virtual=${directionEvidence.virtual_samples} ` +
+      `eff=${directionEvidence.effective_samples} post=${directionEvidence.posterior_win_rate} ` +
+      `low=${directionEvidence.conservative_win_rate} blend=${directionEvidence.blend_weight} ` +
+      `adj=${round3(historyBlend.adjustment)})`
+    : "DIR_EVIDENCE(insufficient)";
   const rsiGuardTag = rsiGuard.guardTag;
   const rsiMrBonusTag = rsiMrBonus.guardTag;
   const recentPerfTag = recentPerfResult.guardTag;
@@ -1813,7 +1936,7 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     `sep=${modelHealth.separation ?? "na"} applied=0 finalP=${round3(winProbFinal)})`;
 
   const baseReasoning = typeof base.reasoning === "string" ? base.reasoning.trim() : "";
-  const tags = [gateTag, calTag, reliabilityTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
+  const tags = [gateTag, calTag, evidenceTag, reliabilityTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
   const reasoning = baseReasoning ? `${tags} | ${baseReasoning}` : tags;
   const decision_summary = buildDecisionSummary({
     willExecute: action !== 0,
@@ -1865,11 +1988,18 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     calibration_sample_size: debug.n ?? null,
     calibration_bin_sample_size: debug.bin_n ?? null,
     calibration_shift: round3(calibrated - raw),
+    direction_evidence: directionEvidence,
     probability_adjustments: {
       calibration_version: debug.version ?? null,
       calibration_source: debug.source ?? null,
       calibration: round3(calibrated - raw),
-      extreme_rsi: round3(afterRsi - calibrated),
+      directional_history: round3(historyBlend.adjustment),
+      directional_history_effective_n: directionEvidence?.effective_samples ?? 0,
+      directional_history_real_n: directionEvidence?.real_samples ?? 0,
+      directional_history_virtual_n: directionEvidence?.virtual_samples ?? 0,
+      directional_history_posterior: directionEvidence?.posterior_win_rate ?? null,
+      directional_history_lower: directionEvidence?.conservative_win_rate ?? null,
+      extreme_rsi: round3(afterRsi - evidenceAdjusted),
       rsi_mean_reversion: round3(afterRsiMr - afterRsi),
       recent_performance: round3(afterRecentPerf - afterRsiMr),
       loss_streak: round3(modelWinProb - afterRecentPerf),
@@ -2975,6 +3105,9 @@ ${candleBarsSummary}
     const raw_win_prob = win_prob;
     const cal = await calibrateWinProb(req, raw_win_prob);
     win_prob = cal.winProb;
+    const directionEvidence = await getDirectionalEvidence(req);
+    const historyBlend = blendWithDirectionalEvidence(win_prob, directionEvidence);
+    win_prob = historyBlend.probability;
 
     const calibrationOk = !calibrationRequired || cal.debug.applied;
     
@@ -3055,6 +3188,12 @@ ${candleBarsSummary}
     const calTag = cal.debug.applied
       ? `CAL(${cal.debug.method}/${cal.debug.scope} n=${cal.debug.n}): raw=${round3(raw_win_prob)}→${round3(cal.winProb)}`
       : "";
+    const evidenceTag = directionEvidence
+      ? `DIR_EVIDENCE(${directionEvidence.scope} real=${directionEvidence.real_samples} virtual=${directionEvidence.virtual_samples} ` +
+        `eff=${directionEvidence.effective_samples} post=${directionEvidence.posterior_win_rate} ` +
+        `low=${directionEvidence.conservative_win_rate} blend=${directionEvidence.blend_weight} ` +
+        `adj=${round3(historyBlend.adjustment)})`
+      : "DIR_EVIDENCE(insufficient)";
     const rsiGuardTag = rsiGuard.guardTag;
     const rsiMrBonusTag = rsiMrBonus.guardTag;
     const recentPerfTag = recentPerfResult.guardTag;
@@ -3063,7 +3202,7 @@ ${candleBarsSummary}
       `MODEL_DIAGNOSTIC(weight=${round3(modelHealth.weight)} n=${modelHealth.episodes} ` +
       `sep=${modelHealth.separation ?? "na"} applied=0 finalP=${round3(win_prob)})`;
 
-    const tags = [gateTag, calTag, reliabilityTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
+    const tags = [gateTag, calTag, evidenceTag, reliabilityTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
 
     const costOk = rt.costR <= maxCostR;
     const willExecute =
@@ -3147,11 +3286,18 @@ ${candleBarsSummary}
       calibration_sample_size: cal.debug.n ?? null,
       calibration_bin_sample_size: cal.debug.bin_n ?? null,
       calibration_shift: round3(cal.winProb - raw_win_prob),
+      direction_evidence: directionEvidence,
       probability_adjustments: {
         calibration_version: cal.debug.version ?? null,
         calibration_source: cal.debug.source ?? null,
         calibration: round3(cal.winProb - raw_win_prob),
-        extreme_rsi: round3(rsiGuard.winProb - cal.winProb),
+        directional_history: round3(historyBlend.adjustment),
+        directional_history_effective_n: directionEvidence?.effective_samples ?? 0,
+        directional_history_real_n: directionEvidence?.real_samples ?? 0,
+        directional_history_virtual_n: directionEvidence?.virtual_samples ?? 0,
+        directional_history_posterior: directionEvidence?.posterior_win_rate ?? null,
+        directional_history_lower: directionEvidence?.conservative_win_rate ?? null,
+        extreme_rsi: round3(rsiGuard.winProb - historyBlend.probability),
         rsi_mean_reversion: round3(rsiMrBonus.winProb - rsiGuard.winProb),
         recent_performance: round3(recentPerfResult.winProb - rsiMrBonus.winProb),
         loss_streak: round3(streakResult.winProb - recentPerfResult.winProb),
@@ -3175,21 +3321,85 @@ ${candleBarsSummary}
   }
 }
 
-function pickBetterDirection(
-  buy: TradeResponse,
-  sell: TradeResponse,
-): { selectedDir: 1 | -1; selected: TradeResponse } {
-  // Primary: higher expected_value_r. Secondary: higher win_prob.
-  const buyEv = typeof buy.expected_value_r === "number" ? buy.expected_value_r : -Infinity;
-  const sellEv = typeof sell.expected_value_r === "number" ? sell.expected_value_r : -Infinity;
+function mergeDualDirectionResponses(buyRes: TradeResponse, sellRes: TradeResponse): TradeResponse {
+  const minimumEdge = getMinimumDirectionEdge();
+  const choice = chooseDirection(
+    {
+      dir: 1,
+      winProb: buyRes.win_prob,
+      directionProb: buyRes.direction_prob,
+      action: buyRes.action,
+    },
+    {
+      dir: -1,
+      winProb: sellRes.win_prob,
+      directionProb: sellRes.direction_prob,
+      action: sellRes.action,
+    },
+    minimumEdge,
+  );
+  const selectedBase = choice.selectedDir === 1 ? buyRes : sellRes;
+  const selected = choice.ambiguous
+    ? {
+        ...selectedBase,
+        action: 0,
+        skip_reason: appendSkip(selectedBase.skip_reason, "direction_edge_too_small"),
+        decision_summary: appendReasonText(
+          selectedBase.decision_summary,
+          `directionEdge=${round3(choice.edge)}<${round3(minimumEdge)}`,
+        ),
+      }
+    : selectedBase;
 
-  if (buyEv > sellEv) return { selectedDir: 1, selected: buy };
-  if (sellEv > buyEv) return { selectedDir: -1, selected: sell };
+  const mergedReasoning = [
+    selected.reasoning,
+    `DUAL_DIR: selected=${choice.selectedDir} buy=${round3(buyRes.win_prob)} sell=${round3(sellRes.win_prob)} ` +
+      `edge=${round3(choice.edge)} minEdge=${round3(minimumEdge)} ambiguous=${choice.ambiguous ? 1 : 0}`,
+  ]
+    .filter(Boolean)
+    .join(" | ");
 
-  const buyWin = typeof buy.win_prob === "number" ? buy.win_prob : -Infinity;
-  const sellWin = typeof sell.win_prob === "number" ? sell.win_prob : -Infinity;
-  if (buyWin >= sellWin) return { selectedDir: 1, selected: buy };
-  return { selectedDir: -1, selected: sell };
+  return {
+    ...selected,
+    suggested_dir: choice.selectedDir,
+    buy_win_prob: buyRes.win_prob,
+    sell_win_prob: sellRes.win_prob,
+    buy_direction_prob: buyRes.direction_prob,
+    sell_direction_prob: sellRes.direction_prob,
+    buy_tp_before_sl_prob: buyRes.tp_before_sl_prob ?? buyRes.win_prob,
+    sell_tp_before_sl_prob: sellRes.tp_before_sl_prob ?? sellRes.win_prob,
+    buy_action: buyRes.action,
+    sell_action: sellRes.action,
+    reasoning: mergedReasoning,
+    direction_eval: {
+      selected_dir: choice.selectedDir,
+      edge: round3(choice.edge),
+      minimum_edge: round3(minimumEdge),
+      ambiguous: choice.ambiguous,
+      buy_score: round3(choice.buyScore),
+      sell_score: round3(choice.sellScore),
+      buy: {
+        win_prob: buyRes.win_prob,
+        direction_prob: buyRes.direction_prob,
+        tp_before_sl_prob: buyRes.tp_before_sl_prob ?? buyRes.win_prob,
+        action: buyRes.action,
+        expected_value_r: buyRes.expected_value_r,
+        entry_method: buyRes.entry_method,
+        skip_reason: buyRes.skip_reason,
+        evidence: buyRes.direction_evidence,
+      },
+      sell: {
+        win_prob: sellRes.win_prob,
+        direction_prob: sellRes.direction_prob,
+        tp_before_sl_prob: sellRes.tp_before_sl_prob ?? sellRes.win_prob,
+        action: sellRes.action,
+        expected_value_r: sellRes.expected_value_r,
+        entry_method: sellRes.entry_method,
+        skip_reason: sellRes.skip_reason,
+        evidence: sellRes.direction_evidence,
+      },
+    },
+  };
 }
 
 // OpenAI APIを使用したAI予測（dir=0 の場合は BUY/SELL を両方評価して比較）
@@ -3222,54 +3432,29 @@ async function calculateSignalWithAI(req: TradeRequest): Promise<TradeResponse> 
       calculateSignalWithAIForFixedDir(sellReq),
     ]);
 
-    const picked = pickBetterDirection(buyRes, sellRes);
-    const selected = picked.selected;
-
-    // Ensure suggested_dir is always the chosen direction even if action=0.
-    const mergedReasoning = [
-      selected.reasoning,
-      `DUAL_DIR: selected=${picked.selectedDir} buy=${buyRes.win_prob?.toFixed?.(3) ?? buyRes.win_prob} sell=${sellRes.win_prob?.toFixed?.(3) ?? sellRes.win_prob}`,
-    ]
-      .filter(Boolean)
-      .join(" | ");
-
-    return {
-      ...selected,
-      suggested_dir: picked.selectedDir,
-      buy_win_prob: buyRes.win_prob,
-      sell_win_prob: sellRes.win_prob,
-      buy_direction_prob: buyRes.direction_prob,
-      sell_direction_prob: sellRes.direction_prob,
-      buy_tp_before_sl_prob: buyRes.tp_before_sl_prob ?? buyRes.win_prob,
-      sell_tp_before_sl_prob: sellRes.tp_before_sl_prob ?? sellRes.win_prob,
-      buy_action: buyRes.action,
-      sell_action: sellRes.action,
-      reasoning: mergedReasoning,
-      direction_eval: {
-        selected_dir: picked.selectedDir,
-        buy: {
-          win_prob: buyRes.win_prob,
-          direction_prob: buyRes.direction_prob,
-          tp_before_sl_prob: buyRes.tp_before_sl_prob ?? buyRes.win_prob,
-          action: buyRes.action,
-          expected_value_r: buyRes.expected_value_r,
-          entry_method: buyRes.entry_method,
-          skip_reason: buyRes.skip_reason,
-        },
-        sell: {
-          win_prob: sellRes.win_prob,
-          direction_prob: sellRes.direction_prob,
-          tp_before_sl_prob: sellRes.tp_before_sl_prob ?? sellRes.win_prob,
-          action: sellRes.action,
-          expected_value_r: sellRes.expected_value_r,
-          entry_method: sellRes.entry_method,
-          skip_reason: sellRes.skip_reason,
-        },
-      },
-    };
+    return mergeDualDirectionResponses(buyRes, sellRes);
   }
 
   return calculateSignalWithAIForFixedDir(req);
+}
+
+async function calculateSignalFallbackForRequest(req: TradeRequest): Promise<TradeResponse> {
+  if (req.ea_suggestion.dir !== 0) return calculateSignalFallbackWithCalibration(req);
+
+  const baseSuggestion = req.ea_suggestion;
+  const makeRequest = (dir: 1 | -1): TradeRequest => ({
+    ...req,
+    ea_suggestion: {
+      ...baseSuggestion,
+      dir,
+      tech_dir: typeof baseSuggestion.tech_dir === "number" ? baseSuggestion.tech_dir : undefined,
+    },
+  });
+  const [buyRes, sellRes] = await Promise.all([
+    calculateSignalFallbackWithCalibration(makeRequest(1)),
+    calculateSignalFallbackWithCalibration(makeRequest(-1)),
+  ]);
+  return mergeDualDirectionResponses(buyRes, sellRes);
 }
 
 serve(async (req: Request) => {
@@ -3309,7 +3494,7 @@ serve(async (req: Request) => {
       JSON.stringify({ 
         ok: true, 
         service: "ai-trader with OpenAI + Comprehensive Technical Analysis", 
-        version: "3.0.0-direction-tp-probabilities",
+        version: "3.1.0-dual-direction-evidence",
         mode: "COMPREHENSIVE_TECHNICAL",
         ai_enabled: hasKey,
         ml_learning_enabled: mlLearningEnabled,
@@ -3340,6 +3525,9 @@ serve(async (req: Request) => {
           "detailed_final_probability",
           "separate_direction_probability",
           "tp_before_sl_probability",
+          "dual_direction_comparison",
+          "directional_outcome_evidence",
+          "ambiguous_direction_guard",
           "higher_timeframe_context",
           "chart_structure_guard",
           "volatility_cost_context",
@@ -3466,12 +3654,12 @@ serve(async (req: Request) => {
       } catch (aiError) {
         console.error(`[ai-trader] ❌ OpenAI prediction failed:`, aiError);
         console.warn(`[ai-trader] Switching to fallback calculation...`);
-        response = await calculateSignalFallbackWithCalibration(tradeReq);
+        response = await calculateSignalFallbackForRequest(tradeReq);
         predictionMethod = "Fallback-AfterAI-Error";
       }
     } else {
       console.warn(`[ai-trader] ⚠️ Using rule-based FALLBACK (no OpenAI key)`);
-      response = await calculateSignalFallbackWithCalibration(tradeReq);
+      response = await calculateSignalFallbackForRequest(tradeReq);
       predictionMethod = "Fallback-NoKey";
     }
 

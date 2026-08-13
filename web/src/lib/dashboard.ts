@@ -152,6 +152,9 @@ type EALogRecord = {
   tf: string | null;
   action: string | null;
   trade_decision: string | null;
+  suggested_dir?: number | null;
+  buy_win_prob?: number | null;
+  sell_win_prob?: number | null;
   direction_prob?: number | null;
   direction_prob_raw?: number | null;
   tp_before_sl_prob?: number | null;
@@ -940,7 +943,7 @@ export async function updateTradePlanOverrides(reportId: number, overrides: Plan
 }
 
 async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
-  const legacySelect = "id,created_at,at,sym,tf,action,trade_decision,win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,decision_summary,skip_reason,entry_method,trade_plan_id,plan_alignment,event_risk,market_session,ai_reasoning,order_ticket";
+  const legacySelect = "id,created_at,at,sym,tf,action,trade_decision,win_prob,suggested_dir,buy_win_prob,sell_win_prob,win_prob_raw,win_prob_calibrated,win_prob_final,calibration_applied,calibration_version,calibration_method,calibration_scope,calibration_sample_size,calibration_shift,h1_shadow_checked,h1_shadow_would_block,h1_shadow_reason,plan_base_min_win_prob,plan_gate_adjustment,plan_effective_min_win_prob,plan_gate_mode,decision_summary,skip_reason,entry_method,trade_plan_id,plan_alignment,event_risk,market_session,ai_reasoning,order_ticket";
   const params = {
     order: "created_at.desc,id.desc",
     limit: "5",

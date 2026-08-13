@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| AwajiSamurai_AI_2.0.mq5  (ver 1.9.0)                            |
+//| AwajiSamurai_AI_2.0.mq5  (ver 2.0.0)                            |
 //| - Supabase: ai-signals(AI側) / ea-log                            |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
@@ -17,6 +17,7 @@
 //| - v1.7.0: 固定ロット・market-only化、H1を監査専用へ変更         |
 //| - v1.8.0: 複数建玉のposition ID追跡と純損益集計を修正           |
 //| - v1.9.0: 方向確率とTP先着確率を分離し、注文条件を記録          |
+//| - v2.0.0: BUY/SELL両方向をAI評価し、方向別実績で補正            |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -51,7 +52,7 @@ input string EALogBearerToken        = "";
 #define CooldownAfterCloseMin 30
 #define H1AuditEnabled true
 #define H1OppositeBlockProb 0.78
-#define UseAIForDirection false
+#define UseAIForDirection true
 #define CandleBarsToSend 12
 #define EnableVirtualLearning true
 #define VirtualMaxWatches 2000
@@ -62,8 +63,8 @@ input string EALogBearerToken        = "";
 #define AI_Bearer_Token AIBearerToken
 #define EA_Log_Bearer_Token EALogBearerToken
 #define AI_EA_Instance "main"
-#define AI_EA_Version "1.9.0"
-#define AI_Timeout_ms 10000
+#define AI_EA_Version "2.0.0"
+#define AI_Timeout_ms 30000
 #define UseIchimoku true
 #define Ichimoku_Tenkan 9
 #define Ichimoku_Kijun 26
@@ -2324,6 +2325,49 @@ void MaybeRecordVirtualSkip(const string decision_code,const TechSignal &t,doubl
    }
 }
 
+void RecordOppositeDirectionShadow(const TechSignal &base,double rsi,const AIOut &ai,int expiry_min)
+{
+   if(!EnableVirtualLearning || ai.buy_win_prob<0.0 || ai.sell_win_prob<0.0) return;
+
+   int selected_dir=(ai.suggested_dir!=0?ai.suggested_dir:ai.action);
+   if(selected_dir!=1 && selected_dir!=-1) return;
+   int opposite_dir=-selected_dir;
+   double opposite_prob=(opposite_dir>0?ai.buy_win_prob:ai.sell_win_prob);
+   if(!MathIsValidNumber(opposite_prob) || opposite_prob<0.0 || opposite_prob>1.0) return;
+
+   AIOut shadow=ai;
+   shadow.action=0;
+   shadow.suggested_dir=opposite_dir;
+   shadow.win_prob=opposite_prob;
+   shadow.win_prob_raw=opposite_prob;
+   shadow.win_prob_calibrated=opposite_prob;
+   shadow.win_prob_final=opposite_prob;
+   shadow.direction_prob=opposite_prob;
+   shadow.direction_prob_raw=opposite_prob;
+   shadow.tp_before_sl_prob=opposite_prob;
+   shadow.tp_before_sl_prob_raw=opposite_prob;
+   shadow.tp_before_sl_prob_calibrated=opposite_prob;
+   shadow.tp_before_sl_prob_final=opposite_prob;
+   shadow.probability_target_version="direction_tp_v2";
+   shadow.calibration_applied=false;
+   shadow.calibration_version="paired_direction";
+   shadow.calibration_method="final_probability_snapshot";
+   shadow.calibration_scope="symbol_tf_dir";
+   shadow.calibration_shift=0.0;
+   shadow.expected_value_r=opposite_prob*shadow.reward_rr-(1.0-opposite_prob)-shadow.planned_cost_r;
+   shadow.skip_reason="dual_direction_counterfactual";
+   shadow.plan_alignment="dual_direction_counterfactual";
+   shadow.decision_summary=StringFormat("見送り %s | pairedDirection=1 | p=%.3f | target=tp_before_sl",
+      (opposite_dir>0?"BUY":"SELL"),opposite_prob);
+   shadow.reasoning="DUAL_DIR_COUNTERFACTUAL: opposite direction shadow tracking";
+   shadow.method_reason="paired BUY/SELL outcome collection";
+
+   TechSignal opposite=base;
+   opposite.dir=opposite_dir;
+   opposite.reason=base.reason+"|dual_direction_counterfactual";
+   MaybeRecordVirtualSkip("DUAL_DIRECTION_COUNTERFACTUAL",opposite,rsi,shadow,expiry_min);
+}
+
 // Parse timeframe string to ENUM_TIMEFRAMES
 ENUM_TIMEFRAMES ParseTF(const string s){
    if(s=="M1") return PERIOD_M1;
@@ -2387,6 +2431,7 @@ void OnM15NewBar()
    // derive expiry minutes for virtual tracking
    int expiry_min = PendingExpiryMin;
    if(ai.expiry_min>0) expiry_min=ai.expiry_min;
+   RecordOppositeDirectionShadow(t,rsi,ai,expiry_min);
    
    if(threshold_met){
       // 以降の注文・仮想・記録は方向を統一
