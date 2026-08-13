@@ -137,6 +137,15 @@ function formatStrategy(value: string | null | undefined) {
   return value ?? "-";
 }
 
+function formatSelectionSource(value: string | null | undefined) {
+  if (value === "ai_verified") return "AI推奨・査読済み";
+  if (value === "critic_conditional") return "AI一次候補・条件付き";
+  if (value === "system_conditional") return "システム条件付き";
+  if (value === "rule_fallback") return "ルール代替判定";
+  if (value === "ai_primary") return "AI一次判定";
+  return "判定元未記録";
+}
+
 function formatUtcWindow(start?: string, end?: string) {
   if (!start || !end) return "-";
   return `${formatUtcClockAsJst(start)}-${formatUtcClockAsJst(end)} JST`;
@@ -497,10 +506,11 @@ export default async function Home({ searchParams }: PageProps) {
               <h1 className="font-title text-3xl font-semibold tracking-[0.16em] text-white sm:text-5xl">
                 Awaji Samurai AI Trader
               </h1>
-              <div className="mt-6 grid gap-3 sm:grid-cols-3">
+              <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <HeroBadge label="更新 cadence" value={formatCadenceLabel(latest?.cadence ?? null)} />
                 <HeroBadge label="監視テーマ" value={`${liveContext?.themes?.length ?? 0} 件`} />
                 <HeroBadge label="選定 lookback" value={`${latest?.lookback_days ?? 21} 日`} />
+                <HeroBadge label="日次AIモデル" value={latest?.model ?? "-"} />
               </div>
               <div className="mt-5 flex flex-col gap-3 sm:items-start">
                 <AiRefreshButton
@@ -554,7 +564,7 @@ export default async function Home({ searchParams }: PageProps) {
               <p className="text-xs uppercase tracking-[0.24em] text-slate-400">稼働メモ</p>
               <div className="mt-4 space-y-3 text-sm text-slate-300">
                 <div className="rounded-2xl border border-white/8 bg-slate-950/45 px-4 py-3">更新時刻: {formatDateTime(latest?.generated_at ?? data.generatedAt)}</div>
-                <div className="rounded-2xl border border-white/8 bg-slate-950/45 px-4 py-3">推奨候補: {(latest?.recommended_pairs?.length ?? 0)} 件 / 回避候補: {(latest?.avoided_pairs?.length ?? 0)} 件</div>
+                <div className="rounded-2xl border border-white/8 bg-slate-950/45 px-4 py-3">検証済み推奨: {(latest?.recommended_pairs?.length ?? 0)} 件 / 条件付き: {(latest?.neutral_pairs?.length ?? 0)} 件</div>
                 <div className="rounded-2xl border border-white/8 bg-slate-950/45 px-4 py-3">直近ログ: {data.recentEaLogs.length} 件を表示中</div>
               </div>
             </article>
@@ -616,12 +626,16 @@ export default async function Home({ searchParams }: PageProps) {
                       ? "border-cyan-300/30 bg-cyan-300/10 text-cyan-100"
                       : "border-amber-300/30 bg-amber-300/10 text-amber-100"
                   }`}>
-                    選定 {selectionMeta.selected_count}/{selectionMeta.requested_count}
+                    AI推奨 {selectionMeta.selected_count}件 / 上限 {selectionMeta.requested_count}件
                   </span>
                 ) : null}
-                {(selectionMeta?.backfilled_count ?? 0) > 0 ? (
-                  <span className="w-fit rounded-full border border-violet-300/30 bg-violet-300/10 px-3 py-1 text-xs text-violet-100">
-                    市場補充 {selectionMeta?.backfilled_count}
+                {tradePlan?.selection_review ? (
+                  <span className={`w-fit rounded-full border px-3 py-1 text-xs ${
+                    tradePlan.selection_review.status === "completed"
+                      ? "border-emerald-300/30 bg-emerald-300/10 text-emerald-100"
+                      : "border-amber-300/30 bg-amber-300/10 text-amber-100"
+                  }`}>
+                    批判検証 {tradePlan.selection_review.status === "completed" ? "完了" : "未完了"}
                   </span>
                 ) : null}
               </div>
@@ -629,10 +643,10 @@ export default async function Home({ searchParams }: PageProps) {
             </div>
           </div>
 
-          {selectionMeta && (!selectionMeta.complete || selectionMeta.excluded_market_closed.length > 0) ? (
+          {selectionMeta && (selectionMeta.selected_count === 0 || selectionMeta.excluded_market_closed.length > 0) ? (
             <div className="mb-5 flex flex-wrap gap-x-5 gap-y-2 rounded-2xl border border-amber-300/18 bg-amber-300/8 px-4 py-3 text-xs leading-6 text-amber-50">
               <span>市場適格 {selectionMeta.eligible_count}銘柄</span>
-              {!selectionMeta.complete ? <span>要求数に満たないため、適格銘柄のみで稼働</span> : null}
+              {selectionMeta.selected_count === 0 ? <span>本日は検証済み推奨なし。条件付き候補のみ通常ガードで監視</span> : null}
               {selectionMeta.excluded_market_closed.length > 0 ? (
                 <span>休場除外: {selectionMeta.excluded_market_closed.join(" / ")}</span>
               ) : null}
@@ -653,6 +667,7 @@ export default async function Home({ searchParams }: PageProps) {
                   <div>
                     <h3 className="text-2xl font-semibold text-white">{item.symbol}</h3>
                     <p className="mt-1 text-xs uppercase tracking-[0.2em] text-cyan-100/70">{formatStrategy(item.strategy)}</p>
+                    <p className="mt-2 text-xs text-emerald-200/80">{formatSelectionSource(item.selection_source)}</p>
                   </div>
                   <div className="text-right">
                     <p className="text-2xl font-semibold text-cyan-50">{item.score}</p>
@@ -726,7 +741,7 @@ export default async function Home({ searchParams }: PageProps) {
               );
             }) : (
               <div className="rounded-3xl border border-white/8 bg-slate-950/35 p-5 text-sm text-slate-300 xl:col-span-3">
-                日次計画はまだ生成されていません。AI判定ボタンで最新計画を作成できます。
+                {tradePlan ? "本日は批判検証と品質条件を通過した推奨ペアがありません。" : "日次計画はまだ生成されていません。AI判定ボタンで最新計画を作成できます。"}
               </div>
             )}
           </div>
@@ -736,14 +751,14 @@ export default async function Home({ searchParams }: PageProps) {
 
         <section className="mt-8 grid gap-5 xl:grid-cols-2">
           <article className="surface-panel rounded-[28px] p-6 backdrop-blur">
-            <SectionTitle title="本日の推奨ペア" description="日次計画を優先適用" />
+            <SectionTitle title="本日の推奨ペア" description="一次AI・批判モデル・統計品質ゲートを通過" />
             <div className="grid gap-4 md:grid-cols-2">
               {(latest?.recommended_pairs ?? []).slice(0, 4).map((pair) => (
                 <div key={`rec-${pair.symbol}`} className="rounded-3xl border border-emerald-400/18 bg-emerald-400/8 p-4">
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <p className="text-lg font-semibold text-white">{pair.symbol}</p>
-                      <p className="text-xs uppercase tracking-[0.18em] text-emerald-200/70">推奨</p>
+                      <p className="text-xs uppercase tracking-[0.18em] text-emerald-200/70">{formatSelectionSource(pair.selection_source)}</p>
                     </div>
                     <div className="text-right">
                       <p className="text-2xl font-semibold text-emerald-100">{pair.score}</p>
@@ -751,9 +766,15 @@ export default async function Home({ searchParams }: PageProps) {
                     </div>
                   </div>
                   <p className="mt-3 text-sm leading-7 text-slate-200">{pair.reason}</p>
+                  {pair.verification_reason ? <p className="mt-2 text-xs leading-6 text-emerald-100/75">査読: {pair.verification_reason}</p> : null}
                   {pair.caution ? <p className="mt-2 text-xs text-amber-200/80">注意: {pair.caution}</p> : null}
                 </div>
               ))}
+              {(latest?.recommended_pairs?.length ?? 0) === 0 ? (
+                <div className="rounded-3xl border border-white/8 bg-slate-950/35 p-4 text-sm leading-7 text-slate-300 md:col-span-2">
+                  本日は検証済み推奨が0件です。推奨数を埋めるための自動補充は行いません。
+                </div>
+              ) : null}
             </div>
           </article>
 
@@ -765,7 +786,7 @@ export default async function Home({ searchParams }: PageProps) {
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <p className="text-lg font-semibold text-white">{pair.symbol}</p>
-                      <p className="text-xs uppercase tracking-[0.18em] text-rose-200/70">回避</p>
+                      <p className="text-xs uppercase tracking-[0.18em] text-rose-200/70">{pair.verification_status === "rejected" ? "査読・品質ゲートで回避" : "回避"}</p>
                     </div>
                     <div className="text-right">
                       <p className="text-2xl font-semibold text-rose-100">{pair.score}</p>
@@ -773,6 +794,7 @@ export default async function Home({ searchParams }: PageProps) {
                     </div>
                   </div>
                   <p className="mt-3 text-sm leading-7 text-slate-200">{pair.reason}</p>
+                  {pair.verification_reason ? <p className="mt-2 text-xs leading-6 text-rose-100/75">判定: {pair.verification_reason}</p> : null}
                   {pair.caution ? <p className="mt-2 text-xs text-amber-200/80">注意: {pair.caution}</p> : null}
                 </div>
               ))}
@@ -784,7 +806,7 @@ export default async function Home({ searchParams }: PageProps) {
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
               {(latest?.neutral_pairs ?? []).slice(0, 8).map((pair) => {
                 const symbolKey = pair.symbol.toUpperCase();
-                const aiGate = Math.max(0.50, Math.min(0.75, pair.min_win_prob ?? 0.50));
+                const aiGate = Math.max(0.50, Math.min(0.75, pair.min_win_prob ?? 0.60));
                 const manualGate = symbolMinWinProbs[symbolKey];
                 const effectiveGate = typeof manualGate === "number" ? manualGate : aiGate;
                 const sessionOverride = symbolSessionOverrides[symbolKey];
@@ -794,7 +816,7 @@ export default async function Home({ searchParams }: PageProps) {
                     <div className="flex items-center justify-between gap-3">
                       <div>
                         <p className="text-lg font-semibold text-white">{pair.symbol}</p>
-                        <p className="text-xs uppercase tracking-[0.18em] text-cyan-100/70">条件付き許可</p>
+                        <p className="text-xs uppercase tracking-[0.18em] text-cyan-100/70">{formatSelectionSource(pair.selection_source)}</p>
                       </div>
                       <div className="text-right">
                         <p className="text-2xl font-semibold text-cyan-50">{pair.score}</p>
@@ -837,6 +859,7 @@ export default async function Home({ searchParams }: PageProps) {
                       )}
                     </div>
                     <p className="mt-3 text-sm leading-7 text-slate-200">{pair.reason}</p>
+                    {pair.verification_reason ? <p className="mt-2 text-xs leading-6 text-cyan-100/75">査読: {pair.verification_reason}</p> : null}
                     {pair.caution ? <p className="mt-2 text-xs text-amber-200/80">注意: {pair.caution}</p> : null}
                   </div>
                 );

@@ -1,4 +1,9 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  assessRecommendationQuality,
+  isHeadlineRelevantToSymbol,
+  isMarketHeadline,
+} from "./selection-policy.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 let SUPABASE_SERVICE_ROLE_KEY =
@@ -6,8 +11,9 @@ let SUPABASE_SERVICE_ROLE_KEY =
   Deno.env.get("SERVICE_ROLE_KEY") ??
   "";
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
-const PAIR_SELECTOR_MODEL = Deno.env.get("PAIR_SELECTOR_MODEL") ?? "gpt-5-mini";
-const PAIR_SELECTOR_FALLBACK_MODEL = Deno.env.get("OPENAI_MODEL") ?? "gpt-4.1-mini";
+const PAIR_SELECTOR_MODEL = Deno.env.get("PAIR_SELECTOR_MODEL") ?? "gpt-5.6-terra";
+const PAIR_SELECTOR_REVIEW_MODEL = Deno.env.get("PAIR_SELECTOR_REVIEW_MODEL") ?? "gpt-5.4-mini";
+const PAIR_SELECTOR_FALLBACK_MODEL = Deno.env.get("PAIR_SELECTOR_FALLBACK_MODEL") ?? "gpt-5-mini";
 const FINNHUB_API_KEY = Deno.env.get("FINNHUB_API_KEY") ?? "";
 
 let supabase = createClient(
@@ -33,7 +39,6 @@ const DEFAULT_TIMEFRAME = "M15";
 const DEFAULT_LOOKBACK_DAYS = 21;
 const DEFAULT_TOP_N = 3;
 const SHADOW_EPISODE_MINUTES = 120;
-const MIN_BACKFILL_SCORE = 48;
 const GOOGLE_NEWS_RSS = "https://news.google.com/rss/search";
 const FOREX_FACTORY_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
 const FINNHUB_CALENDAR_URL = "https://finnhub.io/api/v1/economic-calendar";
@@ -135,6 +140,9 @@ interface PairRecommendation {
   min_win_prob?: number;
   max_cost_r?: number;
   plan_note?: string;
+  selection_source?: "ai_primary" | "ai_verified" | "critic_conditional" | "system_conditional" | "rule_fallback";
+  verification_status?: "approved" | "conditional" | "rejected" | "not_run";
+  verification_reason?: string;
 }
 
 interface AiSelectionResult {
@@ -142,6 +150,21 @@ interface AiSelectionResult {
   selected_pairs: PairRecommendation[];
   avoided_pairs: PairRecommendation[];
   trade_plan?: DailyTradePlan;
+  conditional_pairs?: PairRecommendation[];
+  model_used?: string;
+  selection_review?: SelectionReview;
+}
+
+interface SelectionReviewDecision {
+  symbol: string;
+  decision: "approve" | "conditional" | "reject";
+  reason: string;
+}
+
+interface SelectionReview {
+  model: string;
+  status: "completed" | "skipped" | "failed";
+  decisions: SelectionReviewDecision[];
 }
 
 interface SessionWindow {
@@ -170,6 +193,9 @@ interface TradePlanSymbol {
   score: number;
   reason: string;
   setup_focus: string[];
+  selection_source?: PairRecommendation["selection_source"];
+  verification_status?: PairRecommendation["verification_status"];
+  verification_reason?: string;
 }
 
 interface DailyTradePlan {
@@ -184,6 +210,7 @@ interface DailyTradePlan {
   symbols: TradePlanSymbol[];
   conditional_symbols: TradePlanSymbol[];
   selection_meta: SelectionMeta;
+  selection_review?: SelectionReview;
   global_rules: {
     avoid_high_impact_minutes_before: number;
     avoid_high_impact_minutes_after: number;
@@ -199,6 +226,9 @@ interface SelectionMeta {
   backfilled_count: number;
   excluded_market_closed: string[];
   complete: boolean;
+  conditional_count?: number;
+  rejected_count?: number;
+  review_completed?: boolean;
 }
 
 interface NewsHeadline {
@@ -255,13 +285,6 @@ interface MarketContext {
   pair_notes: PairMarketNote[];
   economic_events: EconomicEvent[];
 }
-
-const TOPIC_KEYWORDS: Record<string, string[]> = {
-  macro: ["federal reserve", "fed", "inflation", "cpi", "pce", "yield", "treasury", "dollar", "economy", "rates"],
-  fx: ["forex", "eurusd", "usdjpy", "gbpusd", "yen", "euro", "pound", "dollar", "ecb", "boj", "boe", "fx"],
-  metals: ["gold", "silver", "xau", "xag", "bullion", "precious metal", "metals"],
-  crypto: ["bitcoin", "btc", "crypto", "cryptocurrency", "digital asset", "token"],
-};
 
 interface PairSelectionView {
   top_picks: PairRecommendation[];
@@ -565,7 +588,7 @@ function eventWindowsForSymbol(symbol: string, marketContext: MarketContext | nu
 }
 
 function planGatesForSymbol(symbol: string, riskLevel: MarketContext["risk_level"] | undefined): { min_win_prob: number; max_cost_r: number } {
-  const baseMin = riskLevel === "high" ? 0.58 : riskLevel === "medium" ? 0.55 : 0.52;
+  const baseMin = riskLevel === "high" ? 0.64 : riskLevel === "medium" ? 0.62 : 0.60;
   const baseCost = 0.20;
   if (symbol === "BTCUSD") return { min_win_prob: baseMin + 0.01, max_cost_r: baseCost };
   if (symbol === "XAUUSD" || symbol === "XAGUSD") return { min_win_prob: baseMin + 0.02, max_cost_r: 0.18 };
@@ -599,7 +622,7 @@ function makePlanSymbol(
     strategy,
     session_windows: rec.session_windows?.length ? rec.session_windows : defaultSessionWindows(rec.symbol, marketContext?.risk_level),
     avoid_event_windows: rec.avoid_event_windows?.length ? rec.avoid_event_windows : eventWindowsForSymbol(rec.symbol, marketContext),
-    min_win_prob: typeof rec.min_win_prob === "number" ? clamp(rec.min_win_prob, 0.50, 0.75) : gates.min_win_prob,
+    min_win_prob: typeof rec.min_win_prob === "number" ? clamp(rec.min_win_prob, 0.60, 0.75) : gates.min_win_prob,
     max_cost_r: typeof rec.max_cost_r === "number"
       ? Math.min(clamp(rec.max_cost_r, 0.05, 0.20), gates.max_cost_r)
       : gates.max_cost_r,
@@ -607,6 +630,9 @@ function makePlanSymbol(
     score: Number.isFinite(rec.score) ? Math.round(rec.score) : Math.round(stats?.compatibility_score ?? 50),
     reason: rec.reason || (stats ? makeRecommendationFromStats(stats, noteForSymbol(marketContext, rec.symbol)).reason : "AI selected"),
     setup_focus: setupFocusForSymbol(strategy, allowedDirection),
+    selection_source: rec.selection_source,
+    verification_status: rec.verification_status,
+    verification_reason: rec.verification_reason,
   };
 }
 
@@ -625,18 +651,24 @@ function attachPlanToRecommendations(recs: PairRecommendation[], plan: DailyTrad
       min_win_prob: item.min_win_prob,
       max_cost_r: item.max_cost_r,
       plan_note: item.setup_focus.join(" / "),
+      selection_source: item.selection_source ?? rec.selection_source,
+      verification_status: item.verification_status ?? rec.verification_status,
+      verification_reason: item.verification_reason ?? rec.verification_reason,
     };
   });
 }
 
-function defaultSelectionMeta(selectedCount: number): SelectionMeta {
+function defaultSelectionMeta(selectedCount: number, requestedCount = selectedCount): SelectionMeta {
   return {
-    requested_count: selectedCount,
+    requested_count: requestedCount,
     selected_count: selectedCount,
     eligible_count: selectedCount,
     backfilled_count: 0,
     excluded_market_closed: [],
     complete: true,
+    conditional_count: 0,
+    rejected_count: 0,
+    review_completed: false,
   };
 }
 
@@ -659,7 +691,7 @@ function buildFallbackTradePlan(
   );
 
   return {
-    plan_version: "daily-plan-v2-pair-gates",
+    plan_version: "daily-plan-v3-reviewed-selection",
     plan_date: now.toISOString().slice(0, 10),
     generated_at: now.toISOString(),
     expires_at: new Date(now.getTime() + 30 * 60 * 60 * 1000).toISOString(),
@@ -670,6 +702,7 @@ function buildFallbackTradePlan(
     symbols,
     conditional_symbols: conditionalSymbols,
     selection_meta: selectionMeta,
+    selection_review: undefined,
     global_rules: {
       avoid_high_impact_minutes_before: 60,
       avoid_high_impact_minutes_after: 45,
@@ -715,12 +748,19 @@ export function normalizeTradePlan(
 
   return {
     ...fallback,
+    plan_version: typeof raw.plan_version === "string" ? raw.plan_version : fallback.plan_version,
+    plan_date: typeof raw.plan_date === "string" ? raw.plan_date : fallback.plan_date,
+    generated_at: typeof raw.generated_at === "string" ? raw.generated_at : fallback.generated_at,
+    expires_at: typeof raw.expires_at === "string" ? raw.expires_at : fallback.expires_at,
     summary: typeof raw.summary === "string" && raw.summary.trim() ? raw.summary.trim() : fallback.summary,
     market_themes: Array.isArray(raw.market_themes) ? raw.market_themes.filter((x: unknown) => typeof x === "string").slice(0, 5) : fallback.market_themes,
     risk_level: raw.risk_level === "low" || raw.risk_level === "medium" || raw.risk_level === "high" ? raw.risk_level : fallback.risk_level,
     symbols: symbols.length > 0 ? symbols : fallback.symbols,
     conditional_symbols: conditionalSymbols,
     selection_meta: selectionMeta,
+    selection_review: raw.selection_review && typeof raw.selection_review === "object"
+      ? raw.selection_review as SelectionReview
+      : fallback.selection_review,
     global_rules: {
       ...fallback.global_rules,
       ...(raw.global_rules && typeof raw.global_rules === "object" ? raw.global_rules : {}),
@@ -804,6 +844,8 @@ function buildSelectionView(
   for (const rec of aiSelection.selected_pairs) {
     const fallback = bySymbol.get(rec.symbol);
     bySymbol.set(rec.symbol, {
+      ...fallback,
+      ...rec,
       symbol: rec.symbol,
       score: Number.isFinite(rec.score) ? rec.score : (fallback?.score ?? 50),
       confidence: rec.confidence ?? fallback?.confidence ?? "low",
@@ -812,9 +854,23 @@ function buildSelectionView(
     });
   }
 
+  for (const rec of aiSelection.conditional_pairs ?? []) {
+    const fallback = bySymbol.get(rec.symbol);
+    bySymbol.set(rec.symbol, {
+      ...fallback,
+      ...rec,
+      symbol: rec.symbol,
+      score: Number.isFinite(rec.score) ? rec.score : (fallback?.score ?? 50),
+      confidence: rec.confidence ?? fallback?.confidence ?? "low",
+      reason: rec.reason || fallback?.reason || "conditional candidate",
+    });
+  }
+
   for (const rec of aiSelection.avoided_pairs) {
     const fallback = bySymbol.get(rec.symbol);
     bySymbol.set(rec.symbol, {
+      ...fallback,
+      ...rec,
       symbol: rec.symbol,
       score: Number.isFinite(rec.score) ? rec.score : (fallback?.score ?? 50),
       confidence: rec.confidence ?? fallback?.confidence ?? "low",
@@ -828,10 +884,11 @@ function buildSelectionView(
 
   const ranked_pairs = sortedStats.map((stat) => {
     const rec = bySymbol.get(stat.symbol) ?? makeRecommendationFromStats(stat);
+    const quality = assessRecommendationQuality(stat);
     let category: "recommended" | "neutral" | "avoid";
     if (aiSelectedSymbols.has(stat.symbol)) {
       category = "recommended";
-    } else if (stat.market_eligible === false || aiAvoidedSymbols.has(stat.symbol) || stat.compatibility_score < 45) {
+    } else if (quality.hard_reject || aiAvoidedSymbols.has(stat.symbol) || stat.compatibility_score < 45) {
       category = "avoid";
     } else {
       category = "neutral";
@@ -868,15 +925,41 @@ function buildConditionalRecommendations(
   selected: PairRecommendation[],
   avoided: PairRecommendation[],
   marketContext: MarketContext | null,
+  preferred: PairRecommendation[] = [],
 ): PairRecommendation[] {
   const selectedSymbols = new Set(selected.map((item) => item.symbol.toUpperCase()));
   const avoidedSymbols = new Set(avoided.map((item) => item.symbol.toUpperCase()));
-  return stats
+  const statsBySymbol = new Map(stats.map((item) => [item.symbol.toUpperCase(), item]));
+  const conditional = new Map<string, PairRecommendation>();
+
+  for (const rec of preferred) {
+    const key = rec.symbol.toUpperCase();
+    const stat = statsBySymbol.get(key);
+    if (!stat || selectedSymbols.has(key) || avoidedSymbols.has(key)) continue;
+    const quality = assessRecommendationQuality(stat);
+    if (quality.hard_reject) continue;
+    conditional.set(key, {
+      ...makeRecommendationFromStats(stat, noteForSymbol(marketContext, stat.symbol)),
+      ...rec,
+      symbol: stat.symbol,
+      selection_source: rec.selection_source ?? "critic_conditional",
+    });
+  }
+
+  for (const item of stats
     .filter((item) => item.market_eligible !== false)
     .filter((item) => !selectedSymbols.has(item.symbol.toUpperCase()) && !avoidedSymbols.has(item.symbol.toUpperCase()))
     .filter((item) => item.compatibility_score >= 45)
-    .sort((a, b) => b.compatibility_score - a.compatibility_score)
-    .map((item) => makeRecommendationFromStats(item, noteForSymbol(marketContext, item.symbol)));
+    .sort((a, b) => b.compatibility_score - a.compatibility_score)) {
+    const key = item.symbol.toUpperCase();
+    if (conditional.has(key) || assessRecommendationQuality(item).hard_reject) continue;
+    conditional.set(key, {
+      ...makeRecommendationFromStats(item, noteForSymbol(marketContext, item.symbol)),
+      selection_source: "system_conditional",
+      verification_status: "not_run",
+    });
+  }
+  return [...conditional.values()];
 }
 
 function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string, marketContext: MarketContext | null): AiSelectionResult {
@@ -884,18 +967,21 @@ function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string
     .filter((s) => s.market_eligible)
     .sort((a, b) => b.compatibility_score - a.compatibility_score);
   const selected_pairs = sorted
-    .filter((s) => s.compatibility_score >= 55)
-    .map((s) => makeRecommendationFromStats(s, noteForSymbol(marketContext, s.symbol)));
+    .filter((s) => assessRecommendationQuality(s).recommendable)
+    .slice(0, topN)
+    .map((s) => ({
+      ...makeRecommendationFromStats(s, noteForSymbol(marketContext, s.symbol)),
+      selection_source: "rule_fallback" as const,
+      verification_status: "not_run" as const,
+    }));
   const avoided_pairs = [...sorted]
-    .filter((s) => s.compatibility_score < 45)
+    .filter((s) => s.compatibility_score < 45 || assessRecommendationQuality(s).hard_reject)
     .sort((a, b) => a.compatibility_score - b.compatibility_score)
     .map((s) => makeRecommendationFromStats(s, noteForSymbol(marketContext, s.symbol)));
 
-  if (selected_pairs.length === 0 && sorted.length > 0) {
-    selected_pairs.push(...sorted.slice(0, topN).map((s) => makeRecommendationFromStats(s, noteForSymbol(marketContext, s.symbol))));
-  }
-
-  const summary = marketContext?.summary || "現在の市場反応と直近実績を併用した簡易選定です。";
+  const summary = selected_pairs.length > 0
+    ? marketContext?.summary || "現在の市場反応と直近実績を併用した簡易選定です。"
+    : "推奨品質を満たす銘柄がないため、本日の推奨は0件です。条件付き候補のみ監視します。";
   const conditionalPairs = buildConditionalRecommendations(stats, selected_pairs, avoided_pairs, marketContext);
   const trade_plan = buildFallbackTradePlan(
     selected_pairs.slice(0, topN),
@@ -903,7 +989,7 @@ function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string
     timeframe,
     marketContext,
     summary,
-    defaultSelectionMeta(selected_pairs.slice(0, topN).length),
+    defaultSelectionMeta(selected_pairs.length, topN),
     conditionalPairs,
   );
 
@@ -912,6 +998,9 @@ function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string
     selected_pairs: attachPlanToRecommendations(selected_pairs, trade_plan),
     avoided_pairs,
     trade_plan,
+    conditional_pairs: conditionalPairs,
+    model_used: "rule-based",
+    selection_review: { model: "rule-based", status: "skipped", decisions: [] },
   };
 }
 
@@ -927,42 +1016,44 @@ export function finalizeSelection(
   stats: SymbolStats[],
   topN: number,
   marketContext: MarketContext | null,
-): { selected: PairRecommendation[]; avoided: PairRecommendation[]; meta: SelectionMeta } {
+): { selected: PairRecommendation[]; avoided: PairRecommendation[]; conditional: PairRecommendation[]; meta: SelectionMeta } {
   const statsBySymbol = new Map(stats.map((item) => [item.symbol, item]));
   const marketClosed = stats.filter((item) => !item.market_eligible).map((item) => item.symbol);
-  const eligible = stats
-    .filter((item) => item.market_eligible && item.compatibility_score >= MIN_BACKFILL_SCORE)
-    .sort((a, b) => b.compatibility_score - a.compatibility_score);
   const avoidedSymbols = new Set(aiSelection.avoided_pairs.map((item) => item.symbol));
   const selected: PairRecommendation[] = [];
+  const downgraded: PairRecommendation[] = [...(aiSelection.conditional_pairs ?? [])];
+  const qualityRejected: PairRecommendation[] = [];
   const selectedSymbols = new Set<string>();
 
   for (const rec of aiSelection.selected_pairs) {
     const stat = statsBySymbol.get(rec.symbol);
-    if (!stat?.market_eligible || avoidedSymbols.has(rec.symbol) || selectedSymbols.has(rec.symbol)) continue;
-    selected.push({
+    if (!stat || avoidedSymbols.has(rec.symbol) || selectedSymbols.has(rec.symbol)) continue;
+    const quality = assessRecommendationQuality(stat);
+    const merged = {
       ...makeRecommendationFromStats(stat, noteForSymbol(marketContext, stat.symbol)),
       ...rec,
       symbol: stat.symbol,
-    });
-    selectedSymbols.add(stat.symbol);
-    if (selected.length >= topN) break;
-  }
-
-  const aiSelectedCount = selected.length;
-  for (const stat of eligible) {
-    if (selected.length >= topN) break;
-    if (selectedSymbols.has(stat.symbol) || avoidedSymbols.has(stat.symbol)) continue;
-    const recommendation = makeRecommendationFromStats(stat, noteForSymbol(marketContext, stat.symbol));
+    };
+    if (!quality.recommendable) {
+      const gated = {
+        ...merged,
+        caution: appendCaution(merged.caution, `quality_gate:${quality.reasons.join("+")}`),
+        verification_status: quality.hard_reject ? "rejected" as const : "conditional" as const,
+        verification_reason: quality.reasons.join(", "),
+      };
+      if (quality.hard_reject) qualityRejected.push(gated);
+      else downgraded.push({ ...gated, selection_source: "system_conditional" });
+      continue;
+    }
     selected.push({
-      ...recommendation,
-      reason: `全銘柄市場スキャンから補充: ${recommendation.reason}`,
-      caution: appendCaution(recommendation.caution, "market_backfill"),
+      ...merged,
+      selection_source: rec.selection_source ?? "ai_verified",
     });
     selectedSymbols.add(stat.symbol);
+    if (selected.length >= topN) break;
   }
 
-  const avoided = [...aiSelection.avoided_pairs];
+  const avoided = [...aiSelection.avoided_pairs, ...qualityRejected];
   const avoidedSeen = new Set(avoided.map((item) => item.symbol));
   for (const symbol of marketClosed) {
     if (avoidedSeen.has(symbol)) continue;
@@ -976,16 +1067,23 @@ export function finalizeSelection(
     });
   }
 
+  const conditional = buildConditionalRecommendations(stats, selected, avoided, marketContext, downgraded);
+  const eligibleCount = stats.filter((item) => assessRecommendationQuality(item).recommendable).length;
+
   return {
     selected,
     avoided,
+    conditional,
     meta: {
       requested_count: topN,
       selected_count: selected.length,
-      eligible_count: eligible.length,
-      backfilled_count: Math.max(0, selected.length - aiSelectedCount),
+      eligible_count: eligibleCount,
+      backfilled_count: 0,
       excluded_market_closed: marketClosed,
-      complete: selected.length >= topN,
+      complete: true,
+      conditional_count: conditional.length,
+      rejected_count: qualityRejected.length,
+      review_completed: aiSelection.selection_review?.status === "completed",
     },
   };
 }
@@ -1033,16 +1131,6 @@ function extractMetaContent(html: string, key: string): string | null {
     if (match?.[1]) return stripHtml(match[1]);
   }
   return null;
-}
-
-function isRelevantHeadline(topic: string, title: string): boolean {
-  const normalized = title.toLowerCase();
-  const keywords = TOPIC_KEYWORDS[topic] ?? [];
-  if (keywords.length === 0) return true;
-  const matched = keywords.some((keyword) => normalized.includes(keyword));
-  if (!matched) return false;
-  if (topic === "metals" && /silver lake|silverado|golden state|gold coast/i.test(title)) return false;
-  return true;
 }
 
 function extractParagraphSummary(html: string): string | null {
@@ -1382,7 +1470,7 @@ async function fetchNewsHeadlines(): Promise<NewsHeadline[]> {
         const source = extractXmlTag(block, "source") ?? (titleRaw.includes(" - ") ? titleRaw.split(" - ").slice(-1)[0] : "Google News");
         const title = titleRaw.replace(/\s+-\s+[^-]+$/, "").trim();
         if (!title || !link) continue;
-        if (!isRelevantHeadline(topic, title)) continue;
+        if (!isMarketHeadline(topic, title)) continue;
         collected.push({
           topic,
           title,
@@ -1568,15 +1656,7 @@ function buildPairMarketNote(symbol: string, snapshotByKey: Map<string, MarketSn
     }
   }
 
-  const relatedHeadline = headlines.find((headline) => {
-    const title = headline.title.toLowerCase();
-    if (symbol === "BTCUSD") return title.includes("bitcoin") || title.includes("crypto");
-    if (symbol === "XAUUSD" || symbol === "XAGUSD") return title.includes("gold") || title.includes("silver");
-    if (symbol === "USDJPY") return title.includes("yen") || title.includes("boj");
-    if (symbol === "EURUSD" || symbol === "EURJPY") return title.includes("euro") || title.includes("ecb");
-    if (symbol === "GBPUSD" || symbol === "GBPJPY") return title.includes("pound") || title.includes("boe");
-    return title.includes("dollar") || title.includes("forex");
-  });
+  const relatedHeadline = headlines.find((headline) => isHeadlineRelevantToSymbol(symbol, headline.title));
   if (relatedHeadline) {
     const digest = relatedHeadline.summary ? ` - ${relatedHeadline.summary}` : "";
     notes.push(`関連見出し: ${relatedHeadline.title}${digest}`);
@@ -1625,8 +1705,9 @@ function buildMarketSummary(snapshotByKey: Map<string, MarketSnapshot>, pairNote
   const cautiousCount = pairNotes.filter((x) => x.bias === "cautious").length;
   const supportiveCount = pairNotes.filter((x) => x.bias === "supportive").length;
   const risk_level = cautiousCount >= 4 || (vix?.day_change_pct ?? 0) >= 4 || highImpactUpcoming.length >= 2 ? "high" : cautiousCount >= 2 || highImpactUpcoming.length >= 1 ? "medium" : "low";
-  const headlineText = headlines.length > 0
-    ? `直近見出しでは ${headlines[0].title}`
+  const summaryHeadline = headlines.find((headline) => headline.topic === "macro" || headline.topic === "fx");
+  const headlineText = summaryHeadline
+    ? `直近見出しでは ${summaryHeadline.title}`
     : highImpactUpcoming.length > 0
     ? `直近では ${highImpactUpcoming[0].country} ${highImpactUpcoming[0].title} を控えています`
     : "ニュース面では決定打は限定的";
@@ -1831,8 +1912,19 @@ function applySystemFitToContext(marketContext: MarketContext | null, stats: Sym
   };
 }
 
-async function requestPairSelection(prompt: string): Promise<string | null> {
-  const models = [...new Set([PAIR_SELECTOR_MODEL, PAIR_SELECTOR_FALLBACK_MODEL].filter(Boolean))];
+type OpenAiJsonResult = { content: string; model: string };
+
+async function requestPairSelection(
+  prompt: string,
+  options: {
+    models?: string[];
+    system?: string;
+    reasoningEffort?: "low" | "medium" | "high";
+    maxCompletionTokens?: number;
+    logLabel?: string;
+  } = {},
+): Promise<OpenAiJsonResult | null> {
+  const models = [...new Set((options.models ?? [PAIR_SELECTOR_MODEL, PAIR_SELECTOR_FALLBACK_MODEL]).filter(Boolean))];
   for (const model of models) {
     try {
       const isReasoningModel = /^gpt-5/i.test(model);
@@ -1848,12 +1940,12 @@ async function requestPairSelection(prompt: string): Promise<string | null> {
           messages: [
             {
               role: "system",
-              content: "市場環境と運用実績から、コスト控除後の期待値が高い銘柄を順位付けする。取引回避を目的化せず、サンプル不足と過信を避けてJSONで返す。",
+              content: options.system ?? "市場環境と運用実績から、コスト控除後の期待値が高い銘柄を順位付けする。推奨件数を埋めることを目的化せず、サンプル不足と過信を避けてJSONで返す。",
             },
             { role: "user", content: prompt },
           ],
           ...(isReasoningModel
-            ? { reasoning_effort: "low", max_completion_tokens: 1600 }
+            ? { reasoning_effort: options.reasoningEffort ?? "medium", max_completion_tokens: options.maxCompletionTokens ?? 2400 }
             : { temperature: 0.1, max_tokens: 1200 }),
         }),
       });
@@ -1865,14 +1957,138 @@ async function requestPairSelection(prompt: string): Promise<string | null> {
       const data = await response.json();
       const content = data?.choices?.[0]?.message?.content;
       if (typeof content === "string" && content.trim()) {
-        console.log(`[pair-selector] Selection model: ${model}`);
-        return content;
+        console.log(`[pair-selector] ${options.logLabel ?? "selection"} model: ${model}`);
+        return { content, model };
       }
     } catch (error) {
       console.error(`[pair-selector] OpenAI ${model} exception:`, error instanceof Error ? error.message : String(error));
     }
   }
   return null;
+}
+
+function parseJsonObject(content: string): any | null {
+  const jsonMatch = content.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return null;
+  try {
+    return JSON.parse(jsonMatch[0]);
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function reviewSelection(
+  selected: PairRecommendation[],
+  stats: SymbolStats[],
+  marketContext: MarketContext | null,
+): Promise<SelectionReview> {
+  if (selected.length === 0) return { model: PAIR_SELECTOR_REVIEW_MODEL, status: "skipped", decisions: [] };
+  const selectedSymbols = new Set(selected.map((item) => item.symbol));
+  const selectedStats = summarizeStatsForPrompt(stats.filter((item) => selectedSymbols.has(item.symbol)));
+  const prompt = `一次AIが選んだ日次推奨を、独立したリスク査読者として批判的に検証してください。
+
+検証規則:
+- 推奨数を維持する必要はなく、0件でも正しい
+- 実績、PF、補正勝率、直近成績、市場適合、ニュース根拠の矛盾を探す
+- 根拠が弱い、サンプルが不足、方向が曖昧なら conditional
+- 明確な損失傾向、低PF、市場休場、材料矛盾なら reject
+- 十分な根拠があり、今日の市場とシステム実績が整合する場合だけ approve
+- 新しい銘柄は追加しない
+
+一次推奨:
+${JSON.stringify(selected, null, 2)}
+
+該当銘柄の統計:
+${JSON.stringify(selectedStats, null, 2)}
+
+市場環境:
+${JSON.stringify(marketContext, null, 2)}
+
+JSONのみで回答:
+{"decisions":[{"symbol":"X","decision":"approve|conditional|reject","reason":"日本語で具体的に"}]}`;
+  const result = await requestPairSelection(prompt, {
+    models: [PAIR_SELECTOR_REVIEW_MODEL, PAIR_SELECTOR_FALLBACK_MODEL],
+    system: "あなたは自動売買の日次推奨を検証する独立査読者です。推奨を増やさず、弱い根拠を見逃さず、JSONだけを返してください。",
+    reasoningEffort: "medium",
+    maxCompletionTokens: 1400,
+    logLabel: "review",
+  });
+  if (!result) return { model: PAIR_SELECTOR_REVIEW_MODEL, status: "failed", decisions: [] };
+
+  const parsed = parseJsonObject(result.content);
+  const rawDecisions = Array.isArray(parsed?.decisions) ? parsed.decisions : [];
+  const bySymbol = new Map<string, SelectionReviewDecision>();
+  for (const raw of rawDecisions) {
+    const symbol = typeof raw?.symbol === "string" ? raw.symbol.trim().toUpperCase() : "";
+    const decision = raw?.decision;
+    if (!selectedSymbols.has(symbol) || !["approve", "conditional", "reject"].includes(decision)) continue;
+    bySymbol.set(symbol, {
+      symbol,
+      decision,
+      reason: typeof raw?.reason === "string" && raw.reason.trim() ? raw.reason.trim() : "査読理由なし",
+    });
+  }
+  for (const rec of selected) {
+    if (!bySymbol.has(rec.symbol)) {
+      bySymbol.set(rec.symbol, { symbol: rec.symbol, decision: "conditional", reason: "査読結果が欠落したため条件付きへ変更" });
+    }
+  }
+  return { model: result.model, status: "completed", decisions: [...bySymbol.values()] };
+}
+
+function applySelectionReview(
+  selected: PairRecommendation[],
+  avoided: PairRecommendation[],
+  review: SelectionReview,
+): { selected: PairRecommendation[]; conditional: PairRecommendation[]; avoided: PairRecommendation[] } {
+  if (review.status === "failed") {
+    return {
+      selected: [],
+      conditional: selected.map((rec) => ({
+        ...rec,
+        selection_source: "critic_conditional",
+        verification_status: "conditional",
+        verification_reason: "批判モデルの応答に失敗したため条件付きへ変更",
+        caution: appendCaution(rec.caution, "critic_unavailable"),
+      })),
+      avoided,
+    };
+  }
+  if (review.status !== "completed") {
+    return {
+      selected: selected.map((rec) => ({ ...rec, selection_source: "ai_primary", verification_status: "not_run" })),
+      conditional: [],
+      avoided,
+    };
+  }
+
+  const decisions = new Map(review.decisions.map((item) => [item.symbol, item]));
+  const approved: PairRecommendation[] = [];
+  const conditional: PairRecommendation[] = [];
+  const rejected = [...avoided];
+  for (const rec of selected) {
+    const decision = decisions.get(rec.symbol);
+    if (decision?.decision === "approve") {
+      approved.push({ ...rec, selection_source: "ai_verified", verification_status: "approved", verification_reason: decision.reason });
+    } else if (decision?.decision === "reject") {
+      rejected.push({
+        ...rec,
+        selection_source: "ai_primary",
+        verification_status: "rejected",
+        verification_reason: decision.reason,
+        caution: appendCaution(rec.caution, "critic_rejected"),
+      });
+    } else {
+      conditional.push({
+        ...rec,
+        selection_source: "critic_conditional",
+        verification_status: "conditional",
+        verification_reason: decision?.reason ?? "査読未完了のため条件付きへ変更",
+        caution: appendCaution(rec.caution, "critic_conditional"),
+      });
+    }
+  }
+  return { selected: approved, conditional, avoided: rejected };
 }
 
 async function askOpenAi(stats: SymbolStats[], topN: number, cadence: string, timeframe: string, marketContext: MarketContext | null): Promise<AiSelectionResult> {
@@ -1892,11 +2108,11 @@ async function askOpenAi(stats: SymbolStats[], topN: number, cadence: string, ti
 - virtual成績は重複をまとめた virtual_episode_trades と virtual_win_rate_bayesian を補助情報として使う
 - 実績ゼロの銘柄も市場適合が高ければ候補から外さず、フィードバックループを避ける
 - このシステムは ${timeframe} を使う
-- top ${topN} 件を選ぶ
+- 推奨は0～${topN}件。条件不足なら0件でよく、件数を埋めるための選定は禁止
 - 理由は「現在の市場環境」と「このシステムの直近実績」の両方に触れる
 - 推奨ペアと条件付き許可ペアの全銘柄について、今日だけ許可する方向・戦略・取引時間帯・避けるイベント・実行ゲートを個別に決める
 - 勝率の最大化ではなく、RR=1.5と取引コストを踏まえた期待値を最大化する
-- min_win_probは全銘柄共通値にせず、その日の相場、銘柄特性、実績、コストから0.50～0.75の範囲で個別に決める
+- min_win_probは全銘柄共通値にせず、その日の相場、銘柄特性、実績、コストから0.60～0.75の範囲で個別に決める
 - 条件が良いからゲートを上げるのではなく、予測の不確実性・損失傾向・コストが高いほど必要勝率を上げる
 - max_cost_rは直近の独立機会でプラスだった0.20R以下を基本にする
 - allowed_direction は buy/sell/both/none のいずれか。迷うなら both ではなく根拠のある方向へ絞る
@@ -1914,7 +2130,7 @@ JSONのみで回答:
 {
   "summary": "日本語で、市場環境とシステム適合性を2-3文で要約",
   "selected_pairs": [
-    {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"...","allowed_direction":"buy|sell|both|none","strategy":"trend_follow|pullback|mean_revert|breakout|standby","min_win_prob":0.58,"max_cost_r":0.20}
+    {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"...","allowed_direction":"buy|sell|both|none","strategy":"trend_follow|pullback|mean_revert|breakout|standby","min_win_prob":0.62,"max_cost_r":0.20}
   ],
   "avoided_pairs": [
     {"symbol":"X","score":0-100,"confidence":"high|medium|low","reason":"日本語で1文","caution":"..."}
@@ -1929,7 +2145,7 @@ JSONのみで回答:
         "allowed_direction": "buy|sell|both|none",
         "strategy": "trend_follow|pullback|mean_revert|breakout|standby",
         "session_windows": [{"label":"Tokyo|London|New York|custom","start_utc":"00:00","end_utc":"09:00"}],
-        "min_win_prob": 0.58,
+        "min_win_prob": 0.62,
         "max_cost_r": 0.20,
         "confidence": "high|medium|low",
         "score": 0-100,
@@ -1960,25 +2176,36 @@ JSONのみで回答:
   }
 }`;
 
-  const content = await requestPairSelection(prompt);
-  if (!content) return fallbackSelection(stats, topN, timeframe, marketContext);
-  const jsonMatch = typeof content === "string" ? content.match(/\{[\s\S]*\}/) : null;
-  if (!jsonMatch) {
-    return fallbackSelection(stats, topN, timeframe, marketContext);
-  }
+  const result = await requestPairSelection(prompt);
+  if (!result) return fallbackSelection(stats, topN, timeframe, marketContext);
+  const parsed = parseJsonObject(result.content);
+  if (!parsed) return fallbackSelection(stats, topN, timeframe, marketContext);
 
   try {
-    const parsed = JSON.parse(jsonMatch[0]);
     const selected_pairs = Array.isArray(parsed?.selected_pairs) ? parsed.selected_pairs : [];
     const avoided_pairs = Array.isArray(parsed?.avoided_pairs) ? parsed.avoided_pairs : [];
     const summary = typeof parsed?.summary === "string" && parsed.summary.trim()
       ? parsed.summary.trim()
       : `${cadence} pair selection report`;
-    const fallbackSelected = selected_pairs.length > 0
-      ? selected_pairs
-      : fallbackSelection(stats, topN, timeframe, marketContext).selected_pairs;
-    const conditionalPairs = buildConditionalRecommendations(stats, fallbackSelected, avoided_pairs, marketContext);
-    const selectedForPlan = fallbackSelected.slice(0, topN);
+    const primarySelected = selected_pairs.slice(0, topN).map((rec: PairRecommendation) => ({
+      ...rec,
+      symbol: String(rec.symbol ?? "").toUpperCase(),
+      selection_source: "ai_primary" as const,
+    }));
+    const primaryAvoided = avoided_pairs.map((rec: PairRecommendation) => ({
+      ...rec,
+      symbol: String(rec.symbol ?? "").toUpperCase(),
+    }));
+    const review = await reviewSelection(primarySelected, stats, marketContext);
+    const reviewed = applySelectionReview(primarySelected, primaryAvoided, review);
+    const conditionalPairs = buildConditionalRecommendations(
+      stats,
+      reviewed.selected,
+      reviewed.avoided,
+      marketContext,
+      reviewed.conditional,
+    );
+    const selectedForPlan = reviewed.selected;
     const trade_plan = normalizeTradePlan(
       parsed?.trade_plan,
       selectedForPlan,
@@ -1986,15 +2213,24 @@ JSONのみで回答:
       timeframe,
       marketContext,
       summary,
-      defaultSelectionMeta(selectedForPlan.length),
+      {
+        ...defaultSelectionMeta(selectedForPlan.length, topN),
+        conditional_count: conditionalPairs.length,
+        rejected_count: reviewed.avoided.filter((item) => item.verification_status === "rejected").length,
+        review_completed: review.status === "completed",
+      },
       conditionalPairs,
     );
+    trade_plan.selection_review = review;
 
     return {
       summary,
-      selected_pairs: attachPlanToRecommendations(fallbackSelected, trade_plan),
-      avoided_pairs,
+      selected_pairs: attachPlanToRecommendations(reviewed.selected, trade_plan),
+      avoided_pairs: reviewed.avoided,
       trade_plan,
+      conditional_pairs: attachPlanToRecommendations(conditionalPairs, trade_plan),
+      model_used: result.model,
+      selection_review: review,
     };
   } catch (_error) {
     return fallbackSelection(stats, topN, timeframe, marketContext);
@@ -2017,7 +2253,11 @@ async function generateReport(body: any) {
   const finalized = finalizeSelection(aiSelection, stats, topN, enrichedContext);
   aiSelection.selected_pairs = finalized.selected;
   aiSelection.avoided_pairs = finalized.avoided;
-  const conditionalPairs = buildConditionalRecommendations(stats, finalized.selected, finalized.avoided, enrichedContext);
+  aiSelection.conditional_pairs = finalized.conditional;
+  if (finalized.selected.length === 0) {
+    aiSelection.summary = `本日のAI推奨は0件です。品質条件を満たすまで条件付き候補として監視します。${aiSelection.summary ? ` ${aiSelection.summary}` : ""}`;
+  }
+  const conditionalPairs = finalized.conditional;
   const tradePlan = normalizeTradePlan(
     aiSelection.trade_plan,
     finalized.selected,
@@ -2028,6 +2268,7 @@ async function generateReport(body: any) {
     finalized.meta,
     conditionalPairs,
   );
+  tradePlan.selection_review = aiSelection.selection_review;
   aiSelection.trade_plan = tradePlan;
   aiSelection.selected_pairs = attachPlanToRecommendations(aiSelection.selected_pairs, tradePlan);
   const selectionView = buildSelectionView(stats, aiSelection, topN, enrichedContext);
@@ -2048,7 +2289,7 @@ async function generateReport(body: any) {
     trade_plan: tradePlan,
     plan_status: "active",
     plan_overrides: {},
-    model: PAIR_SELECTOR_MODEL,
+    model: aiSelection.model_used ?? PAIR_SELECTOR_MODEL,
     triggered_by: triggeredBy,
     status: "active",
   };
@@ -2150,6 +2391,7 @@ if (import.meta.main) Deno.serve(async (req: Request) => {
           liveContext,
         );
         const selectedForPlan = aiSelection.selected_pairs.slice(0, Number(report?.top_n ?? DEFAULT_TOP_N));
+        const storedSelectionMeta = report?.trade_plan?.selection_meta;
         const reportPlan = normalizeTradePlan(
           report?.trade_plan,
           selectedForPlan,
@@ -2157,10 +2399,29 @@ if (import.meta.main) Deno.serve(async (req: Request) => {
           String(report?.timeframe ?? DEFAULT_TIMEFRAME),
           liveContext,
           aiSelection.summary,
-          defaultSelectionMeta(selectedForPlan.length),
+          storedSelectionMeta && typeof storedSelectionMeta === "object"
+            ? storedSelectionMeta as SelectionMeta
+            : defaultSelectionMeta(selectedForPlan.length, Number(report?.top_n ?? DEFAULT_TOP_N)),
           conditionalPairs,
         );
         aiSelection.trade_plan = reportPlan;
+        aiSelection.selection_review = reportPlan.selection_review;
+        aiSelection.conditional_pairs = reportPlan.conditional_symbols.map((item) => ({
+          symbol: item.symbol,
+          score: item.score,
+          confidence: item.confidence,
+          reason: item.reason,
+          caution: item.verification_status === "conditional" ? "critic_conditional" : undefined,
+          allowed_direction: item.allowed_direction,
+          strategy: item.strategy,
+          session_windows: item.session_windows,
+          avoid_event_windows: item.avoid_event_windows,
+          min_win_prob: item.min_win_prob,
+          max_cost_r: item.max_cost_r,
+          selection_source: item.selection_source ?? "system_conditional",
+          verification_status: item.verification_status ?? "not_run",
+          verification_reason: item.verification_reason,
+        }));
         aiSelection.selected_pairs = attachPlanToRecommendations(aiSelection.selected_pairs, reportPlan);
         const selectionView = buildSelectionView(stats, aiSelection, Number(report?.top_n ?? DEFAULT_TOP_N), liveContext);
         const digest = buildReportDigest(aiSelection.summary, selectionView, liveContext);

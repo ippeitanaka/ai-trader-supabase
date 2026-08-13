@@ -102,6 +102,10 @@ jobs:
           if [ -n "$OPENAI_API_KEY" ]; then
             supabase secrets set OPENAI_API_KEY="$OPENAI_API_KEY" --project-ref "$PROJECT_REF"
             supabase secrets set OPENAI_MODEL="gpt-4.1-mini" --project-ref "$PROJECT_REF"
+            supabase secrets set AI_TRADER_EXECUTION_MODEL="gpt-5-mini" --project-ref "$PROJECT_REF"
+            supabase secrets set PAIR_SELECTOR_MODEL="gpt-5.6-terra" --project-ref "$PROJECT_REF"
+            supabase secrets set PAIR_SELECTOR_REVIEW_MODEL="gpt-5.4-mini" --project-ref "$PROJECT_REF"
+            supabase secrets set PAIR_SELECTOR_FALLBACK_MODEL="gpt-5-mini" --project-ref "$PROJECT_REF"
             echo "✅ OpenAI secrets configured"
           else
             echo "⚠️  WARNING: OPENAI_API_KEY not set, skipping OpenAI configuration"
