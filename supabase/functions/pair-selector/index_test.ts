@@ -45,11 +45,11 @@ function stat(symbol: string, score: number, eligible = true) {
     market_win_rate: null,
     pullback_trades: 0,
     pullback_win_rate: null,
-    virtual_trades: 0,
-    virtual_raw_trades: 0,
-    virtual_episode_trades: 0,
-    virtual_win_rate: null,
-    virtual_win_rate_bayesian: 0.4,
+    virtual_trades: 10,
+    virtual_raw_trades: 10,
+    virtual_episode_trades: 10,
+    virtual_win_rate: 0.5,
+    virtual_win_rate_bayesian: 0.45,
     virtual_total_profit_loss: 0,
     real_win_rate_bayesian: 0.45,
     market_fit_score: score,
@@ -83,7 +83,7 @@ Deno.test("overlapping shadow signals collapse into independent episodes", () =>
   assert(episodes.length === 2, `expected 2 episodes, received ${episodes.length}`);
 });
 
-Deno.test("selection backfills missing AI picks from all-symbol market scores", () => {
+Deno.test("selection never fills missing AI picks just to reach top N", () => {
   const stats = [
     stat("BTCUSD", 62),
     stat("EURUSD", 60),
@@ -96,9 +96,10 @@ Deno.test("selection backfills missing AI picks from all-symbol market scores", 
     avoided_pairs: [],
   }, stats, 3, null);
 
-  assert(result.selected.map((item) => item.symbol).join(",") === "BTCUSD,EURUSD,GBPUSD", "expected deterministic top-N backfill");
-  assert(result.meta.backfilled_count === 2, "expected two backfilled symbols");
-  assert(result.meta.complete, "selection should be complete");
+  assert(result.selected.map((item) => item.symbol).join(",") === "BTCUSD", "only the AI-selected symbol should remain recommended");
+  assert(result.meta.backfilled_count === 0, "automatic recommendation backfill must stay disabled");
+  assert(result.conditional.some((item) => item.symbol === "EURUSD"), "eligible non-selected symbols should be conditional");
+  assert(result.meta.complete, "a variable-size selection is complete even below the maximum");
   assert(result.meta.excluded_market_closed.includes("XAUUSD"), "closed market should be reported");
 });
 
@@ -114,7 +115,23 @@ Deno.test("daily plan preserves AI gates and sessions for conditional pairs", ()
     }],
   }, selected, [stat("BTCUSD", 62), stat("EURUSD", 60)], "M15", null, "test", undefined, conditional);
 
-  assert(plan.symbols[0].min_win_prob === 0.57, "selected AI gate should be preserved");
+  assert(plan.symbols[0].min_win_prob === 0.60, "daily AI gates should have a 60% floor");
   assert(plan.conditional_symbols[0].min_win_prob === 0.63, "conditional AI gate should be preserved");
   assert(plan.conditional_symbols[0].session_windows[0].label === "Tokyo", "conditional AI session should be preserved");
+});
+
+Deno.test("normalizing a stored plan preserves its original generation time", () => {
+  const selected = [{ symbol: "BTCUSD", score: 62, confidence: "low" as const, reason: "AI pick" }];
+  const generatedAt = "2026-08-13T22:00:00.000Z";
+  const expiresAt = "2026-08-15T04:00:00.000Z";
+  const plan = normalizeTradePlan({
+    plan_version: "daily-plan-v3-reviewed-selection",
+    plan_date: "2026-08-14",
+    generated_at: generatedAt,
+    expires_at: expiresAt,
+    symbols: [{ symbol: "BTCUSD", min_win_prob: 0.64 }],
+  }, selected, [stat("BTCUSD", 62)], "M15", null, "test");
+
+  assert(plan.generated_at === generatedAt, "dashboard reads must not regenerate the plan timestamp");
+  assert(plan.expires_at === expiresAt, "dashboard reads must preserve the plan expiry");
 });

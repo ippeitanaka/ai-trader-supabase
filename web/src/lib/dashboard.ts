@@ -11,6 +11,9 @@ type PairRecommendation = {
   min_win_prob?: number;
   max_cost_r?: number;
   plan_note?: string;
+  selection_source?: "ai_primary" | "ai_verified" | "critic_conditional" | "system_conditional" | "rule_fallback";
+  verification_status?: "approved" | "conditional" | "rejected" | "not_run";
+  verification_reason?: string;
 };
 
 type SessionWindow = {
@@ -39,6 +42,9 @@ type TradePlanSymbol = {
   score: number;
   reason: string;
   setup_focus?: string[];
+  selection_source?: PairRecommendation["selection_source"];
+  verification_status?: PairRecommendation["verification_status"];
+  verification_reason?: string;
 };
 
 type DailyTradePlan = {
@@ -59,6 +65,18 @@ type DailyTradePlan = {
     backfilled_count: number;
     excluded_market_closed: string[];
     complete: boolean;
+    conditional_count?: number;
+    rejected_count?: number;
+    review_completed?: boolean;
+  };
+  selection_review?: {
+    model: string;
+    status: "completed" | "skipped" | "failed";
+    decisions: Array<{
+      symbol: string;
+      decision: "approve" | "conditional" | "reject";
+      reason: string;
+    }>;
   };
   global_rules?: {
     avoid_high_impact_minutes_before?: number;
@@ -137,6 +155,7 @@ type PairSelectorLatest = {
   trade_plan?: DailyTradePlan;
   plan_overrides?: PlanOverrides;
   plan_status?: "active" | "paused" | string;
+  model?: string;
 };
 
 type PairSelectorResponse = {
