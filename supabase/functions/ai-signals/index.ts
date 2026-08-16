@@ -282,6 +282,8 @@ interface AISignalEntry {
   planned_reward_rr?: number | null;
   planned_risk_atr_mult?: number | null;
   planned_cost_r?: number | null;
+  strategy_mode?: "standard" | "scalp";
+  max_hold_minutes?: number | null;
   win_prob_raw?: number | null;
   win_prob_calibrated?: number | null;
   win_prob_final?: number | null;
@@ -707,6 +709,10 @@ serve(async (req: Request) => {
         planned_reward_rr: isFiniteNumber(body.planned_reward_rr) ? Math.max(0, body.planned_reward_rr) : null,
         planned_risk_atr_mult: isFiniteNumber(body.planned_risk_atr_mult) ? Math.max(0, body.planned_risk_atr_mult) : null,
         planned_cost_r: isFiniteNumber(body.planned_cost_r) ? Math.max(0, body.planned_cost_r) : null,
+        strategy_mode: body.strategy_mode === "scalp" ? "scalp" : "standard",
+        max_hold_minutes: isFiniteNumber(body.max_hold_minutes) && body.max_hold_minutes > 0
+          ? Math.max(5, Math.min(240, Math.floor(body.max_hold_minutes)))
+          : null,
         win_prob_raw: isFiniteNumber(body.win_prob_raw) ? clamp(body.win_prob_raw, 0, 1) : null,
         win_prob_calibrated: isFiniteNumber(body.win_prob_calibrated) ? clamp(body.win_prob_calibrated, 0, 1) : null,
         win_prob_final: isFiniteNumber(body.win_prob_final) ? clamp(body.win_prob_final, 0, 1) : body.win_prob,
@@ -906,6 +912,8 @@ serve(async (req: Request) => {
           delete legacyEntry.planned_reward_rr;
           delete legacyEntry.planned_risk_atr_mult;
           delete legacyEntry.planned_cost_r;
+          delete legacyEntry.strategy_mode;
+          delete legacyEntry.max_hold_minutes;
           delete legacyEntry.win_prob_calibrated;
           delete legacyEntry.win_prob_final;
           delete legacyEntry.calibration_applied;
@@ -1000,6 +1008,7 @@ serve(async (req: Request) => {
         realized_fee,
         result_consistent,
         result_quality_reason,
+        exit_reason,
         tracking_version,
         cancelled_reason,
         // virtual
@@ -1064,6 +1073,7 @@ serve(async (req: Request) => {
       if (isFiniteNumber(realized_fee)) updateData.realized_fee = realized_fee;
       if (typeof result_consistent === "boolean") updateData.result_consistent = result_consistent;
       if (result_quality_reason !== undefined) updateData.result_quality_reason = safeText(result_quality_reason);
+      if (exit_reason !== undefined) updateData.exit_reason = safeText(exit_reason);
       if (tracking_version !== undefined) updateData.tracking_version = safeText(tracking_version);
 
         if (cancelled_reason) updateData.cancelled_reason = cancelled_reason;

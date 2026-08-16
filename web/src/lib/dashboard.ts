@@ -169,6 +169,8 @@ type EALogRecord = {
   at: string;
   sym: string;
   tf: string | null;
+  strategy_mode?: "standard" | "scalp" | null;
+  max_hold_minutes?: number | null;
   action: string | null;
   trade_decision: string | null;
   suggested_dir?: number | null;
@@ -221,6 +223,9 @@ type AISignalRecord = {
   created_at: string;
   symbol: string;
   timeframe: string | null;
+  strategy_mode?: "standard" | "scalp" | null;
+  max_hold_minutes?: number | null;
+  exit_reason?: string | null;
   dir: number | null;
   direction_prob?: number | null;
   direction_prob_raw?: number | null;
@@ -369,6 +374,12 @@ type SymbolSummary = {
   totalPnl: number;
 };
 
+type StrategyModeSummary = {
+  mode: "standard" | "scalp";
+  label: string;
+  summary: DashboardSummary;
+};
+
 type DashboardData = {
   generatedAt: string;
   dataErrors: string[];
@@ -386,10 +397,12 @@ type DashboardData = {
     label: string;
     summary: DashboardSummary;
     symbolBreakdown: SymbolSummary[];
+    modeBreakdown: StrategyModeSummary[];
   };
   total: {
     summary: DashboardSummary;
     symbolBreakdown: SymbolSummary[];
+    modeBreakdown: StrategyModeSummary[];
   };
 };
 
@@ -457,6 +470,7 @@ function buildFunctionUrl(functionName: string, params: Record<string, string>) 
 
 const TRADE_RESULT_INTEGRITY_FIELDS = "mt5_position_id,mt5_position_ticket,entry_deal_ticket,exit_deal_ticket,realized_commission,realized_swap,realized_fee,result_consistent,result_quality_reason,tracking_version";
 const TRADE_PROBABILITY_FIELDS = "direction_prob,direction_prob_raw,tp_before_sl_prob,tp_before_sl_prob_raw,tp_before_sl_prob_calibrated,tp_before_sl_prob_final,probability_target_version,direction_horizon_minutes,planned_reward_rr,planned_risk_atr_mult,planned_cost_r";
+const TRADE_STRATEGY_FIELDS = "strategy_mode,max_hold_minutes,exit_reason";
 
 async function fetchAiSignalsWithOptionalIntegrity(
   params: Record<string, string>,
@@ -465,7 +479,7 @@ async function fetchAiSignalsWithOptionalIntegrity(
   try {
     return await fetchJson<AISignalRecord[]>(buildRestUrl("ai_signals", {
       ...params,
-      select: legacySelect.replace("order_ticket", `order_ticket,${TRADE_RESULT_INTEGRITY_FIELDS},${TRADE_PROBABILITY_FIELDS}`),
+      select: legacySelect.replace("order_ticket", `order_ticket,${TRADE_RESULT_INTEGRITY_FIELDS},${TRADE_PROBABILITY_FIELDS},${TRADE_STRATEGY_FIELDS}`),
     }));
   } catch {
     // Keep the dashboard available while a newly deployed UI is waiting for its DB migration.
@@ -523,6 +537,26 @@ function summarizeTrades(trades: AISignalRecord[]): DashboardSummary {
     profitFactor: grossLoss > 0 ? round2(grossProfit / grossLoss) : null,
     qualityExcludedCount,
   };
+}
+
+function normalizeTradeStrategyMode(trade: AISignalRecord): "standard" | "scalp" {
+  if (trade.strategy_mode === "scalp" || trade.timeframe?.toUpperCase() === "M5") return "scalp";
+  return "standard";
+}
+
+function buildModeBreakdown(trades: AISignalRecord[]): StrategyModeSummary[] {
+  return [
+    {
+      mode: "standard",
+      label: "標準 M15",
+      summary: summarizeTrades(trades.filter((trade) => normalizeTradeStrategyMode(trade) === "standard")),
+    },
+    {
+      mode: "scalp",
+      label: "短期 M5",
+      summary: summarizeTrades(trades.filter((trade) => normalizeTradeStrategyMode(trade) === "scalp")),
+    },
+  ];
 }
 
 function isStaleOpenTrade(trade: AISignalRecord) {
@@ -970,7 +1004,7 @@ async function fetchRecentEaLogs(): Promise<EALogRecord[]> {
   try {
     return await fetchJson<EALogRecord[]>(buildRestUrl("ea-log", {
       ...params,
-      select: legacySelect.replace("win_prob", `${TRADE_PROBABILITY_FIELDS},planned_entry_price,planned_sl,planned_tp,win_prob`),
+      select: legacySelect.replace("win_prob", `${TRADE_PROBABILITY_FIELDS},strategy_mode,max_hold_minutes,planned_entry_price,planned_sl,planned_tp,win_prob`),
     }));
   } catch {
     return fetchJson<EALogRecord[]>(buildRestUrl("ea-log", { ...params, select: legacySelect }));
@@ -1092,10 +1126,12 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
       label: periodLabel(period),
       summary: summarizeTrades(selectedTrades),
       symbolBreakdown: buildSymbolBreakdown(selectedTrades),
+      modeBreakdown: buildModeBreakdown(selectedTrades),
     },
     total: {
       summary: summarizeTrades(totalTrades),
       symbolBreakdown: buildSymbolBreakdown(totalTrades),
+      modeBreakdown: buildModeBreakdown(totalTrades),
     },
   };
 }

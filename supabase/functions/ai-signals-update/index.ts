@@ -178,6 +178,7 @@ interface SignalUpdateRequest {
   tracking_version?: string;
   symbol?: string;
   timeframe?: string;
+  strategy_mode?: "standard" | "scalp" | string;
   dir?: number;
   reason?: string;
   instance?: string;
@@ -323,6 +324,7 @@ serve(async (req: Request) => {
         actual_result: "FILLED",
         symbol: safeText(body.symbol),
         timeframe: safeText(body.timeframe) ?? "M15",
+        strategy_mode: body.strategy_mode === "scalp" ? "scalp" : "standard",
         dir: body.dir === 1 || body.dir === -1 ? body.dir : null,
         price: body.entry_price ?? null,
         entry_price: body.entry_price ?? null,

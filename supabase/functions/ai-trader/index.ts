@@ -18,6 +18,12 @@ import {
   chooseDirection,
   type DirectionalEvidence,
 } from "./direction-policy.ts";
+import {
+  normalizeStrategyMode,
+  strategyDefaults,
+  strategyMinWinProbFloor,
+  type StrategyMode,
+} from "./strategy-mode.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -139,6 +145,9 @@ async function applyRecentPerfGuard(
     .order("created_at", { ascending: false })
     .limit(lookback);
 
+  const strategyMode = normalizeStrategyMode(req.strategy_mode, req.timeframe, req.instance);
+  q = q.eq("strategy_mode", strategyMode);
+
   if (!includeVirtualInPerfGuards()) {
     q = q
       .eq("is_virtual", false)
@@ -224,6 +233,9 @@ async function applyStreakGuard(
     .in("actual_result", ["WIN", "LOSS"])
     .order("created_at", { ascending: false })
     .limit(lookback);
+
+  const strategyMode = normalizeStrategyMode(req.strategy_mode, req.timeframe, req.instance);
+  q = q.eq("strategy_mode", strategyMode);
 
   if (!includeVirtualInPerfGuards()) {
     q = q
@@ -328,6 +340,9 @@ async function fetchCalibrationRows(
     .order("created_at", { ascending: false })
     .limit(queryLimit);
 
+  const strategyMode = normalizeStrategyMode(req.strategy_mode, req.timeframe, req.instance);
+  q = q.eq("strategy_mode", strategyMode);
+
   // By default use only real trades for calibration to avoid virtual-mode bias.
   // Set AI_TRADER_CALIBRATION_INCLUDE_VIRTUAL=on when virtual trades dominate.
   if (!includeVirtual) {
@@ -427,7 +442,8 @@ async function getCalibrationEntry(req: TradeRequest): Promise<{ entry: Calibrat
   const minN = getCalibrationMinN();
 
   for (const scope of scopes) {
-    const key = `v2|${scope}|${req.symbol}|${req.timeframe}|${req.ea_suggestion.dir}`;
+    const strategyMode = normalizeStrategyMode(req.strategy_mode, req.timeframe, req.instance);
+    const key = `v2|${strategyMode}|${scope}|${req.symbol}|${req.timeframe}|${req.ea_suggestion.dir}`;
     const cached = calibrationCache.get(key);
     if (cached && cached.expiresAt > Date.now()) {
       if ((cached.debug.n ?? 0) >= minN) return { entry: cached, scopeTried: scope };
@@ -544,14 +560,15 @@ async function getDirectionalEvidence(req: TradeRequest): Promise<DirectionalEvi
   if (direction !== 1 && direction !== -1) return null;
 
   const session = typeof req.market_session === "string" ? req.market_session.trim().toLowerCase() : "";
-  const cacheKey = `${req.symbol}|${req.timeframe}|${direction}|${session || "all"}`;
+  const strategyMode = normalizeStrategyMode(req.strategy_mode, req.timeframe, req.instance);
+  const cacheKey = `${strategyMode}|${req.symbol}|${req.timeframe}|${direction}|${session || "all"}`;
   const cached = directionalEvidenceCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.evidence;
 
   const since = new Date(
     Date.now() - getDirectionalEvidenceLookbackDays() * 24 * 60 * 60 * 1000,
   ).toISOString();
-  const { data, error } = await supabase
+  let query = supabase
     .from("ai_signals")
     .select("created_at,symbol,dir,actual_result,is_virtual,probability_target_version,market_session")
     .gte("created_at", since)
@@ -564,6 +581,10 @@ async function getDirectionalEvidence(req: TradeRequest): Promise<DirectionalEvi
     .in("actual_result", ["WIN", "LOSS"])
     .order("created_at", { ascending: false })
     .limit(800);
+
+  query = query.eq("strategy_mode", strategyMode);
+
+  const { data, error } = await query;
 
   if (error) {
     console.warn(`[direction-evidence] fetch error ${cacheKey}: ${error.message}`);
@@ -811,6 +832,7 @@ export interface TradeRequest {
   
   instance?: string;
   version?: string;
+  strategy_mode?: StrategyMode;
 }
 
 export interface TradeResponse {
@@ -830,6 +852,8 @@ export interface TradeResponse {
   planned_reward_rr?: number;
   planned_risk_atr_mult?: number;
   planned_cost_r?: number;
+  strategy_mode?: StrategyMode;
+  max_hold_minutes?: number | null;
   win_prob: number;
   win_prob_raw?: number;
   win_prob_calibrated?: number;
@@ -1667,6 +1691,11 @@ function normalizeTradeRequest(body: any): TradeRequest {
   const chart_structure = sanitizeContext((req as any).chart_structure);
   const volatility_context = sanitizeContext((req as any).volatility_context);
   const cost_context = sanitizeContext((req as any).cost_context);
+  const strategy_mode = normalizeStrategyMode(
+    (req as any).strategy_mode,
+    req.timeframe,
+    req.instance,
+  );
 
   return {
     ...req,
@@ -1687,6 +1716,7 @@ function normalizeTradeRequest(body: any): TradeRequest {
     chart_structure,
     volatility_context,
     cost_context,
+    strategy_mode,
   };
 }
 
@@ -1840,8 +1870,12 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
   ) ?? 0.70;
   const minEvR = getMinEvR();
   const evGateMinWinProb = computeEvGateMinWinProb({ rewardRR: rt.rewardRR, costR: rt.costR, minEvR });
-  const minWinProbFloor = getMinWinProbFloor();
-  const maxCostR = getMaxCostR();
+  const minWinProbFloor = strategyMinWinProbFloor(
+    rt.strategyMode,
+    getMinWinProbFloor(),
+    rt.minWinProbFromConfig,
+  );
+  const maxCostR = rt.maxCostR;
 
   const raw = typeof base.win_prob === "number" ? base.win_prob : 0.5;
   const { winProb: calibrated, debug } = await calibrateWinProb(req, raw);
@@ -1961,7 +1995,9 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     tp_before_sl_prob_raw: round3(raw),
     tp_before_sl_prob_calibrated: round3(calibrated),
     tp_before_sl_prob_final: round3(winProbFinal),
-    probability_target_version: "fallback_shared_estimate_v2",
+    probability_target_version: rt.strategyMode === "scalp"
+      ? "scalp_timeboxed_net_v1"
+      : "fallback_shared_estimate_v2",
     direction_horizon_minutes: probabilityContract.directionHorizonMinutes,
     planned_entry_price: probabilityContract.entry,
     planned_sl: probabilityContract.sl,
@@ -1969,12 +2005,15 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     planned_reward_rr: probabilityContract.rewardRR,
     planned_risk_atr_mult: probabilityContract.riskAtrMult,
     planned_cost_r: probabilityContract.costR,
+    strategy_mode: rt.strategyMode,
+    max_hold_minutes: rt.maxHoldMinutes,
     win_prob: round3(winProbFinal),
     action,
     decision_summary,
     expected_value_r,
     reward_rr: round3(rt.rewardRR),
     risk_atr_mult: round3(rt.riskAtrMult),
+    expiry_minutes: rt.expiryMinutes,
     cost_r: round3(rt.costR),
     cost_r_source: rt.costRSource,
     reasoning,
@@ -2032,11 +2071,25 @@ function getMinWinProbFloor(): number {
   return Math.max(0.50, Math.min(0.75, Math.round(v * 1000) / 1000));
 }
 
-function getMaxCostR(): number {
+function getMaxCostR(mode: StrategyMode = "standard"): number {
   // Cost is already subtracted from EV. This remains a catastrophe ceiling only.
-  const v = Number(Deno.env.get("AI_TRADER_OPPORTUNITY_MAX_COST_R") ?? 0.20);
-  if (!Number.isFinite(v)) return 0.20;
+  const defaults = strategyDefaults(mode);
+  const envName = mode === "scalp"
+    ? "AI_TRADER_SCALP_MAX_COST_R"
+    : "AI_TRADER_OPPORTUNITY_MAX_COST_R";
+  const v = Number(Deno.env.get(envName) ?? defaults.maxCostR);
+  if (!Number.isFinite(v)) return defaults.maxCostR;
   return Math.max(0.0, Math.min(0.5, Math.round(v * 1000) / 1000));
+}
+
+function getDirectionHorizonMinutes(mode: StrategyMode): number {
+  const defaults = strategyDefaults(mode);
+  const envName = mode === "scalp"
+    ? "AI_TRADER_SCALP_DIRECTION_HORIZON_MINUTES"
+    : "AI_TRADER_DIRECTION_HORIZON_MINUTES";
+  const parsed = Number(Deno.env.get(envName) ?? defaults.directionHorizonMinutes);
+  if (!Number.isFinite(parsed)) return defaults.directionHorizonMinutes;
+  return Math.max(5, Math.min(240, Math.round(parsed)));
 }
 
 function getAssumedCostR(): number {
@@ -2206,6 +2259,10 @@ type AiConfigRuntimeRow = {
   min_win_prob?: number | null;
   reward_rr?: number | null;
   risk_atr_mult?: number | null;
+  max_cost_r?: number | null;
+  direction_horizon_minutes?: number | null;
+  max_hold_minutes?: number | null;
+  pending_expiry_min?: number | null;
 };
 
 type AiConfigCacheEntry = {
@@ -2215,9 +2272,10 @@ type AiConfigCacheEntry = {
 
 const aiConfigCache = new Map<string, AiConfigCacheEntry>();
 
-function normalizeInstance(instance: unknown): string {
+function normalizeInstance(instance: unknown, mode: StrategyMode): string {
   const s = typeof instance === "string" ? instance.trim() : "";
-  return s ? s : "main";
+  if (mode === "scalp" && (!s || s === "main")) return "scalp";
+  return s || strategyDefaults(mode).instance;
 }
 
 async function fetchAiConfigRuntimeRow(instance: string): Promise<AiConfigRuntimeRow | null> {
@@ -2226,7 +2284,7 @@ async function fetchAiConfigRuntimeRow(instance: string): Promise<AiConfigRuntim
 
   const { data, error } = await supabase
     .from("ai_config")
-    .select("min_win_prob,reward_rr,risk_atr_mult")
+    .select("min_win_prob,reward_rr,risk_atr_mult,max_cost_r,direction_horizon_minutes,max_hold_minutes,pending_expiry_min")
     .eq("instance", instance)
     .maybeSingle();
 
@@ -2242,28 +2300,51 @@ async function fetchAiConfigRuntimeRow(instance: string): Promise<AiConfigRuntim
 }
 
 async function getRuntimeTradeParams(req: TradeRequest): Promise<{
+  strategyMode: StrategyMode;
   instance: string;
   minWinProbFromConfig: number | null;
   rewardRR: number;
   riskAtrMult: number;
+  maxCostR: number;
+  directionHorizonMinutes: number;
+  maxHoldMinutes: number | null;
+  expiryMinutes: number;
   costR: number;
   costRSource: "real" | "assumed";
 }> {
-  const instance = normalizeInstance(req.instance);
+  const strategyMode = normalizeStrategyMode(req.strategy_mode, req.timeframe, req.instance);
+  const defaults = strategyDefaults(strategyMode);
+  const instance = normalizeInstance(req.instance, strategyMode);
   const row = await fetchAiConfigRuntimeRow(instance);
 
   const rewardRR =
     typeof row?.reward_rr === "number" && Number.isFinite(row.reward_rr) && row.reward_rr > 0
       ? row.reward_rr
-      : 1.5;
+      : defaults.rewardRR;
   const riskAtrMult =
     typeof row?.risk_atr_mult === "number" && Number.isFinite(row.risk_atr_mult) && row.risk_atr_mult > 0
       ? row.risk_atr_mult
-      : 2.0;
+      : defaults.riskAtrMult;
   const minWinProbFromConfig =
     typeof row?.min_win_prob === "number" && Number.isFinite(row.min_win_prob)
       ? sanitizeRecommendedMinWinProb(row.min_win_prob)
       : null;
+  const maxCostR =
+    typeof row?.max_cost_r === "number" && Number.isFinite(row.max_cost_r)
+      ? Math.max(0, Math.min(0.5, row.max_cost_r))
+      : getMaxCostR(strategyMode);
+  const directionHorizonMinutes =
+    typeof row?.direction_horizon_minutes === "number" && Number.isFinite(row.direction_horizon_minutes)
+      ? Math.max(5, Math.min(240, Math.round(row.direction_horizon_minutes)))
+      : getDirectionHorizonMinutes(strategyMode);
+  const maxHoldMinutes =
+    typeof row?.max_hold_minutes === "number" && Number.isFinite(row.max_hold_minutes)
+      ? Math.max(5, Math.min(240, Math.round(row.max_hold_minutes)))
+      : defaults.maxHoldMinutes;
+  const expiryMinutes =
+    typeof row?.pending_expiry_min === "number" && Number.isFinite(row.pending_expiry_min)
+      ? Math.max(5, Math.min(240, Math.round(row.pending_expiry_min)))
+      : defaults.expiryMinutes;
 
   const assumedCostR = getAssumedCostR();
   const hasSpread =
@@ -2282,19 +2363,18 @@ async function getRuntimeTradeParams(req: TradeRequest): Promise<{
   const costRSource: "real" | "assumed" = hasRealCost ? "real" : "assumed";
 
   return {
+    strategyMode,
     instance,
     minWinProbFromConfig,
     rewardRR,
     riskAtrMult,
+    maxCostR: round3(maxCostR),
+    directionHorizonMinutes,
+    maxHoldMinutes,
+    expiryMinutes,
     costR: round3(costR),
     costRSource,
   };
-}
-
-function getDirectionHorizonMinutes(): number {
-  const parsed = Number(Deno.env.get("AI_TRADER_DIRECTION_HORIZON_MINUTES") ?? 60);
-  if (!Number.isFinite(parsed)) return 60;
-  return Math.max(15, Math.min(240, Math.round(parsed)));
 }
 
 function buildProbabilityContract(
@@ -2311,7 +2391,7 @@ function buildProbabilityContract(
   const sl = dir > 0 ? entry - riskDistance : entry + riskDistance;
   const tp = dir > 0 ? entry + rewardDistance : entry - rewardDistance;
   return {
-    directionHorizonMinutes: getDirectionHorizonMinutes(),
+    directionHorizonMinutes: rt.directionHorizonMinutes,
     entry: roundPrice(entry),
     sl: roundPrice(sl),
     tp: roundPrice(tp),
@@ -2518,6 +2598,12 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
   const dailyPlanPrompt = buildDailyPlanPrompt(dailyPlanContext, req);
   const rt = await getRuntimeTradeParams(req);
   const probabilityContract = buildProbabilityContract(req, dir, rt);
+  const probabilityTargetVersion = rt.strategyMode === "scalp"
+    ? "scalp_timeboxed_net_v1"
+    : "direction_tp_v2";
+  const executionProbabilityDefinition = rt.strategyMode === "scalp"
+    ? `予定SLに先に到達せず、${rt.maxHoldMinutes ?? 30}分以内に予定TPへ到達するか、時間決済時の取引コスト控除後損益がプラスになる確率`
+    : "上記の予定TPへ、予定SLより先に到達する確率";
   const probabilityContractPrompt = `
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2527,11 +2613,14 @@ async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<Trad
 • 予定SL: ${probabilityContract.sl}（ATR × ${probabilityContract.riskAtrMult}）
 • 予定TP: ${probabilityContract.tp}（RR=${probabilityContract.rewardRR}）
 • 推定取引コスト: ${probabilityContract.costR}R
+• 戦略モード: ${rt.strategyMode}
+• 最大保有時間: ${rt.maxHoldMinutes == null ? "時間制限なし" : `${rt.maxHoldMinutes}分`}
 • direction_prob: ${probabilityContract.directionHorizonMinutes}分後の価格が、予定エントリーより取引方向側にある確率
-• tp_before_sl_prob: 上記の予定TPへ、予定SLより先に到達する確率
+• tp_before_sl_prob: ${executionProbabilityDefinition}
 • win_prob: 後方互換用。tp_before_sl_probと同じ値を返す
 
-direction_probとtp_before_sl_probは別々に評価してください。方向が合ってもTP到達前に反転する場合があるため、同じ値を機械的に返してはいけません。`;
+direction_probとtp_before_sl_probは別々に評価してください。方向が合ってもTP到達前に反転する場合があるため、同じ値を機械的に返してはいけません。
+${rt.strategyMode === "scalp" ? `これはM5短期モードです。M15/H1の地合いを参考にしつつ、${rt.directionHorizonMinutes}〜${rt.maxHoldMinutes ?? 30}分以内にTPへ到達できる勢い、スプレッド負担、直近M5の加速を特に重視してください。` : "これは現行M15標準モードです。従来どおりM15の構造と上位足の地合いを重視してください。"}`;
   
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // 🔄 ハイブリッド学習システム（3段階）
@@ -2542,13 +2631,16 @@ direction_probとtp_before_sl_probは別々に評価してください。方向�
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   
   // ステップ1: 完結した取引件数をカウント
-  const { count: completedTradesCount } = await supabase
+  let completedTradesQuery = supabase
     .from("ai_signals")
     .select("*", { count: "exact", head: true })
     .in("actual_result", ["WIN", "LOSS"])
     .eq("reverse_execution", false)
     .eq("is_virtual", false)
     .or("result_consistent.is.null,result_consistent.eq.true");
+
+  completedTradesQuery = completedTradesQuery.eq("strategy_mode", rt.strategyMode);
+  const { count: completedTradesCount } = await completedTradesQuery;
   
   const totalCompletedTrades = completedTradesCount || 0;
   console.log(`[AI] 📊 Total completed trades: ${totalCompletedTrades}`);
@@ -3015,15 +3107,16 @@ ${candleBarsSummary}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 - 目的は勝率の最大化ではなく、取引コスト控除後の期待値を正確に見積もること
-- RR=1.5では勝率50%前後でも利益になり得る。50%未満を機械的に見送りにしない
+  - RR=${rt.rewardRR}では損益分岐の勝率が変わる。50%未満を機械的に見送りにしない
 - 45-50%: 弱い、50-55%: 実行可能な優位性、55-62%: 強い、62%超: まれ
 - 指標の一致は根拠の一つであり、固定加点や70-90%への自動引き上げは禁止
 - 高値安値、ブレイク、支持抵抗、ローソク足の並びを単発指標より重視
 - RSI極値だけで高勝率にしない。反転足・構造転換・伸び切りの確認が必要
 - 日次計画と上位足は文脈として使う。重大イベントと方向不一致以外は、それだけで見送りにしない
 - 不確実なら0.50付近へ寄せる。根拠なしに0.60を超えない
-- direction_probは指定時間後の方向一致、tp_before_sl_probは指定バリアの先着事象として別々に評価する
-- 実行判断用の勝率はtp_before_sl_probであり、単なる方向一致を勝ちとして数えない`;
+  - direction_probは指定時間後の方向一致、tp_before_sl_probは実際の決済ルールに対する利益事象として別々に評価する
+  - 実行判断用の勝率はtp_before_sl_probであり、単なる方向一致を勝ちとして数えない
+  ${rt.strategyMode === "scalp" ? `- 短期モードの勝ちは、SLより先のTP到達、または${rt.maxHoldMinutes ?? 30}分の時間決済でコスト控除後損益がプラスになること` : "- 標準モードの勝ちは、SLより先にTPへ到達すること"}`;
   }
   
   // 共通の回答形式指示
@@ -3035,7 +3128,7 @@ ${candleBarsSummary}
 以下のJSON形式で回答してください:
 {
   "direction_prob": 0.XX, // 指定時間後に価格が取引方向側にある確率
-  "tp_before_sl_prob": 0.XX, // 予定TPが予定SLより先に到達する確率
+  "tp_before_sl_prob": 0.XX, // ${executionProbabilityDefinition}
   "win_prob": 0.XX,  // tp_before_sl_probと必ず同じ値（後方互換）
   "recommended_min_win_prob": 0.55, // 参考値。0.50～0.75
   "skip_reason": "", // 見送りなら理由（例: "range", "conflict", "news"）
@@ -3127,8 +3220,12 @@ ${candleBarsSummary}
     // recommended_min_win_prob はログ/参考用（実行ゲートとしては使用しない）。
     const minEvR = getMinEvR();
     const evGateMinWinProb = computeEvGateMinWinProb({ rewardRR: rt.rewardRR, costR: rt.costR, minEvR });
-    const minWinProbFloor = getMinWinProbFloor();
-    const maxCostR = getMaxCostR();
+    const minWinProbFloor = strategyMinWinProbFloor(
+      rt.strategyMode,
+      getMinWinProbFloor(),
+      rt.minWinProbFromConfig,
+    );
+    const maxCostR = rt.maxCostR;
     const rsiGuard = applyExtremeRsiPenalty({ req, dir, winProb: win_prob, costR: rt.costR });
     win_prob = rsiGuard.winProb;
 
@@ -3245,7 +3342,7 @@ ${candleBarsSummary}
       tp_before_sl_prob_raw: round3(raw_win_prob),
       tp_before_sl_prob_calibrated: round3(cal.winProb),
       tp_before_sl_prob_final: round3(win_prob),
-      probability_target_version: "direction_tp_v2",
+      probability_target_version: probabilityTargetVersion,
       direction_horizon_minutes: probabilityContract.directionHorizonMinutes,
       planned_entry_price: probabilityContract.entry,
       planned_sl: probabilityContract.sl,
@@ -3253,12 +3350,14 @@ ${candleBarsSummary}
       planned_reward_rr: probabilityContract.rewardRR,
       planned_risk_atr_mult: probabilityContract.riskAtrMult,
       planned_cost_r: probabilityContract.costR,
+      strategy_mode: rt.strategyMode,
+      max_hold_minutes: rt.maxHoldMinutes,
       win_prob: round3(win_prob),
       action: willExecute ? dir : 0,
       decision_summary,
       suggested_dir: dir,
       offset_factor: atr > 0.001 ? 0.25 : 0.2,
-      expiry_minutes: 90,
+      expiry_minutes: rt.expiryMinutes,
       confidence: confidence,
       reasoning: `${tags} | ${reasoning}`,
       recommended_min_win_prob: recommended_min_win_prob ?? undefined,
@@ -3612,12 +3711,24 @@ serve(async (req: Request) => {
         tp_before_sl_prob_calibrated: 0.5,
         tp_before_sl_prob_final: 0.5,
         probability_target_version: "invalid_input_v2",
-        direction_horizon_minutes: getDirectionHorizonMinutes(),
+        direction_horizon_minutes: strategyDefaults(
+          normalizeStrategyMode(tradeReq.strategy_mode, tradeReq.timeframe, tradeReq.instance),
+        ).directionHorizonMinutes,
+        strategy_mode: normalizeStrategyMode(
+          tradeReq.strategy_mode,
+          tradeReq.timeframe,
+          tradeReq.instance,
+        ),
+        max_hold_minutes: strategyDefaults(
+          normalizeStrategyMode(tradeReq.strategy_mode, tradeReq.timeframe, tradeReq.instance),
+        ).maxHoldMinutes,
         win_prob: 0.5,
         action: 0,
         suggested_dir,
         offset_factor: 0.2,
-        expiry_minutes: 90,
+        expiry_minutes: strategyDefaults(
+          normalizeStrategyMode(tradeReq.strategy_mode, tradeReq.timeframe, tradeReq.instance),
+        ).expiryMinutes,
         confidence: "low",
         reasoning: methodReason,
         skip_reason: "bad_inputs",
