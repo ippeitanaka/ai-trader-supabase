@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| AwajiSamurai_AI_2.0.mq5  (ver 2.0.0)                            |
+//| AwajiSamurai_AI_2.0.mq5  (ver 2.1.0)                            |
 //| - Supabase: ai-signals(AI側) / ea-log                            |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
@@ -18,10 +18,20 @@
 //| - v1.8.0: 複数建玉のposition ID追跡と純損益集計を修正           |
 //| - v1.9.0: 方向確率とTP先着確率を分離し、注文条件を記録          |
 //| - v2.0.0: BUY/SELL両方向をAI評価し、方向別実績で補正            |
+//| - v2.1.0: 現行M15を維持し、独立したM5短期モードを追加           |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
 CTrade trade;
+
+enum ENUM_TRADING_MODE
+{
+   STANDARD_M15=0,
+   SCALP_M5=1
+};
+
+input group "00 運用モード"
+input ENUM_TRADING_MODE TradingMode = STANDARD_M15;
 
 // ===== 運用者が設定する項目 =====
 input group "01 資金・建玉管理"
@@ -35,25 +45,34 @@ input string AIBearerToken           = "";
 input string EALogBearerToken        = "";
 
 // ===== システム管理設定（MT5プロパティから変更不可） =====
-#define TF_Entry PERIOD_M15
-#define TF_Recheck PERIOD_H1
+bool IsScalpMode(){ return TradingMode==SCALP_M5; }
+string StrategyModeName(){ return IsScalpMode()?"scalp":"standard"; }
+string EAInstanceName(){ return IsScalpMode()?"scalp":"main"; }
+string EntryTimeframeLabel(){ return IsScalpMode()?"M5":"M15"; }
+string RecheckTimeframeLabel(){ return IsScalpMode()?"M15":"H1"; }
+ENUM_TIMEFRAMES EntryTimeframe(){ if(IsScalpMode()) return PERIOD_M5; return PERIOD_M15; }
+ENUM_TIMEFRAMES RecheckTimeframe(){ if(IsScalpMode()) return PERIOD_M15; return PERIOD_H1; }
+
+#define TF_Entry EntryTimeframe()
+#define TF_Recheck RecheckTimeframe()
 #define MinWinProb 0.50
-#define ServerMinWinProb 0.50
-#define RiskATRmult 2.0
-#define RewardRR 1.5
-#define PendingExpiryMin 90
+#define ServerMinWinProb (IsScalpMode()?0.62:0.50)
+#define RiskATRmult (IsScalpMode()?1.4:2.0)
+#define RewardRR (IsScalpMode()?1.1:1.5)
+#define PendingExpiryMin (IsScalpMode()?30:90)
 #define Lots BaseLotSize
 #define SlippagePoints MaxSlippagePoints
-#define Magic ExpertMagicNumber
+#define Magic (ExpertMagicNumber+(IsScalpMode()?1:0))
 #define MaxPositions MaxOpenTrades
 #define TrackedMaxTrades 10
 #define DebugLogs true
 #define LogCooldownSec 30
-#define CooldownAfterCloseMin 30
+#define CooldownAfterCloseMin (IsScalpMode()?5:30)
+#define MaxHoldMinutes (IsScalpMode()?30:0)
 #define H1AuditEnabled true
 #define H1OppositeBlockProb 0.78
 #define UseAIForDirection true
-#define CandleBarsToSend 12
+#define CandleBarsToSend (IsScalpMode()?24:12)
 #define EnableVirtualLearning true
 #define VirtualMaxWatches 2000
 #define AI_Endpoint_URL "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-trader"
@@ -62,8 +81,8 @@ input string EALogBearerToken        = "";
 #define AI_Signals_Update_URL "https://nebphrnnpmuqbkymwefs.supabase.co/functions/v1/ai-signals-update"
 #define AI_Bearer_Token AIBearerToken
 #define EA_Log_Bearer_Token EALogBearerToken
-#define AI_EA_Instance "main"
-#define AI_EA_Version "2.0.0"
+#define AI_EA_Instance EAInstanceName()
+#define AI_EA_Version "2.1.0"
 #define AI_Timeout_ms 30000
 #define UseIchimoku true
 #define Ichimoku_Tenkan 9
@@ -71,7 +90,7 @@ input string EALogBearerToken        = "";
 #define Ichimoku_Senkou 52
 
 // ===== 内部変数 =====
-datetime g_lastBar_M15=0;
+datetime g_lastEntryBar=0;
 datetime g_lastLogTs=0;
 datetime g_cooldownUntil=0; // TP/SLクローズ後のクールダウン期限
 
@@ -95,6 +114,8 @@ struct TrackedTrade{
    int      dir;
    bool     fill_sent;
    datetime fill_last_try;
+   int      max_hold_minutes;
+   bool     time_exit_requested;
 };
 TrackedTrade g_tracked[];
 
@@ -209,7 +230,7 @@ void RehydrateTrackingFromExistingPositions()
          }
       }
 
-      if(ordTicket>0 && AddTrackedTrade(posTicket,positionId,ordTicket,entryDealTicket,0,openTime,entryPrice,positionDir,false))
+      if(ordTicket>0 && AddTrackedTrade(posTicket,positionId,ordTicket,entryDealTicket,0,openTime,entryPrice,positionDir,false,MaxHoldMinutes))
       {
          added++;
          if(g_trackedPositionTicket==0)
@@ -240,6 +261,8 @@ void ClearTrackedSlot(const int idx)
    g_tracked[idx].dir=0;
    g_tracked[idx].fill_sent=false;
    g_tracked[idx].fill_last_try=0;
+   g_tracked[idx].max_hold_minutes=0;
+   g_tracked[idx].time_exit_requested=false;
 }
 
 int FindFreeTrackedSlot()
@@ -268,7 +291,7 @@ bool IsPositionTracked(const ulong positionId)
 
 bool AddTrackedTrade(const ulong posTicket,const ulong positionId,const ulong ordTicket,
    const ulong entryDealTicket,const long signalId,const datetime openTime,
-   const double entryPrice,const int positionDir,const bool fillSent)
+   const double entryPrice,const int positionDir,const bool fillSent,const int maxHoldMinutes)
 {
    if(posTicket==0 || positionId==0 || ordTicket==0) return false;
    if(IsPositionTracked(positionId)) return true;
@@ -288,6 +311,8 @@ bool AddTrackedTrade(const ulong posTicket,const ulong positionId,const ulong or
    g_tracked[idx].dir=positionDir;
    g_tracked[idx].fill_sent=fillSent;
    g_tracked[idx].fill_last_try=0;
+   g_tracked[idx].max_hold_minutes=(maxHoldMinutes>0?maxHoldMinutes:0);
+   g_tracked[idx].time_exit_requested=false;
    return true;
 }
 
@@ -308,6 +333,8 @@ struct VirtualWatch{
    double   mfe_r;
    double   mae_r;
    double   reward_rr;
+   double   cost_r;
+   int      max_hold_minutes;
 };
 VirtualWatch g_virtual[];
 
@@ -492,7 +519,7 @@ int TrackVirtual(const VirtualWatch &w)
 }
 
 // Update ai_signals by signal_id (virtual/paper trades)
-bool UpdateSignalResultById(long signal_id,double exit_price,double profit_loss,const string result,bool sl_hit,bool tp_hit,datetime filled_at=0,double mfe_r=0.0,double mae_r=0.0)
+bool UpdateSignalResultById(long signal_id,double exit_price,double profit_loss,const string result,bool sl_hit,bool tp_hit,const string exit_reason,datetime filled_at=0,double mfe_r=0.0,double mae_r=0.0)
 {
    datetime now=TimeCurrent();
    int duration=0;
@@ -507,7 +534,8 @@ bool UpdateSignalResultById(long signal_id,double exit_price,double profit_loss,
    "\"mfe_r\":"+DoubleToString(mfe_r,3)+","+
    "\"mae_r\":"+DoubleToString(mae_r,3)+","+
    "\"sl_hit\":"+(sl_hit?"true":"false")+","+
-   "\"tp_hit\":"+(tp_hit?"true":"false")+"}";
+   "\"tp_hit\":"+(tp_hit?"true":"false")+","+
+   "\"exit_reason\":\""+JsonEscape(exit_reason)+"\"}";
    string resp;
    if(!HttpPut(AI_Signals_URL,AI_Bearer_Token,payload,resp,3000)){
       SafePrint(StringFormat("[AI_SIGNALS] Failed to update virtual result (signal_id=%d)", signal_id));
@@ -1369,6 +1397,7 @@ struct AIOut{
    double planned_reward_rr;
    double planned_risk_atr_mult;
    double planned_cost_r;
+   int    max_hold_minutes;
    double win_prob_raw;
    double win_prob_calibrated;
    double win_prob_final;
@@ -1530,13 +1559,14 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    out_ai.tp_before_sl_prob_calibrated=0.0;
    out_ai.tp_before_sl_prob_final=0.0;
    out_ai.probability_target_version="legacy_win_prob";
-   out_ai.direction_horizon_minutes=60;
+   out_ai.direction_horizon_minutes=(IsScalpMode()?20:60);
    out_ai.planned_entry_price=0.0;
    out_ai.planned_sl=0.0;
    out_ai.planned_tp=0.0;
    out_ai.planned_reward_rr=RewardRR;
    out_ai.planned_risk_atr_mult=RiskATRmult;
    out_ai.planned_cost_r=0.0;
+   out_ai.max_hold_minutes=MaxHoldMinutes;
    out_ai.win_prob_raw=0.0;
    out_ai.win_prob_calibrated=0.0;
    out_ai.win_prob_final=0.0;
@@ -1580,7 +1610,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    out_ai.plan_gate_mode="ai";
 
    // ★ テクニカル指標の詳細データを取得
-   ENUM_TIMEFRAMES tf=(tf_label=="M15")?TF_Entry:TF_Recheck;
+   ENUM_TIMEFRAMES tf=(tf_label==EntryTimeframeLabel())?TF_Entry:TF_Recheck;
    double ema_25=MA(tf,25,MODE_EMA,PRICE_CLOSE,0);
    double sma_100=MA(tf,100,MODE_SMA,PRICE_CLOSE,0);
    double sma_200=MA(tf,200,MODE_SMA,PRICE_CLOSE,0);
@@ -1693,6 +1723,7 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    string payload="{"+
    "\"symbol\":\""+JsonEscape(_Symbol)+"\","+
    "\"timeframe\":\""+JsonEscape(tf_label)+"\","+
+   "\"strategy_mode\":\""+StrategyModeName()+"\","+
 
    // EA設定（ServerMinWinProbをサーバ側ゲートの指示値として送信。MinWinProbはEA側フロアのみ）
    "\"min_win_prob\":"+DoubleToString(ServerMinWinProb,3)+","+
@@ -1802,6 +1833,9 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    ExtractJsonNumber(resp,"planned_reward_rr",out_ai.planned_reward_rr);
    ExtractJsonNumber(resp,"planned_risk_atr_mult",out_ai.planned_risk_atr_mult);
    ExtractJsonNumber(resp,"planned_cost_r",out_ai.planned_cost_r);
+   double parsed_max_hold=0.0;
+   if(ExtractJsonNumber(resp,"max_hold_minutes",parsed_max_hold))
+      out_ai.max_hold_minutes=(int)MathRound(parsed_max_hold);
    if(!ExtractJsonNumber(resp,"win_prob_raw",out_ai.win_prob_raw)) out_ai.win_prob_raw=out_ai.win_prob;
    if(!ExtractJsonNumber(resp,"win_prob_calibrated",out_ai.win_prob_calibrated)) out_ai.win_prob_calibrated=out_ai.win_prob;
    if(!ExtractJsonNumber(resp,"win_prob_final",out_ai.win_prob_final)) out_ai.win_prob_final=out_ai.win_prob;
@@ -1868,6 +1902,7 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
    "\"at\":\""+TimeToString(TimeCurrent(),TIME_DATE|TIME_SECONDS)+"\","+
    "\"sym\":\""+_Symbol+"\","+
    "\"tf\":\""+tf_label+"\","+
+   "\"strategy_mode\":\""+StrategyModeName()+"\","+
    "\"rsi\":"+DoubleToString(rsi,2)+","+
    "\"atr\":"+DoubleToString(atr,5)+","+
    "\"price\":"+DoubleToString(price,_Digits)+","+
@@ -1891,6 +1926,7 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
    "\"planned_reward_rr\":"+DoubleToString(ai.planned_reward_rr,3)+","+
    "\"planned_risk_atr_mult\":"+DoubleToString(ai.planned_risk_atr_mult,3)+","+
    "\"planned_cost_r\":"+DoubleToString(ai.planned_cost_r,3)+","+
+   "\"max_hold_minutes\":"+IntegerToString(ai.max_hold_minutes)+","+
    "\"win_prob\":"+DoubleToString(ai.win_prob,3)+","+
    "\"win_prob_raw\":"+DoubleToString(ai.win_prob_raw,3)+","+
    "\"win_prob_calibrated\":"+DoubleToString(ai.win_prob_calibrated,3)+","+
@@ -1941,7 +1977,7 @@ void LogAIDecision(const string tf_label,int dir,double rsi,double atr,double pr
 long RecordSignal(const string tf_label,int dir,double rsi,double atr,double price,const string reason,const AIOut &ai,const CandleFeatures &candle,ulong ticket=0,double entry_price=0,bool mark_filled=false,bool is_virtual=false,double planned_entry=0,double planned_sl=0,double planned_tp=0,int planned_order_type=-1,int expiry_minutes=0,double executed_lot=0.0,int original_dir=0,const string shadow_reason="",ulong position_id=0,ulong position_ticket=0,ulong entry_deal_ticket=0)
 {
    // レジーム判定用の追加特徴量（QueryAIと同様にEA側で計算して保存する）
-   ENUM_TIMEFRAMES tf=(tf_label=="M15")?TF_Entry:TF_Recheck;
+   ENUM_TIMEFRAMES tf=(tf_label==EntryTimeframeLabel())?TF_Entry:TF_Recheck;
 
    // 価格情報
    double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
@@ -2045,6 +2081,7 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    string payload="{"+
    "\"symbol\":\""+JsonEscape(_Symbol)+"\","+
    "\"timeframe\":\""+JsonEscape(tf_label)+"\","+
+   "\"strategy_mode\":\""+StrategyModeName()+"\","+
    "\"dir\":"+IntegerToString(dir)+","+
    "\"direction_prob\":"+DoubleToString(ai.direction_prob,3)+","+
    "\"direction_prob_raw\":"+DoubleToString(ai.direction_prob_raw,3)+","+
@@ -2057,6 +2094,7 @@ long RecordSignal(const string tf_label,int dir,double rsi,double atr,double pri
    "\"planned_reward_rr\":"+DoubleToString(ai.planned_reward_rr,3)+","+
    "\"planned_risk_atr_mult\":"+DoubleToString(ai.planned_risk_atr_mult,3)+","+
    "\"planned_cost_r\":"+DoubleToString(ai.planned_cost_r,3)+","+
+   "\"max_hold_minutes\":"+IntegerToString(ai.max_hold_minutes)+","+
    "\"win_prob\":"+DoubleToString(ai.win_prob,3)+","+
    "\"win_prob_raw\":"+DoubleToString(ai.win_prob_raw,3)+","+
    "\"win_prob_calibrated\":"+DoubleToString(ai.win_prob_calibrated,3)+","+
@@ -2232,12 +2270,22 @@ void CheckVirtualWatches()
             else if(ask<=g_virtual[i].tp){ tp_hit=true; exit_price=g_virtual[i].tp; }
          }
 
-         if(sl_hit || tp_hit)
+         bool time_exit=false;
+         if(!sl_hit && !tp_hit && g_virtual[i].max_hold_minutes>0 && g_virtual[i].filled_at>0)
          {
-            string result = tp_hit?"WIN":"LOSS";
-            // normalized P/L in R-multiples (virtual only)
-            double pl = tp_hit? g_virtual[i].reward_rr : -1.0;
-            UpdateSignalResultById(g_virtual[i].signal_id,exit_price,pl,result,sl_hit,tp_hit,g_virtual[i].filled_at,g_virtual[i].mfe_r,g_virtual[i].mae_r);
+            time_exit=(now-g_virtual[i].filled_at)>=g_virtual[i].max_hold_minutes*60;
+            if(time_exit) exit_price=(g_virtual[i].dir>0?bid:ask);
+         }
+
+         if(sl_hit || tp_hit || time_exit)
+         {
+            double pl=0.0;
+            if(tp_hit) pl=g_virtual[i].reward_rr;
+            else if(sl_hit) pl=-1.0;
+            else if(risk>0) pl=((exit_price-g_virtual[i].entry)*g_virtual[i].dir)/risk-g_virtual[i].cost_r;
+            string result=(pl>0.01?"WIN":(pl<-0.01?"LOSS":"BREAK_EVEN"));
+            string exitReason=(tp_hit?"tp":(sl_hit?"sl":"scalp_time_exit"));
+            UpdateSignalResultById(g_virtual[i].signal_id,exit_price,pl,result,sl_hit,tp_hit,exitReason,g_virtual[i].filled_at,g_virtual[i].mfe_r,g_virtual[i].mae_r);
             g_virtual[i].signal_id=0;
          }
       }
@@ -2249,7 +2297,7 @@ bool UpdateSignalResultWithOpenTime(const long signal_id,const ulong order_ticke
    const ulong exit_deal_ticket,const double exit_price,const double profit_loss,
    const double commission,const double swap_value,const double fee,const string result,
    const bool sl_hit,const bool tp_hit,const bool result_consistent,
-   const string quality_reason,const datetime open_time,const datetime close_time)
+   const string quality_reason,const string exit_reason,const datetime open_time,const datetime close_time)
 {
    int duration=0;
    if(open_time>0 && close_time>=open_time) duration=(int)((close_time-open_time)/60);
@@ -2272,6 +2320,7 @@ bool UpdateSignalResultWithOpenTime(const long signal_id,const ulong order_ticke
    "\"hold_duration_minutes\":"+IntegerToString(duration)+","+
    "\"sl_hit\":"+(sl_hit?"true":"false")+","+
    "\"tp_hit\":"+(tp_hit?"true":"false")+","+
+   "\"exit_reason\":\""+JsonEscape(exit_reason)+"\","+
    "\"result_consistent\":"+(result_consistent?"true":"false")+","+
    "\"result_quality_reason\":"+(quality_reason!=""?"\""+JsonEscape(quality_reason)+"\"":"null")+","+
    "\"tracking_version\":\"position_id_v2\"}";
@@ -2298,7 +2347,7 @@ void MaybeRecordVirtualSkip(const string decision_code,const TechSignal &t,doubl
    else if(t.dir<0){ planned_entry=bid; planned_sl=bid+slDist; planned_tp=bid-tpDist; planned_type=ORDER_TYPE_SELL; }
    else return;
 
-   long sid=RecordSignal("M15",t.dir,rsi,t.atr,t.ref,t.reason,ai,t.candle,0,0,false,true,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,0.0,t.dir,decision_code);
+   long sid=RecordSignal(EntryTimeframeLabel(),t.dir,rsi,t.atr,t.ref,t.reason,ai,t.candle,0,0,false,true,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,0.0,t.dir,decision_code);
    if(sid<=0) return;
 
    VirtualWatch w;
@@ -2315,6 +2364,8 @@ void MaybeRecordVirtualSkip(const string decision_code,const TechSignal &t,doubl
    w.mfe_r=0.0;
    w.mae_r=0.0;
    w.reward_rr=ai.reward_rr;
+   w.cost_r=ai.planned_cost_r;
+   w.max_hold_minutes=ai.max_hold_minutes;
 
    int vidx=TrackVirtual(w);
    if(vidx>=0){
@@ -2348,7 +2399,7 @@ void RecordOppositeDirectionShadow(const TechSignal &base,double rsi,const AIOut
    shadow.tp_before_sl_prob_raw=opposite_prob;
    shadow.tp_before_sl_prob_calibrated=opposite_prob;
    shadow.tp_before_sl_prob_final=opposite_prob;
-   shadow.probability_target_version="direction_tp_v2";
+   shadow.probability_target_version=(ai.probability_target_version!=""?ai.probability_target_version:(IsScalpMode()?"scalp_timeboxed_net_v1":"direction_tp_v2"));
    shadow.calibration_applied=false;
    shadow.calibration_version="paired_direction";
    shadow.calibration_method="final_probability_snapshot";
@@ -2399,18 +2450,20 @@ int CountPositions()
 }
 
 // ===== バー処理 =====
-void OnM15NewBar()
+void OnEntryNewBar()
 {
+   string tfLabel=EntryTimeframeLabel();
+   string auditLabel=RecheckTimeframeLabel();
    // TP/SL後のクールダウン中は一切の新規アクションを停止
    if(InCooldown()){
-      SafePrint(StringFormat("[M15] cooldown active for %d sec",(int)(g_cooldownUntil-TimeCurrent())));
+      SafePrint(StringFormat("[%s] cooldown active for %d sec",tfLabel,(int)(g_cooldownUntil-TimeCurrent())));
       return;
    }
    
    TechSignal t=Evaluate(TF_Entry); if(t.dir==0)return;
    int tech_dir=t.dir;
-   double rsi=RSIv(PERIOD_M15,14,PRICE_CLOSE,0);
-   AIOut ai; if(!QueryAI("M15",t.dir,rsi,t.atr,t.ref,t.reason,t.ichimoku_score,t.candle,ai))return;
+   double rsi=RSIv(TF_Entry,14,PRICE_CLOSE,0);
+   AIOut ai; if(!QueryAI(tfLabel,t.dir,rsi,t.atr,t.ref,t.reason,t.ichimoku_score,t.candle,ai))return;
 
    int suggested_dir = (ai.suggested_dir!=0?ai.suggested_dir:tech_dir);
    int decision_dir = ai.action; // 0なら見送り
@@ -2438,14 +2491,14 @@ void OnM15NewBar()
       TechSignal t_exec=t; t_exec.dir=execution_dir;
       TechSignal t_plan=t; t_plan.dir=suggested_dir;
 
-      // H1の独立AI判定は既定で監査専用。M15実行を止めず、旧SOFT判定の反実仮想を保存する。
+      // 上位足の独立AI判定は監査専用。実行を止めず、旧SOFT判定の反実仮想を保存する。
       if(H1AuditEnabled)
       {
          TechSignal h1t=Evaluate(TF_Recheck);
          int h1_tech_dir=(h1t.dir!=0?h1t.dir:decision_dir);
-         double h1_rsi=RSIv(PERIOD_H1,14,PRICE_CLOSE,0);
+         double h1_rsi=RSIv(TF_Recheck,14,PRICE_CLOSE,0);
          AIOut h1ai;
-         bool h1_ok=QueryAI("H1",h1_tech_dir,h1_rsi,h1t.atr,h1t.ref,h1t.reason,h1t.ichimoku_score,h1t.candle,h1ai);
+         bool h1_ok=QueryAI(auditLabel,h1_tech_dir,h1_rsi,h1t.atr,h1t.ref,h1t.reason,h1t.ichimoku_score,h1t.candle,h1ai);
          if(!h1_ok){
             ai.h1_shadow_checked=true;
             ai.h1_shadow_would_block=false;
@@ -2453,15 +2506,15 @@ void OnM15NewBar()
             h1ai.h1_shadow_checked=true;
             h1ai.h1_shadow_would_block=false;
             h1ai.h1_shadow_reason="query_failed";
-            LogAIDecision("H1",0,h1_rsi,h1t.atr,h1t.ref,h1t.reason,h1ai,"H1_SHADOW_QUERY_FAIL",false,posCount,0,h1_tech_dir);
-            SafePrint("[M15] H1 audit query failed -> continue");
+            LogAIDecision(auditLabel,0,h1_rsi,h1t.atr,h1t.ref,h1t.reason,h1ai,"HTF_SHADOW_QUERY_FAIL",false,posCount,0,h1_tech_dir);
+            SafePrint(StringFormat("[%s] %s audit query failed -> continue",tfLabel,auditLabel));
          }
          else
          {
             int h1_suggested_dir=(h1ai.suggested_dir!=0?h1ai.suggested_dir:h1ai.action);
             bool h1_opposite=(h1_suggested_dir!=0 && h1_suggested_dir!=decision_dir);
             bool block=(h1_opposite && h1ai.action!=0 && h1ai.win_prob>=H1OppositeBlockProb);
-            string auditReason=StringFormat("soft h1_action=%d h1_prob=%.3f h1_dir=%d m15_dir=%d",h1ai.action,h1ai.win_prob,h1_suggested_dir,decision_dir);
+            string auditReason=StringFormat("soft %s_action=%d prob=%.3f htf_dir=%d entry_dir=%d",auditLabel,h1ai.action,h1ai.win_prob,h1_suggested_dir,decision_dir);
             ai.h1_shadow_checked=true;
             ai.h1_shadow_would_block=block;
             ai.h1_shadow_reason=(block?auditReason:"soft_pass");
@@ -2469,17 +2522,17 @@ void OnM15NewBar()
             h1ai.h1_shadow_would_block=block;
             h1ai.h1_shadow_reason=ai.h1_shadow_reason;
 
-            LogAIDecision("H1",h1ai.action,h1_rsi,h1t.atr,h1t.ref,h1t.reason,h1ai,
-               (block?"H1_SHADOW_WOULD_BLOCK":"H1_SHADOW_PASS"),true,posCount,0,h1_tech_dir);
+            LogAIDecision(auditLabel,h1ai.action,h1_rsi,h1t.atr,h1t.ref,h1t.reason,h1ai,
+               (block?"HTF_SHADOW_WOULD_BLOCK":"HTF_SHADOW_PASS"),true,posCount,0,h1_tech_dir);
             if(block)
-               SafePrint("[M15] H1 shadow would block, but execution continues");
+               SafePrint(StringFormat("[%s] %s shadow would block, but execution continues",tfLabel,auditLabel));
          }
       }
 
       // ポジション数チェック（ペンディングは設定で任意）
       if(posCount>=MaxPositions){
-         LogAIDecision("M15",decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_MAX_POS",threshold_met,posCount,0,tech_dir);
-         SafePrint(StringFormat("[M15] skip: already %d position(s)",posCount));
+         LogAIDecision(tfLabel,decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_MAX_POS",threshold_met,posCount,0,tech_dir);
+         SafePrint(StringFormat("[%s] skip: already %d position(s)",tfLabel,posCount));
          MaybeRecordVirtualSkip("SKIPPED_MAX_POS",t_plan,rsi,ai,expiry_min);
          return;
       }
@@ -2489,8 +2542,8 @@ void OnM15NewBar()
       if(MaxPositions<=1)
       {
          if(g_trackedPositionTicket>0 && PositionSelectByTicket(g_trackedPositionTicket)){
-            LogAIDecision("M15",decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_TRACKED_POS",threshold_met,1,g_trackedPositionTicket,tech_dir);
-            SafePrint(StringFormat("[M15] skip: tracked position active (ticket=%s)",ULongToString(g_trackedPositionTicket)));
+            LogAIDecision(tfLabel,decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_TRACKED_POS",threshold_met,1,g_trackedPositionTicket,tech_dir);
+            SafePrint(StringFormat("[%s] skip: tracked position active (ticket=%s)",tfLabel,ULongToString(g_trackedPositionTicket)));
             MaybeRecordVirtualSkip("SKIPPED_TRACKED_POS",t_plan,rsi,ai,expiry_min);
             return;
          }
@@ -2502,7 +2555,7 @@ void OnM15NewBar()
       double finalLots = Lots;
       double normLots=finalLots; string lotWhy="";
       if(!NormalizeLotsForSymbol(finalLots,normLots,lotWhy)){
-         LogAIDecision("M15",decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_INVALID_LOT",threshold_met,posCount,0,tech_dir);
+         LogAIDecision(tfLabel,decision_dir,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_INVALID_LOT",threshold_met,posCount,0,tech_dir);
          SafePrint(StringFormat("[LOT] skip: %s",lotWhy));
          MaybeRecordVirtualSkip("SKIPPED_INVALID_LOT",t_plan,rsi,ai,expiry_min);
          return;
@@ -2542,8 +2595,8 @@ void OnM15NewBar()
 
       if(ok && posTicket>0 && positionId>0 && ordTicket>0 && entryDealTicket>0){
          if(executedDir==0) executedDir=t_exec.dir;
-         long signalId=RecordSignal("M15",executedDir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,finalLots,decision_dir,"",positionId,posTicket,entryDealTicket);
-         bool tracked=AddTrackedTrade(posTicket,positionId,ordTicket,entryDealTicket,signalId,openTime,entry,executedDir,signalId>0);
+         long signalId=RecordSignal(tfLabel,executedDir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,finalLots,decision_dir,"",positionId,posTicket,entryDealTicket);
+         bool tracked=AddTrackedTrade(posTicket,positionId,ordTicket,entryDealTicket,signalId,openTime,entry,executedDir,signalId>0,ai_exec.max_hold_minutes);
 
          // legacy single-slot (last executed)
          g_trackedPositionTicket=posTicket;
@@ -2553,37 +2606,67 @@ void OnM15NewBar()
          g_trackedFillSent=(signalId>0);
          g_trackedFillLastTry=0;
 
-         LogAIDecision("M15",executedDir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,"EXECUTED_MARKET",threshold_met,posCount,ordTicket,tech_dir,finalLots);
-         SafePrint(StringFormat("[M15] market executed dir=%d prob=%.0f%% lot=%.2f posId=%s tracked=%d",executedDir,ai.win_prob*100,finalLots,ULongToString(positionId),(tracked?1:0)));
+         LogAIDecision(tfLabel,executedDir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,"EXECUTED_MARKET",threshold_met,posCount,ordTicket,tech_dir,finalLots);
+         SafePrint(StringFormat("[%s] market executed dir=%d prob=%.0f%% lot=%.2f posId=%s tracked=%d",tfLabel,executedDir,ai.win_prob*100,finalLots,ULongToString(positionId),(tracked?1:0)));
       }else{
          if(ok && ordTicket>0)
          {
             entry=trade.ResultPrice();
-            long signalId=RecordSignal("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,finalLots,decision_dir);
+            long signalId=RecordSignal(tfLabel,t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,t_exec.candle,ordTicket,entry,true,false,planned_entry,planned_sl,planned_tp,planned_type,expiry_min,finalLots,decision_dir);
             SafePrint(StringFormat("[TRACK] Executed order=%s but identity resolution is pending signal=%d",ULongToString(ordTicket),(int)signalId));
             RehydrateTrackingFromExistingPositions();
-            LogAIDecision("M15",t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,"EXECUTED_TRACKING_PENDING",threshold_met,posCount,ordTicket,tech_dir,finalLots);
+            LogAIDecision(tfLabel,t_exec.dir,rsi,t_exec.atr,t_exec.ref,t_exec.reason,ai_exec,"EXECUTED_TRACKING_PENDING",threshold_met,posCount,ordTicket,tech_dir,finalLots);
          }
          else
          {
-            SafePrint("[M15] market execution failed");
+            SafePrint(StringFormat("[%s] market execution failed",tfLabel));
             MaybeRecordVirtualSkip("SKIPPED_ORDER_FAILED",t_plan,rsi,ai,expiry_min);
          }
       }
    }else{
       TechSignal t_plan=t; t_plan.dir=(ai.suggested_dir!=0?ai.suggested_dir:tech_dir);
-      LogAIDecision("M15",ai.action,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_LOW_PROB",threshold_met,posCount,0,tech_dir);
+      LogAIDecision(tfLabel,ai.action,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_LOW_PROB",threshold_met,posCount,0,tech_dir);
       if(ai.action==0){
-         SafePrint(StringFormat("[M15] skip: server action=0 (prob=%.0f%% eff=%.0f%% ev=%.2f gate=%.2f method=%s reason=%s)",
-            ai.win_prob*100,effectiveMin*100,ev_r,ev_gate,ai.entry_method,ai.skip_reason));
+         SafePrint(StringFormat("[%s] skip: server action=0 (prob=%.0f%% eff=%.0f%% ev=%.2f gate=%.2f method=%s reason=%s)",
+            tfLabel,ai.win_prob*100,effectiveMin*100,ev_r,ev_gate,ai.entry_method,ai.skip_reason));
       }else{
-         SafePrint(StringFormat("[M15] skip: below threshold (prob=%.0f%% < eff=%.0f%% and ev=%.2f < gate=%.2f)",
-            ai.win_prob*100,effectiveMin*100,ev_r,ev_gate));
+         SafePrint(StringFormat("[%s] skip: below threshold (prob=%.0f%% < eff=%.0f%% and ev=%.2f < gate=%.2f)",
+            tfLabel,ai.win_prob*100,effectiveMin*100,ev_r,ev_gate));
       }
 
       // Every direction-bearing candidate is shadow-tracked, including hard guards.
       // This is observational only and never bypasses the execution gate.
       MaybeRecordVirtualSkip("SKIPPED_EXECUTION_GATE",t_plan,rsi,ai,expiry_min);
+   }
+}
+
+void CheckScalpTimeExit()
+{
+   if(!IsScalpMode()) return;
+   datetime now=TimeCurrent();
+   for(int ti=0;ti<ArraySize(g_tracked);ti++)
+   {
+      int maxHold=g_tracked[ti].max_hold_minutes;
+      if(g_tracked[ti].position_id==0 || g_tracked[ti].open_time<=0 || maxHold<=0 || g_tracked[ti].time_exit_requested) continue;
+      if((now-g_tracked[ti].open_time)<maxHold*60) continue;
+
+      ulong ticket=FindOpenPositionTicketByIdentifier(g_tracked[ti].position_id);
+      if(ticket==0 || !PositionSelectByTicket(ticket)) continue;
+
+      trade.SetExpertMagicNumber(Magic);
+      trade.SetDeviationInPoints(SlippagePoints);
+      bool requested=trade.PositionClose(ticket);
+      long retcode=trade.ResultRetcode();
+      bool accepted=requested && (retcode==TRADE_RETCODE_DONE || retcode==TRADE_RETCODE_PLACED);
+      if(accepted)
+      {
+         g_tracked[ti].time_exit_requested=true;
+         SafePrint(StringFormat("[M5] scalp time exit requested after %d min positionId=%s",maxHold,ULongToString(g_tracked[ti].position_id)));
+      }
+      else
+      {
+         SafePrint(StringFormat("[M5] scalp time exit failed retcode=%d positionId=%s",(int)retcode,ULongToString(g_tracked[ti].position_id)));
+      }
    }
 }
 
@@ -2618,7 +2701,8 @@ void CheckPositionStatus()
                            ",\"entry_deal_ticket\":\""+ULongToString(g_tracked[ti].entry_deal_ticket)+"\""+
                            ",\"tracking_version\":\"position_id_v2\""+
                            ",\"symbol\":\""+JsonEscape(_Symbol)+"\""+
-                           ",\"timeframe\":\"M15\""+
+                           ",\"timeframe\":\""+EntryTimeframeLabel()+"\""+
+                           ",\"strategy_mode\":\""+StrategyModeName()+"\""+
                            ",\"dir\":"+IntegerToString(posDir)+
                            ",\"reason\":\"rehydrated_existing_position\""+
                            ",\"instance\":\""+JsonEscape(AI_EA_Instance)+"\""+
@@ -2706,18 +2790,20 @@ void CheckPositionStatus()
             qualityReason="missing_entry_identity";
          }
 
+         string exitReason=(tpHit?"tp":(slHit?"sl":(g_tracked[ti].time_exit_requested?"scalp_time_exit":"other")));
+
          bool updated=UpdateSignalResultWithOpenTime(
             g_tracked[ti].signal_id,g_tracked[ti].order_ticket,g_tracked[ti].position_id,
             g_tracked[ti].position_ticket,g_tracked[ti].entry_deal_ticket,lastExitDeal,
             exitPrice,netProfit,commission,swapValue,fee,result,slHit,tpHit,
-            consistent,qualityReason,g_tracked[ti].open_time,closeTime);
+            consistent,qualityReason,exitReason,g_tracked[ti].open_time,closeTime);
          if(!updated) continue;
 
-         if(slHit || tpHit)
+         if(slHit || tpHit || g_tracked[ti].time_exit_requested)
          {
             g_cooldownUntil=TimeCurrent()+(CooldownAfterCloseMin*60);
             SafePrint(StringFormat("[COOLDOWN] Start %d min after %s (positionId=%s)",
-               CooldownAfterCloseMin,(tpHit?"TP":"SL"),ULongToString(g_tracked[ti].position_id)));
+               CooldownAfterCloseMin,exitReason,ULongToString(g_tracked[ti].position_id)));
          }
 
          if(g_trackedPositionTicket==g_tracked[ti].position_ticket)
@@ -2753,6 +2839,10 @@ int OnInit(){
       return(INIT_FAILED);
    }
 
+   long marginMode=AccountInfoInteger(ACCOUNT_MARGIN_MODE);
+   if(marginMode!=ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
+      Print("[MODE] WARNING: Netting account detected. Do not run standard and scalp modes on the same symbol at the same time.");
+
    int cap=(VirtualMaxWatches<10?10:VirtualMaxWatches);
    ArrayResize(g_virtual,cap);
 
@@ -2767,8 +2857,10 @@ int OnInit(){
    SafePrint(StringFormat("[INIT] AwajiSamurai_AI_2.0 %s start (build %s)", AI_EA_Version, __DATE__));
    SafePrint(StringFormat("[CONFIG] System defaults -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f | Operator -> Lots=%.2f, MaxPos=%d",
       MinWinProb*100,RiskATRmult,RewardRR,Lots,MaxPositions));
+   SafePrint(StringFormat("[MODE] strategy=%s entry=%s audit=%s magic=%I64d maxHold=%d cooldown=%d",
+      StrategyModeName(),EntryTimeframeLabel(),RecheckTimeframeLabel(),Magic,MaxHoldMinutes,CooldownAfterCloseMin));
    SafePrint("[ENTRY] Mode=market LotMode=fixed");
-   SafePrint("[H1] ExecutionPrecheck=removed ShadowAudit=true");
+   SafePrint(StringFormat("[AUDIT] Recheck=%s ExecutionPrecheck=removed ShadowAudit=true",RecheckTimeframeLabel()));
    SafePrint("[INFO] Sending EMA25, SMA100, SMA200, SMA800, MACD, RSI, ATR, Ichimoku (all lines) to AI");
    SafePrint("[TRACK] Market positions only; pending-order execution removed");
    SafePrint("[VIRTUAL] Enabled=true TrackAllSkipped=true");
@@ -2778,8 +2870,10 @@ int OnInit(){
 }
 void OnTick()
 {
+   CheckScalpTimeExit();
    // ポジション状態監視（ML学習用）
    CheckPositionStatus();
-   if(iTime(_Symbol,TF_Entry,0)!=g_lastBar_M15){g_lastBar_M15=iTime(_Symbol,TF_Entry,0);OnM15NewBar();}
+   datetime currentEntryBar=iTime(_Symbol,TF_Entry,0);
+   if(currentEntryBar!=g_lastEntryBar){g_lastEntryBar=currentEntryBar;OnEntryNewBar();}
 }
 void OnDeinit(const int reason){SafePrint("[DEINIT] stopped;");}

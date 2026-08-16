@@ -10,6 +10,8 @@ interface EALogEntry {
   at: string;                    // トレード判断日時
   sym: string;                   // 銘柄
   tf?: string;                   // タイムフレーム（補足情報）
+  strategy_mode?: "standard" | "scalp";
+  max_hold_minutes?: number;
   regime?: string;               // 相場状態（trend/range/uncertain）
   strategy?: string;             // 戦略（trend_follow/mean_revert/none）
   regime_confidence?: string;    // 判定信頼度（high/medium/low）
@@ -78,6 +80,8 @@ interface EALogInput {
   at: string;
   sym: string;
   tf?: string;
+  strategy_mode?: "standard" | "scalp" | string;
+  max_hold_minutes?: number;
   regime?: string;
   strategy?: string;
   regime_confidence?: string;
@@ -410,6 +414,10 @@ serve(async (req: Request) => {
       at: toISO(body.at),
       sym,
       tf: body.tf || undefined,
+      strategy_mode: body.strategy_mode === "scalp" ? "scalp" : "standard",
+      max_hold_minutes: body.max_hold_minutes !== undefined && Number.isFinite(Number(body.max_hold_minutes)) && Number(body.max_hold_minutes) > 0
+        ? Math.max(5, Math.min(240, Math.floor(Number(body.max_hold_minutes))))
+        : undefined,
       regime: (pickedRegime.regime ?? body.regime) || undefined,
       strategy: (pickedRegime.strategy ?? body.strategy) || undefined,
       regime_confidence: (pickedRegime.regime_confidence ?? body.regime_confidence) || undefined,

@@ -30,7 +30,7 @@ const COUNTRY_LABELS: Record<string, string> = {
 };
 
 const SKIP_REASON_LABELS: Record<string, string> = {
-  winprob_below_gate: "TP先着確率が実行基準を下回ったため",
+  winprob_below_gate: "実行勝率が実行基準を下回ったため",
   direction_edge_too_small: "BUYとSELLの優位差が小さく、方向を絞れなかったため",
   ev_below_min: "期待値が最低基準を下回ったため",
   cost_too_high: "コストが許容上限を超えたため",
@@ -105,6 +105,19 @@ function formatMoney(value: number | null | undefined) {
 function formatDirection(value: string | null | undefined) {
   if (!value) return "-";
   return value;
+}
+
+function formatStrategyMode(value: string | null | undefined, timeframe?: string | null) {
+  if (value === "scalp" || timeframe?.toUpperCase() === "M5") return "短期 M5";
+  return "標準 M15";
+}
+
+function formatExitReason(value: string | null | undefined) {
+  if (value === "tp") return "TP決済";
+  if (value === "sl") return "SL決済";
+  if (value === "scalp_time_exit") return "時間決済";
+  if (value === "other") return "その他決済";
+  return null;
 }
 
 function formatCadenceLabel(value: string | null | undefined) {
@@ -290,7 +303,7 @@ function buildEaNarrative(log: EALogRecord) {
     const actual = parsed.winProb * 100;
     const required = parsed.gate * 100;
     const comparison = actual >= required ? "基準を満たしています" : "基準を下回っています";
-    sentences.push(`TP先着確率は ${actual.toFixed(1)}% で、実行基準 ${required.toFixed(1)}% と比べると ${comparison}。`);
+    sentences.push(`実行勝率は ${actual.toFixed(1)}% で、実行基準 ${required.toFixed(1)}% と比べると ${comparison}。`);
   }
 
   if (parsed.ev != null && parsed.minEv != null) {
@@ -307,10 +320,10 @@ function buildEaNarrative(log: EALogRecord) {
 
   if (parsed.calibration) {
     const calibrationLabel = parsed.calibration === "off"
-      ? "TP先着確率の補正は今回は使っていません"
+      ? "実行勝率の補正は今回は使っていません"
       : parsed.calibration === "ok"
-        ? "TP先着確率を補正したうえで判定しています"
-        : "本来必要なTP先着確率の補正を適用できませんでした";
+        ? "実行勝率を補正したうえで判定しています"
+        : "本来必要な実行勝率の補正を適用できませんでした";
     sentences.push(`${calibrationLabel}。`);
   }
 
@@ -366,18 +379,18 @@ function TradeCards({ trades }: { trades: TradeRecord[] }) {
           <div className="flex items-start justify-between gap-3">
             <div>
               <div className="text-base font-semibold text-white">{trade.symbol}</div>
-              <div className="text-xs text-slate-400">{trade.timeframe ?? "-"} / {formatDateTime(trade.created_at)}</div>
+              <div className="text-xs text-slate-400">{formatStrategyMode(trade.strategy_mode, trade.timeframe)} / {formatDateTime(trade.created_at)}</div>
             </div>
             <div className="rounded-full bg-white/8 px-3 py-1 text-xs text-slate-200">{trade.directionLabel}</div>
           </div>
           <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
             <div>
-              <div className="text-xs text-slate-400">TP先着 / 方向</div>
+              <div className="text-xs text-slate-400">実行勝率 / 方向</div>
               <div className="mt-1 text-slate-100">{formatPercent((trade.tp_before_sl_prob_final ?? trade.tp_before_sl_prob ?? trade.win_prob) != null ? (trade.tp_before_sl_prob_final ?? trade.tp_before_sl_prob ?? trade.win_prob)! * 100 : null)} / {formatPercent(trade.direction_prob != null ? trade.direction_prob * 100 : null)}</div>
             </div>
             <div>
               <div className="text-xs text-slate-400">状態</div>
-              <div className="mt-1 text-slate-100">{trade.statusLabel}</div>
+              <div className="mt-1 text-slate-100">{trade.statusLabel}{formatExitReason(trade.exit_reason) ? ` / ${formatExitReason(trade.exit_reason)}` : ""}</div>
             </div>
             <div className="col-span-2">
               <div className="text-xs text-slate-400">損益</div>
@@ -939,7 +952,7 @@ export default async function Home({ searchParams }: PageProps) {
                 </table>
               </div>
               {[
-                { title: "補正後TP先着確率帯", rows: data.opportunityAnalysis.probabilityCohorts },
+                { title: "補正後実行勝率帯", rows: data.opportunityAnalysis.probabilityCohorts },
                 { title: "取引コスト帯", rows: data.opportunityAnalysis.costCohorts },
                 { title: "銘柄別", rows: data.opportunityAnalysis.symbolCohorts },
                 { title: "方向別", rows: data.opportunityAnalysis.directionCohorts },
@@ -973,7 +986,7 @@ export default async function Home({ searchParams }: PageProps) {
           </div>
 
           <div className="mt-4 flex flex-col gap-2 border-y border-white/8 py-4 text-sm text-slate-200 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
-            <span>H1シャドー監査: {data.h1Audit.checkedCount}件確認 / 旧判定なら停止 {data.h1Audit.wouldBlockCount}件</span>
+            <span>上位足シャドー監査: {data.h1Audit.checkedCount}件確認 / 旧判定なら停止 {data.h1Audit.wouldBlockCount}件</span>
             <span>停止候補の決着 {data.h1Audit.resolvedWouldBlockCount}件 / 勝率 {formatPercent(data.h1Audit.wouldBlockWinRate)} / 合計 {data.h1Audit.wouldBlockNetR >= 0 ? "+" : ""}{data.h1Audit.wouldBlockNetR.toFixed(2)}R</span>
           </div>
 
@@ -994,7 +1007,7 @@ export default async function Home({ searchParams }: PageProps) {
               <tbody className="divide-y divide-white/6 bg-slate-950/35 text-slate-100">
                 {data.shadowAnalysis.recent.map((trade) => (
                   <tr key={`shadow-${trade.id}`}>
-                    <td className="px-4 py-3"><div className="font-medium">{trade.symbol} {trade.dir === 1 ? "BUY" : "SELL"}</div><div className="text-xs text-slate-400">{formatDateTime(trade.created_at)}</div></td>
+                    <td className="px-4 py-3"><div className="font-medium">{trade.symbol} {trade.dir === 1 ? "BUY" : "SELL"}</div><div className="text-xs text-slate-400">{formatStrategyMode(trade.strategy_mode, trade.timeframe)} / {formatDateTime(trade.created_at)}</div></td>
                     <td className="px-4 py-3"><div>{formatPercent(trade.direction_prob != null ? trade.direction_prob * 100 : null)}</div><div className="text-xs text-slate-400">{trade.direction_horizon_minutes ? `${trade.direction_horizon_minutes}分後` : "旧データ"}</div></td>
                     <td className="px-4 py-3">{formatPercent((trade.tp_before_sl_prob_raw ?? trade.win_prob_raw) != null ? (trade.tp_before_sl_prob_raw ?? trade.win_prob_raw)! * 100 : null)}</td>
                     <td className="px-4 py-3">{formatPercent((trade.tp_before_sl_prob_calibrated ?? trade.win_prob_calibrated) != null ? (trade.tp_before_sl_prob_calibrated ?? trade.win_prob_calibrated)! * 100 : null)}</td>
@@ -1011,7 +1024,7 @@ export default async function Home({ searchParams }: PageProps) {
 
         <section className="mt-8 grid gap-5 lg:grid-cols-[0.95fr_1.05fr]">
           <article className="surface-panel rounded-[28px] p-6 backdrop-blur">
-            <SectionTitle title="直近5件のEAログ" description="BUY・SELL比較、方向確率、TP先着確率を確認" />
+            <SectionTitle title="直近5件のEAログ" description="BUY・SELL比較、方向確率、実行勝率を確認" />
             <div className="space-y-4">
               {data.recentEaLogs.map((log) => (
                 <div key={log.id} className="rounded-3xl border border-white/8 bg-white/5 p-4">
@@ -1022,18 +1035,20 @@ export default async function Home({ searchParams }: PageProps) {
                     </div>
                     <div className="flex flex-wrap gap-2 text-xs sm:justify-end">
                       <span className="max-w-full rounded-full bg-cyan-300/10 px-3 py-1 text-cyan-100">{formatDirection(log.action)}</span>
+                      <span className="max-w-full rounded-full bg-violet-300/10 px-3 py-1 text-violet-100">{formatStrategyMode(log.strategy_mode, log.tf)}</span>
                       <span className="max-w-full rounded-full bg-white/8 px-3 py-1 text-slate-200">{formatTradeDecision(log)}</span>
-                      <span className="max-w-full rounded-full bg-emerald-300/10 px-3 py-1 text-emerald-100">TP先着 {formatPercent((log.tp_before_sl_prob_final ?? log.tp_before_sl_prob ?? log.win_prob) != null ? (log.tp_before_sl_prob_final ?? log.tp_before_sl_prob ?? log.win_prob)! * 100 : null)}</span>
+                      <span className="max-w-full rounded-full bg-emerald-300/10 px-3 py-1 text-emerald-100">実行勝率 {formatPercent((log.tp_before_sl_prob_final ?? log.tp_before_sl_prob ?? log.win_prob) != null ? (log.tp_before_sl_prob_final ?? log.tp_before_sl_prob ?? log.win_prob)! * 100 : null)}</span>
                       <span className="max-w-full rounded-full bg-cyan-300/10 px-3 py-1 text-cyan-100">方向 {formatPercent(log.direction_prob != null ? log.direction_prob * 100 : null)}</span>
                     </div>
                   </div>
                   <p className="mt-3 text-sm leading-7 text-slate-100">{buildEaNarrative(log)}</p>
-                  {(log.tp_before_sl_prob_raw ?? log.win_prob_raw) != null ? <p className="mt-2 text-xs text-cyan-100/80">TP先着: Raw {formatPercent((log.tp_before_sl_prob_raw ?? log.win_prob_raw)! * 100)} → 補正後 {formatPercent((log.tp_before_sl_prob_calibrated ?? log.win_prob_calibrated ?? log.tp_before_sl_prob_raw ?? log.win_prob_raw)! * 100)} → 最終 {formatPercent((log.tp_before_sl_prob_final ?? log.win_prob_final ?? log.win_prob) != null ? (log.tp_before_sl_prob_final ?? log.win_prob_final ?? log.win_prob)! * 100 : null)} / {log.calibration_method ?? "補正なし"} {log.calibration_scope ? `(${log.calibration_scope}, n=${log.calibration_sample_size ?? "-"})` : ""}</p> : null}
+                  {(log.tp_before_sl_prob_raw ?? log.win_prob_raw) != null ? <p className="mt-2 text-xs text-cyan-100/80">実行勝率: Raw {formatPercent((log.tp_before_sl_prob_raw ?? log.win_prob_raw)! * 100)} → 補正後 {formatPercent((log.tp_before_sl_prob_calibrated ?? log.win_prob_calibrated ?? log.tp_before_sl_prob_raw ?? log.win_prob_raw)! * 100)} → 最終 {formatPercent((log.tp_before_sl_prob_final ?? log.win_prob_final ?? log.win_prob) != null ? (log.tp_before_sl_prob_final ?? log.win_prob_final ?? log.win_prob)! * 100 : null)} / {log.calibration_method ?? "補正なし"} {log.calibration_scope ? `(${log.calibration_scope}, n=${log.calibration_sample_size ?? "-"})` : ""}</p> : null}
                   {log.buy_win_prob != null && log.sell_win_prob != null ? <p className="mt-2 text-xs text-emerald-100/85">AI方向比較: BUY {formatPercent(log.buy_win_prob * 100)} / SELL {formatPercent(log.sell_win_prob * 100)} / 優位差 {(Math.abs(log.buy_win_prob - log.sell_win_prob) * 100).toFixed(1)}pt / 採用 {log.suggested_dir === 1 ? "BUY" : log.suggested_dir === -1 ? "SELL" : "見送り"}</p> : null}
                   {log.direction_prob != null ? <p className="mt-2 text-xs text-slate-300">方向確率: {formatPercent(log.direction_prob * 100)} / {log.direction_horizon_minutes ?? 60}分後 / 実行ゲートには不使用</p> : null}
                   {log.planned_tp != null && log.planned_sl != null ? <p className="mt-2 text-xs text-slate-300">注文前提: Entry {log.planned_entry_price ?? "-"} / TP {log.planned_tp} / SL {log.planned_sl} / RR {log.planned_reward_rr?.toFixed(2) ?? "-"} / cost {log.planned_cost_r?.toFixed(3) ?? "-"}R</p> : null}
+                  {log.strategy_mode === "scalp" && log.max_hold_minutes ? <p className="mt-2 text-xs text-violet-100/80">短期モード最大保有: {log.max_hold_minutes}分（未決着時は成行決済）</p> : null}
                   {log.plan_effective_min_win_prob != null ? <p className="mt-2 text-xs text-slate-300">実行ゲート: AI {formatPercent((log.plan_base_min_win_prob ?? 0) * 100)} + {((log.plan_gate_adjustment ?? 0) * 100).toFixed(0)}pt = {formatPercent(log.plan_effective_min_win_prob * 100)}</p> : null}
-                  {log.h1_shadow_checked ? <p className={`mt-2 text-xs ${log.h1_shadow_would_block ? "text-amber-200" : "text-emerald-200/80"}`}>H1シャドー: {log.h1_shadow_would_block ? "旧判定なら停止（今回は継続）" : "通過"}{log.h1_shadow_reason ? ` / ${log.h1_shadow_reason}` : ""}</p> : null}
+                  {log.h1_shadow_checked ? <p className={`mt-2 text-xs ${log.h1_shadow_would_block ? "text-amber-200" : "text-emerald-200/80"}`}>{log.strategy_mode === "scalp" ? "M15" : "H1"}シャドー: {log.h1_shadow_would_block ? "旧判定なら停止（今回は継続）" : "通過"}{log.h1_shadow_reason ? ` / ${log.h1_shadow_reason}` : ""}</p> : null}
                   {log.decision_summary ? <p className="mt-3 overflow-hidden rounded-2xl border border-white/8 bg-slate-950/45 px-4 py-3 font-mono text-xs leading-6 break-all text-slate-400">最終診断: {normalizedDecisionSummary(log)}</p> : null}
                   <div className="mt-2 flex flex-col gap-2 text-xs text-slate-400 sm:flex-row sm:flex-wrap sm:gap-3">
                     {log.entry_method ? <span className="break-all">entry: {log.entry_method}</span> : null}
@@ -1049,7 +1064,7 @@ export default async function Home({ searchParams }: PageProps) {
             <SectionTitle title="直近の実トレード" description="保有中と決済完了を同時に確認" />
             <div className="mb-4 flex flex-wrap gap-2">
               {data.openTrades.length > 0 ? data.openTrades.map((trade) => (
-                <span key={`open-${trade.id}`} className="rounded-full border border-amber-300/18 bg-amber-300/8 px-3 py-1 text-xs text-amber-100">保有中 {trade.symbol}{trade.dir != null ? ` ${trade.directionLabel}` : ""}</span>
+                <span key={`open-${trade.id}`} className="rounded-full border border-amber-300/18 bg-amber-300/8 px-3 py-1 text-xs text-amber-100">保有中 {trade.symbol}{trade.dir != null ? ` ${trade.directionLabel}` : ""} / {formatStrategyMode(trade.strategy_mode, trade.timeframe)}</span>
               )) : <span className="rounded-full border border-white/10 bg-white/6 px-3 py-1 text-xs text-slate-300">現在保有なし</span>}
             </div>
             {data.staleOpenTrades.length > 0 ? (
@@ -1065,7 +1080,7 @@ export default async function Home({ searchParams }: PageProps) {
                     <th className="px-4 py-3 text-left font-medium">銘柄</th>
                     <th className="px-4 py-3 text-left font-medium">判定日時</th>
                     <th className="px-4 py-3 text-left font-medium">方向</th>
-                    <th className="px-4 py-3 text-left font-medium">TP先着 / 方向</th>
+                    <th className="px-4 py-3 text-left font-medium">実行勝率 / 方向</th>
                     <th className="px-4 py-3 text-left font-medium">状態</th>
                     <th className="px-4 py-3 text-right font-medium">損益</th>
                   </tr>
@@ -1075,12 +1090,12 @@ export default async function Home({ searchParams }: PageProps) {
                     <tr key={trade.id}>
                       <td className="px-4 py-3">
                         <div className="font-medium">{trade.symbol}</div>
-                        <div className="text-xs text-slate-400">{trade.timeframe ?? "-"}</div>
+                        <div className="text-xs text-slate-400">{formatStrategyMode(trade.strategy_mode, trade.timeframe)}</div>
                       </td>
                       <td className="px-4 py-3 text-slate-300">{formatDateTime(trade.created_at)}</td>
                       <td className="px-4 py-3">{trade.directionLabel}</td>
                       <td className="px-4 py-3"><div>{formatPercent((trade.tp_before_sl_prob_final ?? trade.tp_before_sl_prob ?? trade.win_prob) != null ? (trade.tp_before_sl_prob_final ?? trade.tp_before_sl_prob ?? trade.win_prob)! * 100 : null)}</div><div className="text-xs text-slate-400">方向 {formatPercent(trade.direction_prob != null ? trade.direction_prob * 100 : null)}</div></td>
-                      <td className="px-4 py-3">{trade.statusLabel}</td>
+                      <td className="px-4 py-3"><div>{trade.statusLabel}</div>{formatExitReason(trade.exit_reason) ? <div className="text-xs text-slate-400">{formatExitReason(trade.exit_reason)}</div> : null}</td>
                       <td className="px-4 py-3 text-right">{formatMoney(trade.profit_loss)}</td>
                     </tr>
                   ))}
@@ -1115,6 +1130,21 @@ export default async function Home({ searchParams }: PageProps) {
             <StatCard label="総合 総損益" value={formatMoney(data.total.summary.totalPnl)} sublabel={`平均 ${formatMoney(data.total.summary.averagePnl)}`} />
             <StatCard label="総合 Profit Factor" value={data.total.summary.profitFactor?.toFixed(2) ?? (data.total.summary.grossProfit > 0 && data.total.summary.grossLoss === 0 ? "∞" : "-")} sublabel="1.00超で総利益が総損失を上回る" />
             <StatCard label="総合 WIN" value={String(data.total.summary.winCount)} sublabel={`LOSS ${data.total.summary.lossCount} / BE ${data.total.summary.breakevenCount}`} />
+          </div>
+          <div className="mt-5 grid gap-4 border-y border-white/8 py-5 md:grid-cols-2">
+            {data.selectedPeriod.modeBreakdown.map((row) => (
+              <div key={row.mode} className="border-l-2 border-cyan-300/35 px-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="font-semibold text-white">{row.label}</h3>
+                  <span className="text-xs text-slate-400">{data.selectedPeriod.label} / {row.summary.tradeCount}件</span>
+                </div>
+                <div className="mt-3 grid grid-cols-3 gap-3 text-sm">
+                  <div><div className="text-xs text-slate-400">勝率</div><div className="mt-1 text-white">{formatPercent(row.summary.winRate)}</div></div>
+                  <div><div className="text-xs text-slate-400">総損益</div><div className="mt-1 text-white">{formatMoney(row.summary.totalPnl)}</div></div>
+                  <div><div className="text-xs text-slate-400">PF</div><div className="mt-1 text-white">{row.summary.profitFactor?.toFixed(2) ?? (row.summary.grossProfit > 0 && row.summary.grossLoss === 0 ? "∞" : "-")}</div></div>
+                </div>
+              </div>
+            ))}
           </div>
           <div className={`mt-5 border px-4 py-4 text-sm ${data.dataIntegrity.inconsistentCount > 0 || data.dataIntegrity.staleOpenCount > 0 ? "border-amber-300/30 bg-amber-950/20 text-amber-100" : "border-emerald-300/20 bg-emerald-950/15 text-emerald-100"}`}>
             <div className="font-semibold">学習データ品質</div>
