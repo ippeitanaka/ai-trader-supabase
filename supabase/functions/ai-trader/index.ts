@@ -1399,7 +1399,6 @@ async function applyDailyPlanGuard(tradeReq: TradeRequest, response: TradeRespon
     : "ai";
 
   if (plan.plan_status === "paused") hardReasons.push("daily_plan_paused");
-  if (plan.membership === "avoided") hardReasons.push("daily_plan_symbol_avoided");
   if (plan.membership === "unlisted") hardReasons.push("daily_plan_symbol_unlisted");
 
   const expiresAt = (item as any)?.expires_at ?? (plan as any)?.expires_at;
