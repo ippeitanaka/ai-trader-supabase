@@ -841,6 +841,8 @@ export interface TradeRequest {
 }
 
 export interface TradeResponse {
+  execution_min_win_prob?: number;
+  execution_min_ev_r?: number;
   // Probability targets are explicit from v3 onward. win_prob remains an alias
   // of tp_before_sl_prob_final for backwards-compatible EA execution.
   direction_prob?: number;
@@ -2028,6 +2030,8 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     action,
     decision_summary,
     expected_value_r,
+    execution_min_win_prob: effective_gate,
+    execution_min_ev_r: minEvR,
     reward_rr: round3(rt.rewardRR),
     risk_atr_mult: round3(rt.riskAtrMult),
     expiry_minutes: rt.expiryMinutes,
@@ -3391,6 +3395,8 @@ ${candleBarsSummary}
       reasoning: `${tags} | ${reasoning}`,
       recommended_min_win_prob: recommended_min_win_prob ?? undefined,
       expected_value_r,
+      execution_min_win_prob: effective_gate,
+      execution_min_ev_r: minEvR,
       reward_rr: round3(rt.rewardRR),
       risk_atr_mult: round3(rt.riskAtrMult),
       cost_r: round3(rt.costR),
