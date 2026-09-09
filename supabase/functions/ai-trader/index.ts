@@ -1,3 +1,5 @@
+import { requestOpenAiTradePrediction } from "./prediction-request.ts";
+import { isValidTradePrediction } from "./prediction-validation.ts";
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { overlayRuntimeOverrides, parseRuntimeSettings, runtimeBlockReasons, type EaRuntimeSettings } from "../_shared/ea-runtime.ts";
@@ -2536,56 +2538,6 @@ function patternMatchesCurrentSetup(pattern: any, flags: StrictPatternFlags): bo
   }
 }
 
-async function requestOpenAiTradePrediction(system: string, prompt: string): Promise<{ content: string; model: string } | null> {
-  const models = [...new Set([PRIMARY_OPENAI_MODEL, FALLBACK_OPENAI_MODEL].filter(Boolean))];
-  const timeoutRaw = Number(Deno.env.get("OPENAI_TIMEOUT_MS") ?? "12000");
-  const timeoutMs = Math.max(500, Math.min(60_000, Number.isFinite(timeoutRaw) ? timeoutRaw : 12000));
-
-  for (const model of models) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const isReasoningModel = /^gpt-[56]/i.test(model);
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        },
-        signal: controller.signal,
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: prompt },
-          ],
-          response_format: { type: "json_object" },
-          ...(isReasoningModel
-            ? { reasoning_effort: "low", max_completion_tokens: 2000 }
-            : { temperature: 0.2, max_tokens: 1000 }),
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`[AI] OpenAI ${model} error: ${response.status} - ${errorText}`);
-        continue;
-      }
-
-      const data = await response.json();
-      const content = data?.choices?.[0]?.message?.content;
-      if (data?.choices?.[0]?.finish_reason === "stop" && !data?.choices?.[0]?.message?.refusal && typeof content === "string" && content.trim()) return { content, model: data.model ?? model };
-      console.error(`[AI] OpenAI ${model} returned no content`);
-    } catch (error) {
-      console.error(`[AI] OpenAI ${model} exception:`, error instanceof Error ? error.message : String(error));
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  }
-
-  return null;
-}
-
 // OpenAI APIを使用したAI予測
 async function calculateSignalWithAIForFixedDir(req: TradeRequest): Promise<TradeResponse> {
   const { symbol, timeframe, rsi, atr, price, ea_suggestion } = req;
@@ -3172,7 +3124,12 @@ ${candleBarsSummary}
     const modelSystemPrompt = ENABLE_ML_CONTEXT_FOR_OPENAI
       ? "実績データ、価格構造、正確なTP/SL条件を統合し、方向確率とTP先着確率を分けてJSONで返す。過信と過度な見送りを避け、期待値を重視する。"
       : "価格構造、複数時間足、正確なTP/SL条件を統合し、方向確率とTP先着確率を分けてJSONで返す。過信と過度な見送りを避け、期待値を重視する。";
-    const prediction = await requestOpenAiTradePrediction(modelSystemPrompt, prompt);
+    const prediction = await requestOpenAiTradePrediction(modelSystemPrompt, prompt, {
+      models: [PRIMARY_OPENAI_MODEL, FALLBACK_OPENAI_MODEL],
+      apiKey: OPENAI_API_KEY,
+      timeoutMs: Math.max(500, Math.min(12_000, Number(Deno.env.get("OPENAI_TIMEOUT_MS")) || 12_000)),
+      validate: (value) => isValidTradePrediction(value, rt.strategyMode === "scalp", rt.rewardRR, rt.costR),
+    });
     if (!prediction) {
       console.warn("[AI] Falling back to rule-based calculation");
       return await calculateSignalFallbackWithCalibration(req);
