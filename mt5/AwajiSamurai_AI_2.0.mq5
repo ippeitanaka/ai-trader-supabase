@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| AwajiSamurai_AI_2.0.mq5  (ver 2.2.0)                            |
+//| AwajiSamurai_AI_2.0.mq5  (ver 2.2.1)                            |
 //| - Supabase: ai-signals(AI側) / ea-log                            |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
@@ -83,7 +83,7 @@ ENUM_TIMEFRAMES RecheckTimeframe(){ if(IsScalpMode()) return PERIOD_M15; return 
 #define AI_Bearer_Token AIBearerToken
 #define EA_Log_Bearer_Token EALogBearerToken
 #define AI_EA_Instance EAInstanceName()
-#define AI_EA_Version "2.2.0"
+#define AI_EA_Version "2.2.1"
 #define AI_Timeout_ms 30000
 #define UseIchimoku true
 #define Ichimoku_Tenkan 9
@@ -801,7 +801,7 @@ bool CopyBuffer1Retry(const int h,const int buffer,const int shift,double &out)
          if(CopyBuffer(h,buffer,shift,1,buf)>0)
          {
             out=buf[0];
-            if(out!=EMPTY_VALUE) return true;
+            if(out!=EMPTY_VALUE && MathIsValidNumber(out)) return true;
          }
       }
       Sleep(20);
@@ -950,14 +950,45 @@ struct IchimokuValues{
    double chikou;    // 遅行スパン
 };
 
+struct IchimokuHandleState { ENUM_TIMEFRAMES tf; int handle; bool waiting; datetime last_log; };
+IchimokuHandleState g_ichimokuHandles[];
+
+int IchimokuSlot(ENUM_TIMEFRAMES tf)
+{
+   for(int i=0;i<ArraySize(g_ichimokuHandles);i++)
+      if(g_ichimokuHandles[i].tf==tf) return i;
+   int n=ArraySize(g_ichimokuHandles);
+   if(ArrayResize(g_ichimokuHandles,n+1)!=n+1) return -1;
+   g_ichimokuHandles[n].tf=tf;
+   g_ichimokuHandles[n].handle=INVALID_HANDLE;
+   g_ichimokuHandles[n].waiting=false;
+   g_ichimokuHandles[n].last_log=0;
+   return n;
+}
+
+bool IchimokuPending(int slot,string stage,int error_code)
+{
+   if(!g_ichimokuHandles[slot].waiting || TimeCurrent()-g_ichimokuHandles[slot].last_log>=60){
+      PrintFormat("[Ichimoku] waiting tf=%s stage=%s error=%d bars=%d",EnumToString(g_ichimokuHandles[slot].tf),stage,error_code,Bars(_Symbol,g_ichimokuHandles[slot].tf));
+      g_ichimokuHandles[slot].last_log=TimeCurrent();
+   }
+   g_ichimokuHandles[slot].waiting=true;
+   return false;
+}
+
 bool GetIchimoku(ENUM_TIMEFRAMES tf,IchimokuValues &ich,int shift=0)
 {
+   int slot=IchimokuSlot(tf);
+   if(slot<0) return false;
    // Need enough bars for Tenkan/Kijun/Senkou + chikou reference
-   EnsureBars(tf,Ichimoku_Kijun+Ichimoku_Senkou+shift+50);
-   int h=iIchimoku(_Symbol,tf,Ichimoku_Tenkan,Ichimoku_Kijun,Ichimoku_Senkou);
+   ResetLastError();
+   if(!EnsureBars(tf,Ichimoku_Kijun+Ichimoku_Senkou+shift+50))
+      return IchimokuPending(slot,"history",GetLastError());
+   if(g_ichimokuHandles[slot].handle==INVALID_HANDLE)
+      g_ichimokuHandles[slot].handle=iIchimoku(_Symbol,tf,Ichimoku_Tenkan,Ichimoku_Kijun,Ichimoku_Senkou);
+   int h=g_ichimokuHandles[slot].handle;
    if(h==INVALID_HANDLE){
-      Print("[Ichimoku] Failed to create indicator handle");
-      return false;
+      return IchimokuPending(slot,"handle",GetLastError());
    }
 
    double t=EMPTY_VALUE,k=EMPTY_VALUE,a=EMPTY_VALUE,b=EMPTY_VALUE;
@@ -968,10 +999,8 @@ bool GetIchimoku(ENUM_TIMEFRAMES tf,IchimokuValues &ich,int shift=0)
    ok=ok&&CopyBuffer1Retry(h,2,shift,a);
    ok=ok&&CopyBuffer1Retry(h,3,shift,b);
 
-   if(!ok || t==EMPTY_VALUE || k==EMPTY_VALUE || a==EMPTY_VALUE || b==EMPTY_VALUE){
-      IndicatorRelease(h);
-      Print("[Ichimoku] Failed to copy buffers");
-      return false;
+   if(!ok || t==EMPTY_VALUE || k==EMPTY_VALUE || a==EMPTY_VALUE || b==EMPTY_VALUE || !MathIsValidNumber(t) || !MathIsValidNumber(k) || !MathIsValidNumber(a) || !MathIsValidNumber(b)){
+      return IchimokuPending(slot,"buffers",GetLastError());
    }
 
    ich.tenkan=t;
@@ -986,12 +1015,11 @@ bool GetIchimoku(ENUM_TIMEFRAMES tf,IchimokuValues &ich,int shift=0)
    int bars=Bars(_Symbol,tf);
    if(bars>need) ich.chikou=iClose(_Symbol,tf,need);
    else {
-      IndicatorRelease(h);
-      Print("[Ichimoku] Not enough bars for chikou");
-      return false;
+      return IchimokuPending(slot,"chikou_history",GetLastError());
    }
-   
-   IndicatorRelease(h);
+   if(ich.chikou<=0 || !MathIsValidNumber(ich.chikou)) return IchimokuPending(slot,"chikou_price",GetLastError());
+   if(g_ichimokuHandles[slot].waiting) PrintFormat("[Ichimoku] ready tf=%s",EnumToString(tf));
+   g_ichimokuHandles[slot].waiting=false;
    return true;
 }
 
@@ -1419,6 +1447,8 @@ struct AIOut{
    double sell_win_prob;         // dir=0（両方向評価）でのSELL勝率（0-1）。未提供時は-1
    // Dynamic gating / EV
    double recommended_min_win_prob; // 0.60-0.75 (server may suggest lower)
+   double execution_min_win_prob;
+   double execution_min_ev_r;
    double expected_value_r;         // EV in R-multiples (loss=-1R, win=+1.5R)
    double reward_rr;
    double risk_atr_mult;
@@ -1592,6 +1622,8 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    out_ai.buy_win_prob=-1.0;
    out_ai.sell_win_prob=-1.0;
    out_ai.recommended_min_win_prob=0.0;
+   out_ai.execution_min_win_prob=-1.0;
+   out_ai.execution_min_ev_r=-999.0;
    out_ai.expected_value_r=-999.0;
    out_ai.reward_rr=RewardRR;
    out_ai.risk_atr_mult=RiskATRmult;
@@ -1646,6 +1678,8 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
    IchimokuValues ich_prev;
    ich_prev.tenkan=0; ich_prev.kijun=0; ich_prev.senkou_a=0; ich_prev.senkou_b=0; ich_prev.chikou=0;
    bool has_ichimoku_prev=GetIchimoku(tf,ich_prev,1);
+
+   if(!has_ichimoku || !has_ichimoku_prev) return false;
 
    int tk_cross=0;
    if(has_ichimoku && has_ichimoku_prev){
@@ -1861,6 +1895,8 @@ bool QueryAI(const string tf_label,int dir,double rsi,double atr,double price,co
 
    // Dynamic gating / EV
    double rmin; if(ExtractJsonNumber(resp,"recommended_min_win_prob",rmin)) out_ai.recommended_min_win_prob=rmin; else out_ai.recommended_min_win_prob=0.0;
+   ExtractJsonNumber(resp,"execution_min_win_prob",out_ai.execution_min_win_prob);
+   ExtractJsonNumber(resp,"execution_min_ev_r",out_ai.execution_min_ev_r);
    double evr; if(ExtractJsonNumber(resp,"expected_value_r",evr)) out_ai.expected_value_r=evr; else out_ai.expected_value_r=-999.0;
    double responseRr; if(ExtractJsonNumber(resp,"reward_rr",responseRr) && responseRr>0) out_ai.reward_rr=responseRr;
    double responseRiskAtr; if(ExtractJsonNumber(resp,"risk_atr_mult",responseRiskAtr) && responseRiskAtr>0) out_ai.risk_atr_mult=responseRiskAtr;
@@ -2476,7 +2512,6 @@ void OnEntryNewBar()
    // fixed fail-safe used only if an invalid server response slips through.
    double effectiveMin=MinWinProb;
    double ev_r = (ai.expected_value_r>-100.0 ? ai.expected_value_r : (ai.win_prob*ai.reward_rr - (1.0-ai.win_prob)*1.0));
-   double ev_gate = (effectiveMin*ai.reward_rr - (1.0-effectiveMin)*1.0);
    // ガード:
    // 1) Functions側が action=0 を返した場合は必ず見送る（サーバが主要ゲート）
    // 2) EA設定の MinWinProb はフロア（誤作動防止）。サーバ側で既にキャリブレーション・
@@ -2629,11 +2664,14 @@ void OnEntryNewBar()
       TechSignal t_plan=t; t_plan.dir=(ai.suggested_dir!=0?ai.suggested_dir:tech_dir);
       LogAIDecision(tfLabel,ai.action,rsi,t.atr,t.ref,t.reason,ai,"SKIPPED_LOW_PROB",threshold_met,posCount,0,tech_dir);
       if(ai.action==0){
-         SafePrint(StringFormat("[%s] skip: server action=0 (prob=%.0f%% eff=%.0f%% ev=%.2f gate=%.2f method=%s reason=%s)",
-            tfLabel,ai.win_prob*100,effectiveMin*100,ev_r,ev_gate,ai.entry_method,ai.skip_reason));
+         string serverGate=(ai.execution_min_win_prob>=0?DoubleToString(ai.execution_min_win_prob*100,1)+"%":"unknown");
+         string serverEvGate=(ai.execution_min_ev_r>-100?DoubleToString(ai.execution_min_ev_r,3)+"R":"unknown");
+         string planGate=(ai.plan_effective_min_win_prob>=0?DoubleToString(ai.plan_effective_min_win_prob*100,1)+"%":"none");
+         SafePrint(StringFormat("[%s] skip: server action=0 (prob=%.1f%% server_signal_gate=%s plan_gate=%s ea_floor=%.1f%% ev=%.3fR server_ev_gate=%s method=%s reason=%s)",
+            tfLabel,ai.win_prob*100,serverGate,planGate,effectiveMin*100,ev_r,serverEvGate,ai.entry_method,ai.skip_reason));
       }else{
-         SafePrint(StringFormat("[%s] skip: below threshold (prob=%.0f%% < eff=%.0f%% and ev=%.2f < gate=%.2f)",
-            tfLabel,ai.win_prob*100,effectiveMin*100,ev_r,ev_gate));
+         SafePrint(StringFormat("[%s] skip: EA probability floor (prob=%.1f%% ea_floor=%.1f%% server_action=%d)",
+            tfLabel,ai.win_prob*100,effectiveMin*100,ai.action));
       }
 
       // Every direction-bearing candidate is shadow-tracked, including hard guards.
@@ -2879,7 +2917,7 @@ int OnInit(){
    // Rehydrate tracking so WIN/LOSS updates won't stall after restart.
    RehydrateTrackingFromExistingPositions();
 
-   SafePrint(StringFormat("[INIT] AwajiSamurai_AI_2.0 %s start (build %s)", AI_EA_Version, __DATE__));
+   SafePrint(StringFormat("[INIT] AwajiSamurai_AI_2.0 %s start (compiled %s)", AI_EA_Version, TimeToString(__DATETIME__,TIME_DATE|TIME_SECONDS)));
    SafePrint(StringFormat("[CONFIG] System defaults -> MinWinProb=%.0f%%, Risk=%.2f, RR=%.2f | Operator -> Lots=%.2f, MaxPos=%d",
       MinWinProb*100,RiskATRmult,RewardRR,Lots,MaxPositions));
    SafePrint(StringFormat("[MODE] strategy=%s entry=%s audit=%s magic=%I64d maxHold=%d cooldown=%d",
@@ -2903,9 +2941,19 @@ void OnTick()
    // ポジション状態監視（ML学習用）
    CheckPositionStatus();
    datetime currentEntryBar=iTime(_Symbol,TF_Entry,0);
-   if(currentEntryBar!=g_lastEntryBar){g_lastEntryBar=currentEntryBar;OnEntryNewBar();}
+   if(currentEntryBar>0 && currentEntryBar!=g_lastEntryBar){
+      // Keep position management active while new-entry indicators warm up.
+      // Do not consume the bar until ready, so a later tick can retry.
+      IchimokuValues currentIch,previousIch;
+      if(!GetIchimoku(TF_Entry,currentIch,0) || !GetIchimoku(TF_Entry,previousIch,1)) return;
+      g_lastEntryBar=currentEntryBar;
+      OnEntryNewBar();
+   }
 }
 void OnDeinit(const int reason){
+   for(int i=0;i<ArraySize(g_ichimokuHandles);i++)
+      if(g_ichimokuHandles[i].handle!=INVALID_HANDLE) IndicatorRelease(g_ichimokuHandles[i].handle);
+   ArrayResize(g_ichimokuHandles,0);
    EventKillTimer();
    SendRuntimeHeartbeat(false);
    SafePrint("[DEINIT] stopped;");
