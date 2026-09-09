@@ -54,4 +54,3 @@ export async function requestOpenAiTradePrediction(system: string, prompt: strin
 
   return null;
 }
-
