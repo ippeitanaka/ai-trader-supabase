@@ -1,5 +1,7 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { overlayRuntimeOverrides, parseRuntimeSettings, runtimeBlockReasons, type EaRuntimeSettings } from "../_shared/ea-runtime.ts";
+import { scalpExpectancy } from "./scalp-expectancy.ts";
 import {
   classifyDailyPlanMembership,
   collapseTimedEpisodes,
@@ -334,6 +336,8 @@ async function fetchCalibrationRows(
   let q = supabase
     .from("ai_signals")
     .select("created_at,symbol,dir,win_prob_raw,win_prob,actual_result")
+    .not("win_prob_raw", "is", null)
+    .or("calibration_method.is.null,calibration_method.neq.final_probability_snapshot")
     .gte("created_at", since)
     .eq("reverse_execution", false)
     .in("actual_result", ["WIN", "LOSS"])
@@ -375,7 +379,7 @@ async function fetchCalibrationRows(
     win_prob: number;
     actual_result: string;
   }>;
-  const episodes = collapseTimedEpisodes(rows);
+  const episodes = collapseTimedEpisodes(rows, strategyMode === "scalp" ? 30 : 120);
   return episodes
     .map((r) => ({
       win_prob: typeof r.win_prob_raw === "number" && Number.isFinite(r.win_prob_raw) ? r.win_prob_raw : r.win_prob,
@@ -600,7 +604,7 @@ async function getDirectionalEvidence(req: TradeRequest): Promise<DirectionalEvi
     is_virtual: boolean | null;
     probability_target_version: string | null;
     market_session: string | null;
-  }>);
+  }>, strategyMode === "scalp" ? 30 : 120);
   const allEvidence = buildDirectionalEvidence(rows);
   const sessionRows = session
     ? rows.filter((row) => (row.market_session ?? "").trim().toLowerCase() === session)
@@ -735,6 +739,7 @@ type DailyPlanContext = {
 export interface TradeRequest {
   symbol: string;
   timeframe: string;
+  runtime_settings?: EaRuntimeSettings | null;
 
   // EA側の実行閾値（例: 0.60）。サーバの action 判定がこれより厳しくならないようにする。
   min_win_prob?: number;
@@ -1100,7 +1105,12 @@ function resolveManualExecutionGate(
   plan: DailyPlanContext | null,
   symbol: string,
   fallbackBaseGate?: number,
+  runtimeSettings?: EaRuntimeSettings | null,
 ): { gate: number; adjustment: GateAdjustment; mode: PlanGateMode } | null {
+  if (runtimeSettings?.min_win_prob != null) {
+    const adjustment = round3(runtimeSettings.min_win_prob - (fallbackBaseGate ?? getMinWinProbFloor()));
+    return { gate: runtimeSettings.min_win_prob, adjustment, mode: adjustment > 0 ? "cautious" : adjustment < 0 ? "active" : "ai" };
+  }
   if (!plan) return null;
   const manualMinWinProb = resolvePlanManualMinWinProb(plan, symbol);
   const override = resolvePlanGateAdjustment(plan, symbol);
@@ -1227,7 +1237,7 @@ async function fetchDailyPlanContext(req: TradeRequest): Promise<DailyPlanContex
     risk_level: plan?.risk_level === "low" || plan?.risk_level === "medium" || plan?.risk_level === "high" ? plan.risk_level : undefined,
     market_themes: Array.isArray(plan?.market_themes) ? plan.market_themes.filter((v: unknown) => typeof v === "string").slice(0, 5) : [],
     item: item as DailyPlanSymbol | null,
-    plan_overrides: overrides as Record<string, unknown>,
+    plan_overrides: overlayRuntimeOverrides(overrides as Record<string, unknown>, req.symbol, req.runtime_settings),
   };
 }
 
@@ -1240,7 +1250,7 @@ function buildDailyPlanPrompt(plan: DailyPlanContext | null, req: TradeRequest):
   if (!plan) {
     return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n最新の日次計画は取得できませんでした。EAの上位足/セッション/構造情報を通常の判断補助として使ってください。\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}`;
   }
-  return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• report_id=${plan.report_id ?? "N/A"} status=${plan.plan_status} risk=${plan.risk_level ?? "unknown"}\n• symbol_membership=${plan.membership}\n• avoid_reason=${plan.avoid_reason ?? "N/A"}\n• summary=${plan.summary ?? "N/A"}\n• themes=${(plan.market_themes ?? []).join(" / ") || "N/A"}\n• symbol_plan=${JSON.stringify(plan.item ?? null)}\n• manual_overrides=${JSON.stringify(plan.plan_overrides ?? {})}\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}\n\nselected と eligible_unselected は、それぞれの日次計画にある方向・時間帯・個別ゲートを適用します。eligible_unselected はそのうえで通常の期待値・コスト・チャート・イベント条件を満たせば取引可能です。avoided と unlisted は取引禁止です。日次計画に反する方向・時間帯・イベント直前直後・上位足逆行・節目直前・異常コストのエントリーは、勝率を保守的に見積もってください。ダッシュボードの手動設定はAI推奨より優先してください。`;
+  return `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧭 日次トレード計画\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n• report_id=${plan.report_id ?? "N/A"} status=${plan.plan_status} risk=${plan.risk_level ?? "unknown"}\n• symbol_membership=${plan.membership}\n• avoid_reason=${plan.avoid_reason ?? "N/A"}\n• summary=${plan.summary ?? "N/A"}\n• themes=${(plan.market_themes ?? []).join(" / ") || "N/A"}\n• symbol_plan=${JSON.stringify(plan.item ?? null)}\n• manual_overrides=${JSON.stringify(plan.plan_overrides ?? {})}\n• session=${req.market_session ?? "unknown"} utc_hour=${req.utc_hour ?? "unknown"} day=${req.day_of_week ?? "unknown"}\n• higher_timeframes=${htf}\n• level_distances=${levels}\n• chart_structure=${chart}\n• volatility_context=${vol}\n• cost_context=${cost}\n\nselected と eligible_unselected は、それぞれの日次計画にある方向・時間帯・個別ゲートを適用します。eligible_unselected はそのうえで通常の期待値・コスト・チャート・イベント条件を満たせば取引可能です。avoided は運用者の希望で取引可能です。非推奨の根拠は評価に使いますが、非推奨という分類だけで取引を禁止しないでください。unlisted は取引禁止です。日次計画に反する方向・時間帯・イベント直前直後・上位足逆行・節目直前・異常コストのエントリーは、勝率を保守的に見積もってください。ダッシュボードの手動設定はAI推奨より優先してください。`;
 }
 
 function contextNumber(source: Record<string, number | string | null> | undefined, key: string): number | null {
@@ -1716,6 +1726,8 @@ function normalizeTradeRequest(body: any): TradeRequest {
     volatility_context,
     cost_context,
     strategy_mode,
+    // Client-supplied settings must never override the trusted DB configuration.
+    runtime_settings: null,
   };
 }
 
@@ -1916,10 +1928,13 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
     floor: minWinProbFloor,
     gateReduction: rsiMrBonus.gateReduction,
   });
-  const manualGate = resolveManualExecutionGate(dailyPlanContext, req.symbol, adaptiveGate);
+  const manualGate = resolveManualExecutionGate(dailyPlanContext, req.symbol, adaptiveGate, req.runtime_settings);
   const effective_gate = manualGate?.gate ?? adaptiveGate;
 
-  const expected_value_r = computeExpectedValueR(winProbFinal, rt.rewardRR, rt.costR);
+  // A rule-based aggregate win probability has no timed-exit payout estimate.
+  // Do not manufacture positive scalp EV from the full TP reward.
+  const expected_value_r = normalizeStrategyMode(req.strategy_mode, req.timeframe, req.instance) === "scalp"
+    ? -1 - rt.costR : computeExpectedValueR(winProbFinal, rt.rewardRR, rt.costR);
   const costOk = rt.costR <= maxCostR;
   const action =
     dir !== 0 &&
@@ -1931,6 +1946,9 @@ async function calculateSignalFallbackWithCalibration(req: TradeRequest): Promis
       : 0;
 
   let skip_reason = typeof base.skip_reason === "string" ? base.skip_reason : "";
+  if (normalizeStrategyMode(req.strategy_mode, req.timeframe, req.instance) === "scalp") {
+    skip_reason = appendSkip(skip_reason, "scalp_outcomes_unavailable");
+  }
   if (action === 0 && dir !== 0) {
     const parts: string[] = [];
     if (!calibrationOk) parts.push("calibration_not_applied");
@@ -2523,7 +2541,7 @@ async function requestOpenAiTradePrediction(system: string, prompt: string): Pro
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const isReasoningModel = /^gpt-5/i.test(model);
+      const isReasoningModel = /^gpt-[56]/i.test(model);
       const response = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -2539,8 +2557,8 @@ async function requestOpenAiTradePrediction(system: string, prompt: string): Pro
           ],
           response_format: { type: "json_object" },
           ...(isReasoningModel
-            ? { reasoning_effort: "low", max_completion_tokens: 600 }
-            : { temperature: 0.2, max_tokens: 250 }),
+            ? { reasoning_effort: "low", max_completion_tokens: 2000 }
+            : { temperature: 0.2, max_tokens: 1000 }),
         }),
       });
 
@@ -2552,7 +2570,7 @@ async function requestOpenAiTradePrediction(system: string, prompt: string): Pro
 
       const data = await response.json();
       const content = data?.choices?.[0]?.message?.content;
-      if (typeof content === "string" && content.trim()) return { content, model };
+      if (data?.choices?.[0]?.finish_reason === "stop" && !data?.choices?.[0]?.message?.refusal && typeof content === "string" && content.trim()) return { content, model: data.model ?? model };
       console.error(`[AI] OpenAI ${model} returned no content`);
     } catch (error) {
       console.error(`[AI] OpenAI ${model} exception:`, error instanceof Error ? error.message : String(error));
@@ -3129,6 +3147,7 @@ ${candleBarsSummary}
   "direction_prob": 0.XX, // 指定時間後に価格が取引方向側にある確率
   "tp_before_sl_prob": 0.XX, // ${executionProbabilityDefinition}
   "win_prob": 0.XX,  // tp_before_sl_probと必ず同じ値（後方互換）
+  "scalp_outcomes": {"tp_probability":0.30,"sl_probability":0.25,"timeout_win_probability":0.25,"timeout_loss_probability":0.20,"timeout_win_net_r":0.20,"timeout_loss_net_r":-0.20},
   "recommended_min_win_prob": 0.55, // 参考値。0.50～0.75
   "skip_reason": "", // 見送りなら理由（例: "range", "conflict", "news"）
   "confidence": "high" | "medium" | "low",
@@ -3136,6 +3155,7 @@ ${candleBarsSummary}
 }
 
   重要: 
+• scalpモードではscalp_outcomesを必ず評価する。4確率の合計は1、tp_probability+timeout_win_probabilityはwin_probと一致。時間切れ損益は指定保有期限での条件付き平均純損益R（コスト控除済み）。ゼロ損益はtimeout_loss側に含める。TPとSLの確率は期限までの先着確率。サンプル値の転記は禁止。
 • 上記の優先順位に従って判断してください
 • ${ENABLE_ML_CONTEXT_FOR_OPENAI ? (learningPhase === "PHASE3_FULL_ML" ? "ML学習データの過去勝率を最重視" : learningPhase === "PHASE2_HYBRID" && matchedPatterns.length > 0 ? "ML学習データとテクニカル指標をバランス良く総合判断" : "すべてのテクニカル指標を総合的に評価") : "すべてのテクニカル指標を総合的に評価"}してください
 • 0.45～0.62を通常範囲とし、強い根拠がある場合だけ範囲外を使ってください
@@ -3168,6 +3188,15 @@ ${candleBarsSummary}
   const aiResult = JSON.parse(jsonMatch[0]);
     let direction_prob = parseFloat(aiResult.direction_prob);
     let win_prob = parseFloat(aiResult.tp_before_sl_prob ?? aiResult.win_prob);
+    const isScalpPrediction = normalizeStrategyMode(req.strategy_mode, req.timeframe, req.instance) === "scalp";
+    if (isScalpPrediction) {
+      const outcomes = scalpExpectancy(aiResult.scalp_outcomes, win_prob, rt.rewardRR, rt.costR);
+      if (!outcomes || Math.abs(outcomes.rawWinProbability - win_prob) > 0.02) {
+        const fallback = await calculateSignalFallbackWithCalibration(req);
+        return { ...fallback, action: 0, skip_reason: "scalp_outcomes_invalid", reasoning: "SCALP_EV: missing or inconsistent timed-exit outcomes" };
+      }
+      win_prob = outcomes.rawWinProbability;
+    }
     
     // 安全性チェック
     if (isNaN(direction_prob) || direction_prob < 0 || direction_prob > 1 || isNaN(win_prob) || win_prob < 0 || win_prob > 1) {
@@ -3176,13 +3205,6 @@ ${candleBarsSummary}
       return await calculateSignalFallbackWithCalibration(req);
     }
     direction_prob = clampWinProb(direction_prob);
-    
-    // ⭐ 学習データ収集フェーズではML調整をスキップ
-    if (APPLY_ML_WIN_PROB_ADJUSTMENT && mlWinRateBoost !== 0) {
-      const originalProb = win_prob;
-      win_prob = win_prob + mlWinRateBoost;
-      console.log(`[AI] ML adjustment applied: ${originalProb.toFixed(3)} → ${win_prob.toFixed(3)} (boost: ${mlWinRateBoost.toFixed(3)})`);
-    }
     
     // 勝率範囲を0%～90%に設定（幅広く動的に算出）
     win_prob = clampWinProb(win_prob);
@@ -3197,6 +3219,9 @@ ${candleBarsSummary}
     const raw_win_prob = win_prob;
     const cal = await calibrateWinProb(req, raw_win_prob);
     win_prob = cal.winProb;
+    if (APPLY_ML_WIN_PROB_ADJUSTMENT && mlWinRateBoost !== 0) {
+      win_prob = clampWinProb(win_prob + mlWinRateBoost);
+    }
     const directionEvidence = await getDirectionalEvidence(req);
     const historyBlend = blendWithDirectionalEvidence(win_prob, directionEvidence);
     win_prob = historyBlend.probability;
@@ -3258,10 +3283,14 @@ ${candleBarsSummary}
       floor: minWinProbFloor,
       gateReduction: rsiMrBonus.gateReduction,
     });
-    const manualGate = resolveManualExecutionGate(dailyPlanContext, req.symbol, adaptiveGate);
+    const manualGate = resolveManualExecutionGate(dailyPlanContext, req.symbol, adaptiveGate, req.runtime_settings);
     const effective_gate = manualGate?.gate ?? adaptiveGate;
 
-    const expected_value_r = computeExpectedValueR(win_prob, rt.rewardRR, rt.costR);
+    const scalpMode = normalizeStrategyMode(req.strategy_mode, req.timeframe, req.instance) === "scalp";
+    const scalpEv = scalpMode ? scalpExpectancy(aiResult.scalp_outcomes, win_prob, rt.rewardRR, rt.costR) : null;
+    const expected_value_r = scalpMode
+      ? scalpEv?.expectedValueR ?? (-1 - rt.costR)
+      : computeExpectedValueR(win_prob, rt.rewardRR, rt.costR);
     let skip_reason = typeof aiResult.skip_reason === "string" ? aiResult.skip_reason : "";
     const entry_method: "market" = "market";
     const entry_params: null = null;
@@ -3298,7 +3327,8 @@ ${candleBarsSummary}
       `MODEL_DIAGNOSTIC(weight=${round3(modelHealth.weight)} n=${modelHealth.episodes} ` +
       `sep=${modelHealth.separation ?? "na"} applied=0 finalP=${round3(win_prob)})`;
 
-    const tags = [gateTag, calTag, evidenceTag, reliabilityTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
+    const payoutTag = scalpEv ? `SCALP_EV(net_win=${round3(scalpEv.conditionalWinR)} net_loss=${round3(scalpEv.conditionalLossR)} model=${prediction.model})` : `EV(binary model=${prediction.model})`;
+    const tags = [payoutTag, gateTag, calTag, evidenceTag, reliabilityTag, rsiGuardTag, rsiMrBonusTag, recentPerfTag, streakTag].filter((s) => s && s.trim().length > 0).join(" | ");
 
     const costOk = rt.costR <= maxCostR;
     const willExecute =
@@ -3740,6 +3770,21 @@ serve(async (req: Request) => {
       return new Response(JSON.stringify(response), { status: 200, headers: corsHeaders() });
     }
     
+    // Read once per request so BUY/SELL use the same operator settings.
+    const { data: runtimeRow, error: runtimeError } = await supabase
+      .from("ea_runtime_settings")
+      .select("symbol,strategy_mode,min_win_prob,session_override,updated_at")
+      .eq("symbol", tradeReq.symbol.trim().toUpperCase())
+      .eq("strategy_mode", tradeReq.strategy_mode)
+      .maybeSingle();
+    if (runtimeError) {
+      console.error(`[ea-runtime] settings unavailable: ${runtimeError.message}`);
+      return new Response(JSON.stringify({ error: "EA settings unavailable; execution skipped" }), { status: 503, headers: corsHeaders() });
+    }
+    tradeReq.runtime_settings = runtimeRow
+      ? { ...parseRuntimeSettings(runtimeRow), updated_at: runtimeRow.updated_at }
+      : null;
+
     // ⭐ OpenAI API KEY の存在確認とログ
     const hasOpenAIKey = OPENAI_API_KEY && OPENAI_API_KEY.length > 10 && !OPENAI_API_KEY.includes("YOUR_");
     
@@ -3777,6 +3822,18 @@ serve(async (req: Request) => {
     response = applyExecutionGuards(tradeReq, response);
     response = applyChartQualityGuard(tradeReq, response);
     response = await applyDailyPlanGuard(tradeReq, response);
+
+    // These explicit operator limits also apply without a daily plan and cannot
+    // be bypassed by opportunity overrides. They never revive a blocked order.
+    const runtimeReasons = runtimeBlockReasons(tradeReq.runtime_settings, response.win_prob);
+    if (runtimeReasons.length > 0) {
+      response = {
+        ...response,
+        action: 0,
+        skip_reason: runtimeReasons.reduce((reason, addition) => appendSkip(reason, addition), response.skip_reason ?? ""),
+        reasoning: appendReasonText(response.reasoning, `EA_RUNTIME: ${runtimeReasons.join("+")}`),
+      };
+    }
 
     // Emergency stop: keep AI inference (win_prob/reasoning) for monitoring/learning,
     // but force execution decision to no-trade.

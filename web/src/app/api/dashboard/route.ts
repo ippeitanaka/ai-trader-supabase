@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { getDashboardData, triggerPairSelectorRefresh, updateTradePlanOverrides } from "@/lib/dashboard";
+import { EaSettingsConflictError, getDashboardData, triggerPairSelectorRefresh, updateTradePlanOverrides, updateEaRuntimeSettings } from "@/lib/dashboard";
+import { parseRuntimeSettings } from "../../../../../supabase/functions/_shared/ea-runtime";
 
 export const dynamic = "force-dynamic";
 
@@ -19,6 +20,25 @@ export async function POST(request: Request) {
   try {
     const body = await request.json().catch(() => ({}));
     const action = typeof body?.action === "string" ? body.action : "refresh";
+
+    if (action === "ea_runtime_override") {
+      let settings;
+      try {
+        settings = parseRuntimeSettings(body);
+        if (body.expected_updated_at !== null && (typeof body.expected_updated_at !== "string" || !Number.isFinite(Date.parse(body.expected_updated_at)))) {
+          throw new Error("Invalid settings revision");
+        }
+      } catch (error) {
+        return NextResponse.json({ error: error instanceof Error ? error.message : "Invalid EA settings" }, { status: 400 });
+      }
+      try {
+        const result = await updateEaRuntimeSettings(settings, body.expected_updated_at);
+        return NextResponse.json({ ok: true, result });
+      } catch (error) {
+        if (error instanceof EaSettingsConflictError) return NextResponse.json({ error: error.message }, { status: 409 });
+        throw error;
+      }
+    }
 
     if (action === "plan_override") {
       const reportId = Number(body?.report_id);

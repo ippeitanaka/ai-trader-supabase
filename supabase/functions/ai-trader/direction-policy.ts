@@ -35,7 +35,7 @@ function clampProbability(value: number): number {
 }
 
 function rowWeight(row: DirectionEvidenceRow): number {
-  const currentTarget = row.probability_target_version === "direction_tp_v2";
+  const currentTarget = row.probability_target_version === "direction_tp_v2" || row.probability_target_version === "scalp_timeboxed_net_v1";
   if (row.is_virtual) return currentTarget ? 0.25 : 0.08;
   return currentTarget ? 1 : 0.35;
 }

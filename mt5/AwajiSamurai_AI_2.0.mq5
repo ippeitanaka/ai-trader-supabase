@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| AwajiSamurai_AI_2.0.mq5  (ver 2.1.0)                            |
+//| AwajiSamurai_AI_2.0.mq5  (ver 2.2.0)                            |
 //| - Supabase: ai-signals(AI側) / ea-log                            |
 //| - POST時の末尾NUL(0x00)除去対応                                  |
 //| - ML学習用: ai_signalsへの取引記録・結果追跡機能                 |
@@ -19,6 +19,7 @@
 //| - v1.9.0: 方向確率とTP先着確率を分離し、注文条件を記録          |
 //| - v2.0.0: BUY/SELL両方向をAI評価し、方向別実績で補正            |
 //| - v2.1.0: 現行M15を維持し、独立したM5短期モードを追加           |
+//| - v2.2.0: EA稼働通知・Web個別設定対応、BB取得を修正             |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -82,7 +83,7 @@ ENUM_TIMEFRAMES RecheckTimeframe(){ if(IsScalpMode()) return PERIOD_M15; return 
 #define AI_Bearer_Token AIBearerToken
 #define EA_Log_Bearer_Token EALogBearerToken
 #define AI_EA_Instance EAInstanceName()
-#define AI_EA_Version "2.1.0"
+#define AI_EA_Version "2.2.0"
 #define AI_Timeout_ms 30000
 #define UseIchimoku true
 #define Ichimoku_Tenkan 9
@@ -118,6 +119,7 @@ struct TrackedTrade{
    bool     time_exit_requested;
 };
 TrackedTrade g_tracked[];
+string g_runtimeInstanceId="";
 
 string ToIsoUtc(const datetime serverTime)
 {
@@ -892,7 +894,7 @@ bool GetADX(ENUM_TIMEFRAMES tf,double &adx_main,double &di_plus,double &di_minus
 bool GetBollingerWidth(ENUM_TIMEFRAMES tf,double &bb_width,double &bb_upper,double &bb_middle,double &bb_lower,int shift=0)
 {
    EnsureBars(tf,20+shift+10);
-   int h=iBands(_Symbol,tf,20,2.0,0,PRICE_CLOSE);
+   int h=iBands(_Symbol,tf,20,0,2.0,PRICE_CLOSE);
    if(h==INVALID_HANDLE){
       Print("[BB] Failed to create indicator handle");
       return false;
@@ -900,8 +902,8 @@ bool GetBollingerWidth(ENUM_TIMEFRAMES tf,double &bb_width,double &bb_upper,doub
 
    double up=EMPTY_VALUE,mid=EMPTY_VALUE,low=EMPTY_VALUE;
    bool ok=true;
-   ok=ok&&CopyBuffer1Retry(h,0,shift,up);
-   ok=ok&&CopyBuffer1Retry(h,1,shift,mid);
+   ok=ok&&CopyBuffer1Retry(h,0,shift,mid);
+   ok=ok&&CopyBuffer1Retry(h,1,shift,up);
    ok=ok&&CopyBuffer1Retry(h,2,shift,low);
 
    if(!ok || up==EMPTY_VALUE || mid==EMPTY_VALUE || low==EMPTY_VALUE){
@@ -2823,6 +2825,29 @@ void CheckPositionStatus()
    CheckVirtualWatches();
 }
 
+void SendRuntimeHeartbeat(const bool attached=true)
+{
+   if(MQLInfoInteger(MQL_TESTER) || g_runtimeInstanceId=="" || EA_Log_Bearer_Token=="") return;
+   bool connected=(bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+   bool enabled=(bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
+      (bool)MQLInfoInteger(MQL_TRADE_ALLOWED) &&
+      (bool)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) &&
+      (bool)AccountInfoInteger(ACCOUNT_TRADE_EXPERT);
+   string payload="{\"event_type\":\"heartbeat\",\"instance_id\":\""+JsonEscape(g_runtimeInstanceId)+"\","+
+      "\"sym\":\""+JsonEscape(_Symbol)+"\",\"strategy_mode\":\""+StrategyModeName()+"\","+
+      "\"version\":\""+AI_EA_Version+"\",\"attached\":"+(attached?"true":"false")+","+
+      "\"broker_connected\":"+(connected?"true":"false")+","+
+      "\"auto_trading_enabled\":"+(enabled?"true":"false")+","+
+      "\"current_positions\":"+IntegerToString(CountPositions())+","+
+      "\"base_lot_size\":"+DoubleToString(Lots,8)+","+
+      "\"max_open_trades\":"+IntegerToString(MaxPositions)+"}";
+   string response;
+   if(!HttpPostJson(EA_Log_URL,EA_Log_Bearer_Token,payload,response,attached?3000:1500))
+      SafePrint("[EA_RUNTIME] Heartbeat failed; dashboard connection status may be stale");
+}
+
+void OnTimer(){ SendRuntimeHeartbeat(); }
+
 // ===== メイン =====
 int OnInit(){
    trade.SetExpertMagicNumber(Magic);
@@ -2866,6 +2891,10 @@ int OnInit(){
    SafePrint("[VIRTUAL] Enabled=true TrackAllSkipped=true");
    SafePrint(StringFormat("[VIRTUAL] Watch capacity=%d", ArraySize(g_virtual)));
    SafePrint(StringFormat("[TRACK] Multi tracking capacity=%d", ArraySize(g_tracked)));
+   g_runtimeInstanceId=AccountInfoString(ACCOUNT_SERVER)+"|"+IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN))+"|"+
+      TerminalInfoString(TERMINAL_DATA_PATH)+"|"+IntegerToString(ChartID())+"|"+IntegerToString(Magic);
+   if(!EventSetTimer(120)) Print("[EA_RUNTIME] Failed to start heartbeat timer");
+   SendRuntimeHeartbeat();
    return(INIT_SUCCEEDED);
 }
 void OnTick()
@@ -2876,4 +2905,8 @@ void OnTick()
    datetime currentEntryBar=iTime(_Symbol,TF_Entry,0);
    if(currentEntryBar!=g_lastEntryBar){g_lastEntryBar=currentEntryBar;OnEntryNewBar();}
 }
-void OnDeinit(const int reason){SafePrint("[DEINIT] stopped;");}
+void OnDeinit(const int reason){
+   EventKillTimer();
+   SendRuntimeHeartbeat(false);
+   SafePrint("[DEINIT] stopped;");
+}
