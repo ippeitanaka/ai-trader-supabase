@@ -962,7 +962,7 @@ function buildConditionalRecommendations(
   return [...conditional.values()];
 }
 
-function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string, marketContext: MarketContext | null): AiSelectionResult {
+function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string, marketContext: MarketContext | null, failure = "unspecified_selection_failure"): AiSelectionResult {
   const sorted = [...stats]
     .filter((s) => s.market_eligible)
     .sort((a, b) => b.compatibility_score - a.compatibility_score);
@@ -988,7 +988,7 @@ function fallbackSelection(stats: SymbolStats[], topN: number, timeframe: string
     stats,
     timeframe,
     marketContext,
-    summary,
+    `AI選定失敗・ルールベース代替 (${failure})。${summary}`,
     defaultSelectionMeta(selected_pairs.length, topN),
     conditionalPairs,
   );
@@ -1914,7 +1914,7 @@ function applySystemFitToContext(marketContext: MarketContext | null, stats: Sym
 
 type OpenAiJsonResult = { content: string; model: string };
 
-async function requestPairSelection(
+export async function requestPairSelection(
   prompt: string,
   options: {
     models?: string[];
@@ -1922,14 +1922,16 @@ async function requestPairSelection(
     reasoningEffort?: "low" | "medium" | "high";
     maxCompletionTokens?: number;
     logLabel?: string;
+    failures?: string[];
   } = {},
 ): Promise<OpenAiJsonResult | null> {
   const models = [...new Set((options.models ?? [PAIR_SELECTOR_MODEL, PAIR_SELECTOR_FALLBACK_MODEL]).filter(Boolean))];
   for (const model of models) {
     try {
-      const isReasoningModel = /^gpt-5/i.test(model);
+      const isReasoningModel = /^gpt-[56]/i.test(model);
       const response = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
+        signal: AbortSignal.timeout(45_000),
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -1945,22 +1947,25 @@ async function requestPairSelection(
             { role: "user", content: prompt },
           ],
           ...(isReasoningModel
-            ? { reasoning_effort: options.reasoningEffort ?? "medium", max_completion_tokens: options.maxCompletionTokens ?? 2400 }
-            : { temperature: 0.1, max_tokens: 1200 }),
+            ? { reasoning_effort: options.reasoningEffort ?? "low", max_completion_tokens: options.maxCompletionTokens ?? 8000 }
+            : { temperature: 0.1, max_tokens: options.maxCompletionTokens ?? 6000 }),
         }),
       });
 
       if (!response.ok) {
+        options.failures?.push(`${model}:http_${response.status}`);
         console.error(`[pair-selector] OpenAI ${model} failed: ${response.status} ${await response.text()}`);
         continue;
       }
       const data = await response.json();
       const content = data?.choices?.[0]?.message?.content;
-      if (typeof content === "string" && content.trim()) {
+      if (data?.choices?.[0]?.finish_reason === "stop" && !data?.choices?.[0]?.message?.refusal && typeof content === "string" && parseJsonObject(content)) {
         console.log(`[pair-selector] ${options.logLabel ?? "selection"} model: ${model}`);
-        return { content, model };
+        return { content, model: data.model ?? model };
       }
+      options.failures?.push(`${model}:invalid_json_or_${data?.choices?.[0]?.finish_reason ?? "empty"}`);
     } catch (error) {
+      options.failures?.push(`${model}:${error instanceof Error && error.name === "TimeoutError" ? "timeout" : "request_failed"}`);
       console.error(`[pair-selector] OpenAI ${model} exception:`, error instanceof Error ? error.message : String(error));
     }
   }
@@ -2093,7 +2098,7 @@ function applySelectionReview(
 
 async function askOpenAi(stats: SymbolStats[], topN: number, cadence: string, timeframe: string, marketContext: MarketContext | null): Promise<AiSelectionResult> {
   if (!OPENAI_API_KEY) {
-    return fallbackSelection(stats, topN, timeframe, marketContext);
+    return fallbackSelection(stats, topN, timeframe, marketContext, "api_key_missing");
   }
 
   const prompt = `あなたはMT5自動売買システムの運用アナリストです。
@@ -2176,10 +2181,11 @@ JSONのみで回答:
   }
 }`;
 
-  const result = await requestPairSelection(prompt);
-  if (!result) return fallbackSelection(stats, topN, timeframe, marketContext);
+  const failures: string[] = [];
+  const result = await requestPairSelection(prompt, { failures });
+  if (!result) return fallbackSelection(stats, topN, timeframe, marketContext, failures.join(";"));
   const parsed = parseJsonObject(result.content);
-  if (!parsed) return fallbackSelection(stats, topN, timeframe, marketContext);
+  if (!parsed) return fallbackSelection(stats, topN, timeframe, marketContext, "invalid_json");
 
   try {
     const selected_pairs = Array.isArray(parsed?.selected_pairs) ? parsed.selected_pairs : [];
@@ -2233,7 +2239,8 @@ JSONのみで回答:
       selection_review: review,
     };
   } catch (_error) {
-    return fallbackSelection(stats, topN, timeframe, marketContext);
+    console.error("[pair-selector] selection processing failed", _error);
+    return fallbackSelection(stats, topN, timeframe, marketContext, "selection_processing_failed");
   }
 }
 

@@ -844,6 +844,17 @@ serve(async (req: Request) => {
         actual_result: actualResult,
       };
 
+      // Older EAs copied the opposite final probability into raw fields.
+      // Preserve its outcome/final score, but never train raw calibration on it.
+      if (entry.calibration_method === "final_probability_snapshot") {
+        entry.win_prob_raw = null;
+        entry.win_prob_calibrated = null;
+        entry.direction_prob = null;
+        entry.direction_prob_raw = null;
+        entry.tp_before_sl_prob_raw = null;
+        entry.tp_before_sl_prob_calibrated = null;
+      }
+
       const { data, error } = await supabase
         .from("ai_signals")
         .insert(entry)

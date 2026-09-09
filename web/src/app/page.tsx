@@ -2,6 +2,7 @@ import { getDashboardData } from "@/lib/dashboard";
 import { AiRefreshButton } from "@/components/ai-refresh-button";
 import { DashboardAutoRefresh } from "@/components/dashboard-auto-refresh";
 import { SymbolGateControl, SymbolSessionControl, TradePlanControls } from "@/components/trade-plan-controls";
+import { InstalledEaControls } from "@/components/installed-ea-controls";
 
 export const dynamic = "force-dynamic";
 
@@ -41,6 +42,8 @@ const SKIP_REASON_LABELS: Record<string, string> = {
   streak_guard: "連敗ガードを優先したため",
   daily_plan_manual_gate: "ダッシュボードで指定した追加ゲートを下回ったため",
   daily_plan_manual_session_closed: "ダッシュボードで指定した取引時間外のため",
+  ea_manual_gate: "設置中のEAに設定した勝率ゲートを下回ったため",
+  ea_manual_session_closed: "設置中のEAに設定した取引時間外のため",
   daily_plan_symbol_avoided: "本日の非推奨ペアに指定されているため",
   daily_plan_symbol_unlisted: "AI判定対象外の銘柄であるため",
   daily_plan_symbol_not_selected: "旧ルールで本日の推奨ペア外だったため",
@@ -614,6 +617,8 @@ export default async function Home({ searchParams }: PageProps) {
             </article>
           </div>
         </section>
+
+        <InstalledEaControls rows={data.installedEas} />
 
         <section className="mt-8 surface-panel rounded-[28px] p-6 backdrop-blur">
           <div className="mb-5 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">

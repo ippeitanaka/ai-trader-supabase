@@ -1,5 +1,6 @@
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { parseHeartbeat } from "../_shared/ea-runtime.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -381,6 +382,21 @@ serve(async (req: Request) => {
         JSON.stringify({ error: "Missing required field: sym" }),
         { status: 400, headers: corsHeaders() },
       );
+    }
+
+    if ((body as any).event_type === "heartbeat") {
+      let instance;
+      try {
+        instance = await parseHeartbeat(body as unknown as Record<string, unknown>);
+      } catch (error) {
+        return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Invalid heartbeat" }), { status: 400, headers: corsHeaders() });
+      }
+      const { error } = await supabase.from("ea_instances").upsert(instance, { onConflict: "id" });
+      if (error) {
+        console.error(`[ea-log] heartbeat failed: ${error.message}`);
+        return new Response(JSON.stringify({ error: "EA registry unavailable" }), { status: 503, headers: corsHeaders() });
+      }
+      return new Response(JSON.stringify({ ok: true, last_seen_at: instance.last_seen_at }), { status: 200, headers: corsHeaders() });
     }
 
     const hasAnyMeaningfulField =

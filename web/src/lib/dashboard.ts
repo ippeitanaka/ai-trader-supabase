@@ -1,3 +1,5 @@
+import { instanceStatus, runtimeKey, type EaInstance, type EaRuntimeSettings } from "../../../supabase/functions/_shared/ea-runtime";
+
 type PairRecommendation = {
   symbol: string;
   score: number;
@@ -385,6 +387,7 @@ type DashboardData = {
   dataErrors: string[];
   pairSelector: PairSelectorResponse;
   recentEaLogs: EALogRecord[];
+  installedEas: InstalledEaRow[];
   recentTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
   openTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
   staleOpenTrades: Array<AISignalRecord & { statusLabel: string; directionLabel: string }>;
@@ -404,6 +407,16 @@ type DashboardData = {
     symbolBreakdown: SymbolSummary[];
     modeBreakdown: StrategyModeSummary[];
   };
+};
+
+export type InstalledEaRow = {
+  symbol: string;
+  strategyMode: "standard" | "scalp";
+  instances: Array<EaInstance & { connectionStatus: ReturnType<typeof instanceStatus> }>;
+  settings: EaRuntimeSettings | null;
+  inheritedGate: number;
+  inheritedSessions: Array<{ start_jst: string; end_jst: string }> | null;
+  membership: "selected" | "conditional" | "avoided" | "unlisted";
 };
 
 const RAW_SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? process.env.SUPABASE_URL ?? "";
@@ -927,6 +940,61 @@ async function fetchPairSelector(): Promise<PairSelectorResponse> {
   return fetchJson<PairSelectorResponse>(buildFunctionUrl("pair-selector", { limit: "1" }));
 }
 
+async function fetchEaRuntimeData(): Promise<{ instances: EaInstance[]; settings: EaRuntimeSettings[] }> {
+  const [instances, settings] = await Promise.all([
+    fetchJson<EaInstance[]>(buildRestUrl("ea_instances", {
+      select: "id,symbol,strategy_mode,timeframe,ea_version,last_seen_at,attached,broker_connected,auto_trading_enabled,current_positions,base_lot_size,max_open_trades",
+      attached: "eq.true", last_seen_at: `gte.${toIsoDaysAgo(7)}`, order: "last_seen_at.desc", limit: "500",
+    })),
+    fetchJson<EaRuntimeSettings[]>(buildRestUrl("ea_runtime_settings", { select: "symbol,strategy_mode,min_win_prob,session_override,updated_at", limit: "500" })),
+  ]);
+  return { instances, settings };
+}
+
+function buildInstalledEas(runtime: { instances: EaInstance[]; settings: EaRuntimeSettings[] }, latest: PairSelectorLatest | null): InstalledEaRow[] {
+  const rows = new Map<string, InstalledEaRow>();
+  const toJst = (time: string) => `${String((Number(time.slice(0, 2)) + 9) % 24).padStart(2, "0")}:${time.slice(3)}`;
+  for (const instance of runtime.instances) {
+    const key = runtimeKey(instance.symbol, instance.strategy_mode);
+    if (!rows.has(key)) {
+      const selected = latest?.trade_plan?.symbols?.find((item) => item.symbol.toUpperCase() === instance.symbol);
+      const conditional = latest?.trade_plan?.conditional_symbols?.find((item) => item.symbol.toUpperCase() === instance.symbol);
+      const item = selected ?? conditional;
+      const manualSession = latest?.plan_overrides?.symbol_session_overrides?.[instance.symbol];
+      const planWindows = item?.session_windows?.filter((window) => window.start_utc && window.end_utc).map((window) => ({ start_jst: toJst(window.start_utc!), end_jst: toJst(window.end_utc!) })) ?? [];
+      rows.set(key, {
+        symbol: instance.symbol, strategyMode: instance.strategy_mode, instances: [],
+        settings: runtime.settings.find((setting) => runtimeKey(setting.symbol, setting.strategy_mode) === key) ?? null,
+        inheritedGate: latest?.plan_overrides?.symbol_min_win_probs?.[instance.symbol] ?? Math.max(instance.strategy_mode === "scalp" ? 0.62 : 0.50, item?.min_win_prob ?? 0.50),
+        inheritedSessions: manualSession?.mode === "all_day" ? null : manualSession?.mode === "custom" ? manualSession.windows ?? null : planWindows.length ? planWindows : null,
+        membership: selected ? "selected" : conditional ? "conditional" : latest?.avoided_pairs.some((pair) => pair.symbol.toUpperCase() === instance.symbol) ? "avoided" : "unlisted",
+      });
+    }
+    rows.get(key)!.instances.push({ ...instance, connectionStatus: instanceStatus(instance) });
+  }
+  return [...rows.values()].sort((a, b) => a.symbol.localeCompare(b.symbol) || a.strategyMode.localeCompare(b.strategyMode));
+}
+
+export class EaSettingsConflictError extends Error {}
+
+export async function updateEaRuntimeSettings(settings: Omit<EaRuntimeSettings, "updated_at">, expectedUpdatedAt: string | null) {
+  requireEnv();
+  const values = { ...settings, updated_at: new Date().toISOString() };
+  const url = buildRestUrl("ea_runtime_settings", expectedUpdatedAt === null ? {} : {
+    symbol: `eq.${settings.symbol}`, strategy_mode: `eq.${settings.strategy_mode}`, updated_at: `eq.${expectedUpdatedAt}`,
+  });
+  const response = await fetch(url, {
+    method: expectedUpdatedAt === null ? "POST" : "PATCH",
+    headers: { ...supabaseHeaders(), "Content-Type": "application/json", Prefer: "return=representation" },
+    body: JSON.stringify(values), cache: "no-store",
+  });
+  if (response.status === 409) throw new EaSettingsConflictError("別の画面で設定が更新されました。ページを更新して再確認してください。");
+  if (!response.ok) throw new Error(`EA設定の保存に失敗しました (${response.status})。`);
+  const saved = await response.json() as EaRuntimeSettings[];
+  if (saved.length !== 1) throw new EaSettingsConflictError("別の画面で設定が更新されました。ページを更新して再確認してください。");
+  return saved[0];
+}
+
 export async function triggerPairSelectorRefresh(options?: {
   cadence?: string;
   lookbackDays?: number;
@@ -1077,7 +1145,7 @@ async function fetchClosedTrades(period: string): Promise<AISignalRecord[]> {
 export async function getDashboardData(period = "30"): Promise<DashboardData> {
   requireEnv();
 
-  const [pairSelectorResult, recentEaLogsResult, recentTradesResult, openTradesResult, selectedTradesResult, totalTradesResult, shadowTradesResult, h1AuditResult] = await Promise.all([
+  const [pairSelectorResult, recentEaLogsResult, recentTradesResult, openTradesResult, selectedTradesResult, totalTradesResult, shadowTradesResult, h1AuditResult, eaRuntimeResult] = await Promise.all([
     safeFetchWithError("pair-selector", fetchPairSelector, { latest: null, live_context: null }),
     safeFetchWithError("ea-log recent", fetchRecentEaLogs, []),
     safeFetchWithError("ai_signals recent", fetchRecentTrades, []),
@@ -1086,6 +1154,7 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
     safeFetchWithError("ai_signals total", () => fetchClosedTrades("all"), []),
     safeFetchWithError("ai_signals shadow", fetchShadowTrades, []),
     safeFetchWithError("ai_signals H1 audit", fetchH1AuditTrades, []),
+    safeFetchWithError("EA稼働情報", fetchEaRuntimeData, { instances: [], settings: [] }),
   ]);
 
   const pairSelector = pairSelectorResult.data;
@@ -1107,6 +1176,7 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
     totalTradesResult.error,
     shadowTradesResult.error,
     h1AuditResult.error,
+    eaRuntimeResult.error,
   ].filter((value): value is string => Boolean(value));
 
   return {
@@ -1114,6 +1184,7 @@ export async function getDashboardData(period = "30"): Promise<DashboardData> {
     dataErrors,
     pairSelector,
     recentEaLogs,
+    installedEas: buildInstalledEas(eaRuntimeResult.data, pairSelector.latest),
     recentTrades: decorateTrades(recentTrades),
     openTrades: decorateTrades(openTrades),
     staleOpenTrades: decorateTrades(staleOpenTrades),
