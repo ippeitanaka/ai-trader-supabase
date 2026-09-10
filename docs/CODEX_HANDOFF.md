@@ -40,3 +40,13 @@ After deployment, inspect naturally occurring ai-trader requests. Look for `inva
 For further diagnosis, read provider failures and request timing without printing credentials. Existing logs can label an internally recovered fallback as OpenAI success, so inspect detailed provider messages rather than only the outer prediction-method label.
 
 Rollback through a reviewed revert of the fix and a successful main deploy. Keep API keys and service-role credentials out of this file, git, and chat.
+
+## ai_config schema repair (2026-09-10)
+
+Production information_schema contained no ai_config table, although migration history recorded 20250102 and 20250106 as applied. The time/cause of removal is unknown. Normal db push skips applied migrations. The runtime query additionally selects max_cost_r, direction_horizon_minutes and max_hold_minutes, which old ai_config migrations never defined.
+
+`20260910000100_restore_ai_config_runtime.sql` restores the runtime table/columns idempotently, enables RLS, removes anon/authenticated privileges, permits service_role reads, and reloads PostgREST schema. It deliberately inserts no settings and preserves existing rows if run against an intact table. Empty rows mean existing strategy/env defaults and ea_runtime_settings continue to apply; no thresholds or trade quality guards are changed. Historic missing values cannot be reconstructed from migration history. The current MT5 source does not read ai_config directly.
+
+Verify through a service-role REST request selecting all seven runtime columns, and check subsequent natural ai-trader requests for absence of ai_config fetch errors. Do not roll back by dropping restored configuration data.
+
+Validation before release: executed the repair twice in a PostgreSQL transaction and rolled back. Verified empty initial settings, preservation of a temporary 0.73 threshold on the second run, RLS enabled, no anon/authenticated SELECT privilege, and successful service_role selection of all runtime columns. Confirmed the table remained absent after rollback; no test configuration persisted.
