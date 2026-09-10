@@ -1,10 +1,10 @@
 @import "tailwindcss";
 
 :root {
-  --background: #050910;
-  --foreground: #eef2ff;
-  --panel-border: rgba(255, 255, 255, 0.1);
-  --panel-fill: rgba(9, 16, 28, 0.62);
+  --background: #092b2e;
+  --foreground: #f5f5f5;
+  --panel-border: rgba(255, 255, 255, 0.15);
+  --panel-fill: rgba(10, 10, 10, 0.4);
 }
 
 @theme inline {
@@ -42,43 +42,95 @@ a {
 }
 
 .font-title {
-  font-family: var(--font-orbitron), var(--font-geist-sans), sans-serif;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-family: var(--font-geist-sans), sans-serif;
+  letter-spacing: 0;
 }
 
 .dashboard-shell {
-  background:
-    radial-gradient(circle at 12% 14%, rgba(16, 185, 129, 0.2), transparent 24%),
-    radial-gradient(circle at 82% 10%, rgba(34, 211, 238, 0.16), transparent 22%),
-    linear-gradient(180deg, #07111f 0%, #081826 44%, #050910 100%);
+  background: #092b2e;
+  color-scheme: dark;
 }
 
 .hero-panel {
   position: relative;
-  overflow: hidden;
-  border: 1px solid rgba(103, 232, 249, 0.16);
-  background:
-    linear-gradient(145deg, rgba(8, 18, 32, 0.84), rgba(8, 12, 21, 0.72)),
-    radial-gradient(circle at top right, rgba(34, 211, 238, 0.14), transparent 36%);
-}
-
-.hero-panel::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px),
-    linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px);
-  background-size: 40px 40px;
-  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.5), transparent 78%);
 }
 
 .surface-panel {
   border: 1px solid var(--panel-border);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.025)),
-    var(--panel-fill);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  background: var(--panel-fill);
+}
+
+/* Shared visual language, matching the installed-EA controls. */
+.dashboard-shell :where(section, article, div, span, a, button, input, select) {
+  letter-spacing: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.dashboard-shell :where(article, .surface-panel, .rounded-2xl, .rounded-3xl, .rounded-full) {
+  border-radius: 8px;
+}
+
+.dashboard-shell section.surface-panel,
+.dashboard-shell section.hero-panel {
+  border: 0;
+  border-top: 1px solid var(--panel-border);
+  border-radius: 0;
+  background: transparent;
+  padding: 24px 0;
+}
+
+.dashboard-shell article {
+  min-width: 0;
+  border-color: var(--panel-border);
+  background: var(--panel-fill);
+}
+
+.dashboard-shell article :where(div.rounded-lg, div.rounded-2xl, div.rounded-3xl) {
+  border: 0;
+  border-top: 1px solid var(--panel-border);
+  border-radius: 0;
+  background: transparent;
+  padding-inline: 0;
+}
+
+.dashboard-shell :where(input, select) {
+  min-width: 0;
+  min-height: 44px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+  background: #0a0a0a;
+  color: #fff;
+  padding: 8px 12px;
+  font-size: 14px;
+}
+
+.dashboard-shell button {
+  min-height: 44px;
+  border-radius: 6px;
+  background-image: none;
+  white-space: normal;
+}
+
+.dashboard-shell :where(input, select, button, a):focus-visible {
+  outline: 2px solid #67e8f9;
+  outline-offset: 3px;
+}
+
+.dashboard-shell :where(h1, h2, h3, p, label) {
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.dashboard-shell h1 { font-size: 30px; line-height: 1.4; }
+.dashboard-shell h2 { font-size: 24px; line-height: 1.4; }
+.dashboard-shell h3 { font-size: 18px; line-height: 1.5; }
+.dashboard-shell :where(.text-slate-300, .text-slate-400) { color: #b8c5c5; }
+.dashboard-shell :where(th, td) { border-color: var(--panel-border); }
+.dashboard-shell th { color: #b8c5c5; font-weight: 500; }
+
+@media (max-width: 639px) {
+  .dashboard-shell h1 { font-size: 24px; }
+  .dashboard-shell h2 { font-size: 20px; }
+  .dashboard-shell article { padding: 16px; }
 }

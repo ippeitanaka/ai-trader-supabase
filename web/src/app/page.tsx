@@ -433,7 +433,7 @@ function StatCard({
   return (
     <article className="surface-panel rounded-3xl p-5 shadow-[0_20px_60px_rgba(0,0,0,0.22)] backdrop-blur">
       <p className={`text-xs uppercase tracking-[0.24em] ${accent}`}>{label}</p>
-      <p className="mt-3 text-3xl font-semibold text-white">{value}</p>
+      <p className="mt-3 break-words text-xl font-semibold text-white">{value}</p>
       {sublabel ? <p className="mt-2 text-sm text-slate-300">{sublabel}</p> : null}
     </article>
   );
@@ -513,8 +513,8 @@ export default async function Home({ searchParams }: PageProps) {
         ) : null}
 
         <section className="hero-panel rounded-[32px] p-6 shadow-[0_24px_120px_rgba(3,10,18,0.55)] backdrop-blur lg:p-8">
-          <div className="flex flex-col gap-8 lg:flex-row lg:items-start lg:justify-between">
-            <div className="max-w-3xl">
+          <div className="flex flex-col gap-6">
+            <div className="min-w-0">
               <div className="mb-5 inline-flex items-center gap-3 rounded-full border border-white/12 bg-white/6 px-4 py-2 text-xs uppercase tracking-[0.24em] text-slate-300">
                 <span className="h-2.5 w-2.5 rounded-full bg-emerald-300 shadow-[0_0_18px_rgba(134,239,172,0.9)]" />
                 AI Trader Command View
@@ -522,7 +522,7 @@ export default async function Home({ searchParams }: PageProps) {
               <h1 className="font-title text-3xl font-semibold tracking-[0.16em] text-white sm:text-5xl">
                 Awaji Samurai AI Trader
               </h1>
-              <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <div className="mt-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
                 <HeroBadge label="更新 cadence" value={formatCadenceLabel(latest?.cadence ?? null)} />
                 <HeroBadge label="監視テーマ" value={`${liveContext?.themes?.length ?? 0} 件`} />
                 <HeroBadge label="選定 lookback" value={`${latest?.lookback_days ?? 21} 日`} />
@@ -537,7 +537,7 @@ export default async function Home({ searchParams }: PageProps) {
               </div>
             </div>
 
-            <div className="grid gap-4 sm:grid-cols-2 lg:w-[360px] lg:grid-cols-1">
+            <div className="grid gap-4 sm:grid-cols-3">
               <StatCard label="最終更新" value={formatDateTime(latest?.generated_at ?? data.generatedAt)} accent="text-emerald-200/75" />
               <StatCard label="本日トップ推奨" value={latest?.digest?.top_pick_symbol ?? latest?.top_picks?.[0]?.symbol ?? "-"} sublabel={latest?.digest?.risk_label ?? "-"} accent="text-cyan-200/75" />
               <StatCard label="オープン中ポジション" value={String(data.openTrades.length)} sublabel={data.openTrades.length > 0 ? data.openTrades.map((trade) => trade.symbol).join(" / ") : "現在保有なし"} accent="text-amber-200/75" />
